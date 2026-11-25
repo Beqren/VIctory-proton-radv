@@ -936,14 +936,9 @@ extern "system" fn copy_page_mappings(
                 let n = u64::from(r.count);
                 match r.kind {
                     0 => add(C::PagesRun, n),
-                    1 => {
-                        add(C::PagesOne, n);
-                        let mut bytes = vec![1u8; PAGE as usize];
-                        crate::host::copy_mapped(bytes.as_mut_ptr(), source as *const u8, bytes.len(), false);
-                        if bytes.iter().all(|&b| b == 0) {
-                            add(C::PagesOneZero, n);
-                        }
-                    }
+                    // Run 6 also read each source page: 0-170 of these
+                    // pages a frame were of zeros (the probe is gone).
+                    1 => add(C::PagesOne, n),
                     2 => add(C::PagesUnmapped, n),
                     _ => add(C::PagesLeft, n),
                 }

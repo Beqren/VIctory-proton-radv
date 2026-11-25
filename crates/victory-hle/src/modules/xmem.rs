@@ -803,8 +803,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// again) or a different home for the pages.
 ///
 /// Under Wine a view's mapping and unmapping cost grows with the views the
-/// process holds (`/tmp/victory-perf/viewbench`: one page remapped in 14 us
-/// with 100 views, 192 us with 40,000, 569 us with 63,000), and the title
+/// process holds (a standalone bench under Proton Experimental, unmapping
+/// a page view and mapping another page there as `map` does: one page
+/// remapped in 14 us with 100 views, 192 us with 40,000, 569 us with 63,000), and the title
 /// maps its pages one at a time (`XMemMapPhysicalPages` of one page,
 /// `CopyPageMappingsBatchX` page by page): run 6 of the frame study held
 /// 123,000-128,000 views, its 2,000-4,400 remapping calls a frame took

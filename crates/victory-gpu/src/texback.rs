@@ -162,8 +162,14 @@ impl Target {
         let copy = crate::resource::host_copy(resource)?;
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let (_, _, format) = crate::resource::texture_kind(resource)?;
-        let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         first_seen(resource, at, size, &layout);
+        // A layout the formats crate cannot tile (the 64 KiB XOR modes: one
+        // 256x256 R32_FLOAT texture in SW_64KB_R_X in run water-2, beside
+        // 45 it can) is not copied at all: logged once above.
+        if !layout.addressable() {
+            return None;
+        }
+        let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         Some(Self { copy, layout, format, ticket })
     }

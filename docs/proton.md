@@ -403,6 +403,37 @@ Fixes (branch `warm-pipelines`):
   the pipeline waits; each host pipeline's translation and host compile
   times (`host pipeline made`).
 
+### Everything sinks in water (the texture read-back)
+
+Symptom (the owner's play, 2026-11-25): past the prologue "everything is falling
+to the bottom of the water, no swimming or floating physics", and the first
+mission failed at once.
+
+Cause: the title's ocean passes write wave textures on the GPU, and its CPU
+physics reads those textures' memory. The copy-back put shader-written buffers
+into title memory, not textures, so the physics read memory nothing wrote.
+
+Fix (branch water-back; port of fxceless/victory-fork f5c03f3, commits 895c0b8
+and 04df435, `crates/victory-gpu/src/texback.rs`): a list whose shaders write a
+title texture of the kinds 256x256 R32_FLOAT, 256x256 and 64x64 R32G32_FLOAT,
+128x128 R16G16_UINT copies it into a read-back buffer when it closes; once the
+list has run and the device was found alive, the texels are tiled into the
+texture's title memory through the copy-back's guarded write. Texels that did not
+change are not written. On by default here (`VICTORY_TEXTURE_BACK=0` turns it off,
+or a list of `<w>x<h>f<format>` picks others). The fork got past its sinking-boat
+mission with it (their runs 275 against 276: the same set but this switch).
+The texture's own host copy is never uploaded again from that memory: a texture
+shaders write keeps unordered access on the host and is not filled from title
+memory (`texture::title_written`), so the write does not loop back.
+
+The log says once per texture which ones it takes (size, format, layout,
+whether the formats crate can tile it), and every 10 s how many copies were
+recorded and landed, KiB written and CPU time. A test under Proton
+(`texback::tests::shader_written_textures_land_tiled_in_title_memory`) writes each
+kind with a compute shader and checks what lands in each console layout; the
+formats crate cannot address the 64 KiB S_X and R_X layouts of these formats, so
+such a texture would be logged as not tileable and not copied.
+
 ### "a descriptor read only as data"
 
 Symptom: shader does not translate, with that reason. Forty programs of the pack

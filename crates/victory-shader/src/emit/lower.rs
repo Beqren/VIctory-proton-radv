@@ -5571,7 +5571,7 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        if use_at.is_none() {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5619,8 +5619,24 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
-        };
+            // A whole image descriptor (8 dwords) that no instruction samples
+            // or loads through: the code reads its size out of it (width in
+            // dwords 1 and 2, height in dword 2, base level in dword 3: three
+            // of the title's pixel programs scale their coordinates by the
+            // size of a texture picked by index before they sample two
+            // others, e.g. 6b6db9f1a526daeb at 0x1c5c; 40 programs of the
+            // pack stopped here). The size comes from the host as it does
+            // for a descriptor that is sampled, below.
+            // shortcut: such a descriptor is taken for a 2D texture's, as
+            // nothing says what it is; of another kind the host's answer is
+            // not defined.
+            if count != 8 {
+                return Err("a descriptor read only as data");
+            }
+        }
+        // (Without a use, the load itself stands where the use is read.)
+        let sized_only = use_at.is_none();
+        let (at, first) = use_at.unwrap_or((site, 0));
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
@@ -5630,6 +5646,7 @@ impl<'a> Lower<'a> {
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
+            _ if sized_only => ((2, 0x409), Some(2)),
             // A ray-tracing structure in a buffer of the host: read raw.
             Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
             Fields::Image { dim, .. } => {

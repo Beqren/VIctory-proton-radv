@@ -2672,6 +2672,22 @@ impl State {
             return;
         }
         let hash = |h: &str| p.stages.iter().any(|s| s.shader.hash == h);
+        // Every dispatch's buffer views against the watched ranges (who
+        // writes the face controls).
+        if !after {
+            let program = p.stages.first().map_or("", |s| s.shader.hash.as_str());
+            for stage in &p.stages {
+                for u in &stage.translated().used {
+                    let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
+                        continue;
+                    };
+                    let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                    if let Some((a, n)) = view.as_ref().and_then(crate::descriptor::host::buffer_range) {
+                        crate::graphdump::watch_view(program, &format!("{:?} s{}+{}", u.kind, u.slot, u.table_offset_dwords), a, n);
+                    }
+                }
+            }
+        }
         let graph = p.stages.iter().any(|s| GRAPH_PROGRAMS.contains(&s.shader.hash.as_str()));
         let skinning = hash("36e010b53acffd77");
         let head = hash("970c4fbb3b017c0e") || hash("61e54e90adccaf6a") || skinning;
@@ -2688,6 +2704,13 @@ impl State {
         let formula = hash("0aa7934094794dbf");
         if formula && !after {
             PASS.fetch_add(1, Ordering::Relaxed);
+        }
+        if formula
+            && let Some(Root::Table(table)) = self.compute.first()
+            && let Some((a, n)) =
+                crate::descriptor::view(table + 32 * 4).as_ref().and_then(crate::descriptor::host::buffer_range)
+        {
+            crate::graphdump::watch_controls(a, n);
         }
         let pass = PASS.load(Ordering::Relaxed);
         if pass < 0 {

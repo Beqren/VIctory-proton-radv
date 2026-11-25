@@ -178,6 +178,7 @@ pub(crate) fn copy(list: &HostList, frame: u64, address: u64, len: u64, label: &
 /// submission settled, the copies go to files.
 pub(crate) fn flush(frame: u64) {
     let Some(w) = window() else { return };
+    watch_present(frame);
     let _ = w.first;
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = guard.as_mut() else { return };
@@ -218,4 +219,99 @@ pub(crate) fn flush(frame: u64) {
     let _ = std::fs::write(w.folder.join("index.txt"), index);
     tracing::info!(total = s.total, left_out = s.left_out, copies = s.copies.len(), "face network dump written (VICTORY_GRAPH_DUMP)");
     s.chunks.clear();
+}
+
+/// Who writes the face controls (the Formula dispatch's input, three
+/// buffers in turn): the ranges watched (the controls, and the sources of
+/// copies into them), each logged write, and per frame which 64-byte
+/// pieces of the controls' title memory changed since the last present.
+static WATCH: Mutex<Vec<(u64, u64, &'static str)>> = Mutex::new(Vec::new());
+
+fn overlaps(a: u64, n: u64, b: u64, m: u64) -> bool {
+    a < b + m && b < a + n
+}
+
+fn watching() -> bool {
+    let Some(w) = window() else { return false };
+    let f = crate::queue::presented() + 1;
+    f >= w.first && f < w.first + 16
+}
+
+/// The Formula dispatch reads the controls at `address`.
+pub(crate) fn watch_controls(address: u64, len: u64) {
+    let mut w = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.iter().any(|&(a, _, _)| a == address) {
+        w.push((address, len, "controls"));
+        tracing::info!(address = format_args!("{address:#x}"), len, "face controls watched");
+    }
+}
+
+/// A copy recorded into title memory `dst` from `src` (`kind`: which
+/// command): logged where it writes a watched range; its source is watched
+/// from then on.
+pub(crate) fn watch_copy(kind: &str, dst: u64, src: u64, len: u64) {
+    if !watching() {
+        return;
+    }
+    let mut w = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = w.iter().find(|&&(a, n, _)| overlaps(dst, len, a, n)).map(|&(a, _, what)| (a, what));
+    if let Some((a, what)) = hit {
+        let line = format!(
+            "watch copy frame={} {kind} dst={dst:#x} src={src:#x} len={len:#x} into {what} {a:#x}",
+            crate::queue::presented() + 1
+        );
+        tracing::info!("{line}");
+        note(line);
+        if !w.iter().any(|&(b, m, _)| b == src && m == len) {
+            w.push((src, len, "copy source"));
+        }
+    }
+}
+
+/// A dispatch's buffer view `address`+`len`: logged where it touches a
+/// watched range.
+pub(crate) fn watch_view(program: &str, label: &str, address: u64, len: u64) {
+    if !watching() {
+        return;
+    }
+    let w = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    for &(a, n, what) in w.iter() {
+        if overlaps(address, len, a, n) {
+            let line = format!(
+                "watch view frame={} program={program} {label} {address:#x}+{len:#x} touches {what} {a:#x}+{n:#x}",
+                crate::queue::presented() + 1
+            );
+            note(line);
+        }
+    }
+}
+
+/// At a present: which pieces of each watched range's title memory changed
+/// since the last.
+pub(crate) fn watch_present(frame: u64) {
+    if !watching() {
+        return;
+    }
+    static LAST: Mutex<Vec<(u64, Vec<u64>)>> = Mutex::new(Vec::new());
+    let ranges: Vec<(u64, u64, &str)> = WATCH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    for (a, n, what) in ranges {
+        let mut b = vec![0u8; n as usize];
+        if !crate::host::read_into(a as *const u8, &mut b) {
+            continue;
+        }
+        let hashes: Vec<u64> = b
+            .chunks(64)
+            .map(|c| c.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3)))
+            .collect();
+        let changed = match last.iter().find(|(b, _)| *b == a) {
+            Some((_, old)) => hashes.iter().zip(old).filter(|(x, y)| x != y).count(),
+            None => usize::MAX,
+        };
+        note(format!("watch present frame={frame} {what} {a:#x}+{n:#x} pieces changed {changed} of {}", hashes.len()));
+        match last.iter_mut().find(|(b, _)| *b == a) {
+            Some(e) => e.1 = hashes,
+            None => last.push((a, hashes)),
+        }
+    }
 }

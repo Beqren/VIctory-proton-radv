@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// A shader of the draw being bound was handed address 0 for a view
+    /// it takes the address of ([`State::host_word`]).
+    static NULL_ADDRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While a stage is bound: whether its shader marks the pages it writes
     /// through heap views (page marks, `crate::shadow::marks_mode`: it
     /// binds the written-pages bitmap).
@@ -636,6 +639,16 @@ macro_rules! once {
     }};
 }
 
+/// Draws and dispatches dropped because a shader was handed address 0 for
+/// a view it takes the address of, since the start.
+pub(crate) static NULL_ADDRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether such draws and dispatches are dropped (`VICTORY_DROP_NULL_ADDRESS`, on).
+fn drop_null_address() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_NULL_ADDRESS").is_none_or(|v| v != "0"))
+}
+
 /// Root constant and shader views bound to zeros ([`bind_null_root`]),
 /// since the start.
 pub(crate) static NULL_ROOTS: AtomicU64 = AtomicU64::new(0);
@@ -1069,6 +1082,7 @@ impl State {
             _ => 0,
         };
         if address == 0 {
+            NULL_ADDRESS.set(true);
             static SEEN: std::sync::Mutex<Vec<(usize, u8, u32)>> = std::sync::Mutex::new(Vec::new());
             let key = (self.pipeline, slot, dword);
             let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -1310,6 +1324,7 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
+                NULL_ADDRESS.set(false);
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
@@ -1324,6 +1339,19 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                // A program handed address 0 for a view it walks memory
+                // from: dropped (`VICTORY_DROP_NULL_ADDRESS`, on). Run
+                // run1st-1 (2026-11-25): every such program is a ray tracing
+                // pass (sr_tracing, indirect_light_probes, rtdirectionalshadows,
+                // shadowmask, deferred_tiled:CS_LaserLightShadowRaytracing)
+                // whose structure's view is not there (ray tracing is off);
+                // walking a structure from address 0 read fixed fields at
+                // 0x3f000, 0xbd000-0xc4000 ... (runs play-va2, play-va3, b18:
+                // scalar reads, a device loss).
+                if NULL_ADDRESS.take() && drop_null_address() {
+                    NULL_ADDRESSED.fetch_add(1, Ordering::Relaxed);
+                    return false;
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {

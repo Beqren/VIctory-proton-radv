@@ -1119,6 +1119,10 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// Its GPU address with `VICTORY_TEXTURE_VA` (0: not known).
+    va: u64,
+    /// When it was made (`crate::host::now_ms`).
+    made_ms: u64,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
@@ -1412,6 +1416,17 @@ pub(crate) fn host_made<'a>(
     let (host, _) = hosted(this, false)?;
     // SAFETY: as in `host_resource`.
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// How long ago title texture `this`'s host copy was made (ms), making it
+/// if it has none (then 0).
+#[cfg(windows)]
+pub(crate) fn host_age_ms(this: This) -> Option<u64> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, true)?;
+    Some(crate::host::now_ms().saturating_sub(host.made_ms))
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -1886,12 +1901,107 @@ impl HostTexture {
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        let va = TEXTURE_VA
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(windows::core::Interface::as_raw(&texture) as usize))
+            .unwrap_or(0);
         HostTexture {
             texture,
+            va,
+            made_ms: crate::host::now_ms(),
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
         }
+    }
+
+    /// Its bytes on the card.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+/// Host textures made in heaps of their own ([`texture_va`]): their GPU
+/// address, by texture, until their [`HostTexture`] takes it.
+#[cfg(windows)]
+static TEXTURE_VA: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether each host texture is placed at offset 0 of a heap of its own,
+/// with a small buffer placed at the same offset whose GPU address is the
+/// texture's (`VICTORY_TEXTURE_VA=1`; off: committed resources, whose
+/// address vkd3d-proton does not give). For the address map
+/// (`crate::host::vamap`): a texture-unit page fault's address can then be
+/// matched to a texture.
+#[cfg(windows)]
+fn texture_va() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_VA").is_some_and(|v| v == "1"))
+}
+
+/// The private data GUID that ties a placed host texture to its heap (the
+/// texture holds the heap and the buffer that gave its address).
+#[cfg(windows)]
+const HEAP_HOLD: windows::core::GUID = windows::core::GUID::from_u128(0x5f1c2e7a_93b4_4d61_a0c8_7e2d9b4f6a11);
+#[cfg(windows)]
+const ADDR_HOLD: windows::core::GUID = windows::core::GUID::from_u128(0x5f1c2e7a_93b4_4d61_a0c8_7e2d9b4f6a12);
+
+/// [`texture_va`]: the texture placed at offset 0 of a heap of its own, and
+/// its GPU address.
+#[cfg(windows)]
+fn placed_texture(
+    host: &crate::host::Host,
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    state: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,
+    clear: Option<*const windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_VALUE>,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u64, u64)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    // SAFETY: plain queries and creation; the descriptions are ours.
+    unsafe {
+        let info = host.device.GetResourceAllocationInfo(0, &[*desc]);
+        if info.SizeInBytes == u64::MAX || info.SizeInBytes == 0 {
+            return None;
+        }
+        let mut heap: Option<ID3D12Heap> = None;
+        host.device
+            .CreateHeap(
+                &D3D12_HEAP_DESC {
+                    SizeInBytes: info.SizeInBytes,
+                    Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    Alignment: info.Alignment.max(65536),
+                    Flags: D3D12_HEAP_FLAG_NONE,
+                },
+                &mut heap,
+            )
+            .ok()?;
+        let heap = heap?;
+        let mut texture: Option<ID3D12Resource> = None;
+        host.device.CreatePlacedResource(&heap, 0, desc, state, clear, &mut texture).ok()?;
+        let texture = texture?;
+        let buffer_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: info.SizeInBytes.min(65536),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let va = match host.device.CreatePlacedResource(&heap, 0, &buffer_desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer) {
+            Ok(()) => buffer.as_ref().map_or(0, |b| b.GetGPUVirtualAddress()),
+            Err(_) => 0,
+        };
+        // The texture keeps its heap (and the buffer) alive.
+        let _ = texture.SetPrivateDataInterface(&HEAP_HOLD, &heap);
+        if let Some(b) = &buffer {
+            let _ = texture.SetPrivateDataInterface(&ADDR_HOLD, b);
+        }
+        Some((texture, va, info.SizeInBytes))
     }
 }
 
@@ -1899,6 +2009,7 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        crate::host::vamap::freed(self.va);
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -2023,6 +2134,27 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    let state_host = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+    if texture_va() {
+        // SAFETY: the same layout as the host's description (as below).
+        let desc_host = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read() };
+        let clear_ptr = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+        if let Some((t, va, size)) = placed_texture(host, &desc_host, state_host, clear_ptr) {
+            TEXTURE_VA.lock().unwrap_or_else(|e| e.into_inner()).insert(windows::core::Interface::as_raw(&t) as usize, va);
+            {
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| {
+                    tracing::info!(va = format_args!("{va:#x}"), size, "host textures are placed in heaps of their own (VICTORY_TEXTURE_VA); the first")
+                });
+            }
+            crate::host::vamap::made(va, size, "texture", || {
+                format!("{}x{}x{} mips {} f{} flags {:#x}", d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.flags)
+            });
+            crate::host::name(&t, || format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags));
+            return Some(t);
+        }
+    }
+    let _ = state_host;
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.

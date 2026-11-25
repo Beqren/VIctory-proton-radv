@@ -668,10 +668,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 // Written through the runtime, still read-only. With
                 // [`one_view`] another view of the page may be open (the
                 // one written through): guarded again first.
-                if one_view() && view_guard() {
-                    protect_views_of(&mut g, block);
+                // A view that could not be guarded: the block is not
+                // called clean, and is asked about again next time.
+                if !(one_view() && view_guard()) || protect_views_of(&mut g, block) {
+                    g.clean.insert(block);
                 }
-                g.clean.insert(block);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -748,23 +749,30 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 
 /// The other views of `block`'s page made read-only, and all its views
 /// noted guarded together ([`protect`]).
-fn protect_views_of(g: &mut Guards, block: usize) {
+///
+/// False where a view that is mapped could not be made read-only: the
+/// caller must not call the block clean then, or a title write through
+/// that view would go unseen (a view that is not mapped cannot be written
+/// through, and counts as guarded).
+fn protect_views_of(g: &mut Guards, block: usize) -> bool {
     let shown = crate::inplace::pages_of(block * BLOCK);
     // One view (nothing else to guard), or the page the title shows
     // wherever it has nothing (thousands of views): each view of
     // that one is guarded by itself.
     if shown.len() < 2 || shown.len() > MANY_VIEWS {
-        return;
+        return true;
     }
     #[cfg(feature = "diagnostics")]
     ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut all = true;
     for alias in shown {
         let alias = alias / BLOCK;
         g.aliased.insert(alias);
         if alias != block {
-            protect_alias(g, alias);
+            all &= protect_alias(g, alias);
         }
     }
+    all
 }
 
 /// Whether a write of ours (the copy-back's, a title copy at submission,
@@ -831,14 +839,17 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// reports a block that is read-only and not clean as written, then notes it
 /// clean). A block that is clean stays so: had the pages been written since
 /// its copies took them, `open` would have opened it.
-fn protect_alias(g: &mut Guards, block: usize) {
+fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
     if g.protected.contains(&block) {
-        return;
+        return true;
     }
     if reprotect(block * BLOCK, BLOCK, PAGE_READONLY, P_VP_ALIAS) {
         g.protected.insert(block);
+        return true;
     }
+    // Not mapped now: nothing can be written through it.
+    block < uncommitted_end(block)
 }
 
 /// [`protect`] for one range, without the other views of its pages.

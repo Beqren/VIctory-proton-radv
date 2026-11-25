@@ -1109,6 +1109,7 @@ impl Drop for HostHeap {
     /// but not what its descriptors view, and a shader reading a slot of it
     /// would read freed memory (a texture-unit page fault).
     fn drop(&mut self) {
+        crate::memory::heap_gone(std::ptr::from_ref(self) as usize);
         let kept = std::mem::take(self.kept.get_mut().unwrap_or_else(|e| e.into_inner()));
         let mut n = 0u64;
         for resource in kept.into_iter().flatten() {
@@ -2359,6 +2360,24 @@ impl HostHeap {
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
+        if null_buffer_zeros()
+            && let Some(z) = zero_buffers()
+        {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: (ZERO_BYTES / 4) as u32,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: a slot of our heap; a live buffer of ours.
+            unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&desc), self.cpu(index)) };
+            return;
+        }
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,

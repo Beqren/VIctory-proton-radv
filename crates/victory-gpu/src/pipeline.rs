@@ -486,6 +486,18 @@ pub(crate) fn shaders_text(this: This) -> String {
     format!("[{}]", list.join(", "))
 }
 
+/// The shader hashes of the title's pipeline `this`, in every build (for
+/// warnings that name a program once per pipeline).
+#[cfg(windows)]
+pub(crate) fn shaders_text_any(this: This) -> String {
+    if this.is_null() {
+        return "[]".to_owned();
+    }
+    let p = pipeline(this);
+    let list: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    format!("[{}]", list.join(", "))
+}
+
 /// Whether a shader of the title's pipeline `this` holds `name` in its
 /// container (programs found by the title's own names: diagnostics, and
 /// `State::skin_no_blend`).

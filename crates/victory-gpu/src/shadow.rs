@@ -1011,7 +1011,7 @@ fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
         let (at, bytes) = (address + lo, &merged[lo..hi]);
         #[cfg(feature = "diagnostics")]
         let opening = std::time::Instant::now();
-        crate::watch::writing(at, bytes.len());
+        crate::watch::writing_from_card(at, bytes.len());
         #[cfg(feature = "diagnostics")]
         let writing = {
             crate::copystat::add(crate::copystat::C::BackOpenUs, opening.elapsed().as_micros() as u64);

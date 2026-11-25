@@ -1441,6 +1441,39 @@ pub(crate) fn log(frames: f64) {
         c[C::CopyUnchecked as usize],
         c[C::CopyRewritten as usize],
     );
+    // The guards taken apart: who opens blocks, who guards them again, and
+    // what the refreshes then find written.
+    {
+        use crate::watch::*;
+        let p = prep_take().map(|n| n as f64 / frames);
+        let why = |base: usize| format!("{:.0}/{:.0}/{:.0}/{:.0}/{:.0}", p[base], p[base + 1], p[base + 2], p[base + 3], p[base + 4]);
+        tracing::info!(
+            "prep account per frame: guard calls {:.0} ({:.0} all clean), {:.2} ms waiting for the guards' lock in them, \
+             {:.2} ms guarding again in them; blocks the guards reported written {:.0} (by why opened \
+             fault/card/writing/every-view/mapped/not-by-us: {}/{:.0}); 4 KiB pages the kernel reported written {:.0}; \
+             VirtualProtect read-only here {:.0} {:.2} ms, read-only at other views {:.0} {:.2} ms, read-write (opening) \
+             {:.0} {:.2} ms; blocks opened (fault/card/writing/every-view/mapped) here {} at other views {}; \
+             fault handler waited for the guards' lock {:.2} ms; blocks at other views noted written and left read-only {:.0}",
+            p[P_GUARD_CALLS],
+            p[P_GUARD_CLEAN],
+            p[P_GUARD_LOCK_US] / 1e3,
+            p[P_GUARD_PROTECT_US] / 1e3,
+            p[P_GUARD_WRITTEN],
+            why(P_WRITTEN_WHY),
+            p[P_WRITTEN_WHY + 5],
+            p[P_KERNEL_PAGES],
+            p[P_VP_HERE],
+            p[P_VP_HERE + 1] / 1e3,
+            p[P_VP_ALIAS],
+            p[P_VP_ALIAS + 1] / 1e3,
+            p[P_VP_OPEN],
+            p[P_VP_OPEN + 1] / 1e3,
+            why(P_OPENED),
+            why(P_OPENED_ALIAS),
+            p[P_FAULT_LOCK_US] / 1e3,
+            p[P_NOTED_ALIAS],
+        );
+    }
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();

@@ -496,6 +496,40 @@ watch for who writes the controls):
   gives the card's register file after each stage, to compare with the model.
   Then check the barrier's lowering, and dxil-spirv's semantics for typed UAVs.
 
+Replay (5f74661: `formula_replay`, an ignored Windows test run under Proton with
+`VICTORY_FORMULA_DIR`, from dump3's buffers; scripts in /tmp/victory-faceref,
+`replay_var.sh`, `cmp_replay.py`):
+
+- The replay reproduces the title's result: its registers after 12 stages differ
+  from the title run's card in 2 places, and from the model in 63 to 119.
+  Against the model, stage by stage: stage 0 and stage 1 are identical. After
+  stage 2, 1 register differs; after stage 4, 17; after stage 6, 52.
+- The first difference is register 1524 (q20, lane 4, stage 1, a multiply of
+  registers 196 and 1024). The card multiplied the new value of register 1024
+  by the pre-dispatch value of register 196 (0.00937). Thread 0 overwrote 196
+  with 0.4905 in stage 0, and the card's register file after stage 0 holds
+  0.4905 there. So the read after the barrier returned a value already
+  overwritten before it.
+- The barrier is translated as a group-wide execution barrier (DXIL op 80, mode
+  sync | UAV global fence | group-shared fence; HLSL's
+  `AllMemoryBarrierWithGroupSync`). There is one in this program, and the
+  translation adds none. It does synchronise: with `VICTORY_GROUP_SYNC=0` (no
+  waits), 93 registers differ after stage 2 instead of 1.
+- Changed nothing, all deterministic: globally coherent UAVs
+  (`VICTORY_COHERENT_UAVS=1`), barrier modes 1|4|8 and 1|2|4|8, the translator's
+  clean-up passes off (`VICTORY_SHADER_OPT=0`), RADV's LLVM backend
+  (`RADV_DEBUG=llvm`), and porting upstream c4ee3d2 (`v_fma_f16` rounded once)
+  and f3578e3 (f16 inline constants in the wave-sum simulation).
+  `RADV_PERFTEST=cswave32` changes the result (12 registers after stage 2), so it
+  depends on how lanes form waves.
+- `VICTORY_FORMULA_WARP=1` gave the same numbers as the hardware. Unverified that
+  WARP really ran: vkd3d-proton may not have a WARP adapter.
+- Open: a stale read that no fence or coherence flag changes. Either the CPU model
+  misreads which stage an instruction belongs to, or a wave passes the barrier
+  before another has finished its stores. Next: an exact console emulator of these
+  ~150 instructions on the dump, as the referee, or the per-stage split (one
+  dispatch per stage) the coordinator proposed, as an experiment.
+
 Quad reads through quad reads in pixel programs (upstream 4015a18, the same lowering
 as 8487caf; branch d16-pack-quad) made skin plastic and glossy again: not merged.
 

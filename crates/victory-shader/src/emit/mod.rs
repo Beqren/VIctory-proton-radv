@@ -935,6 +935,38 @@ mod tests {
 
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
     fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+        stores_v1_dxil(body).map(|_| ())
+    }
+
+    /// Packed 16-bit float results round to nearest even, as the console's do (the
+    /// face network's programs set MODE to it): `v_pk_add_f16` lowered by default as with
+    /// `VICTORY_F16_NEAREST=1`, which adds the rounding steps to the host's `f32tof16`
+    /// (toward zero on RADV and NVIDIA). The packed path used the host's conversion
+    /// whatever the switch, and the switch was off by default.
+    #[test]
+    fn packed_half_results_round_to_nearest_by_default() {
+        // v_pk_add_f16 v1, v0, v0
+        let body = [0xCC0F_4001u32, 0x1802_0100];
+        let p = ir::build(
+            &body.iter().chain(&[0xBF81_0000u32]).flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>(),
+            true,
+            4,
+        )
+        .unwrap();
+        assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "v_pk_add_f16"));
+        let with = |on: Option<bool>| {
+            let was = super::lower::TEST_F16_NEAREST.replace(on);
+            let r = stores_v1_dxil(&body);
+            super::lower::TEST_F16_NEAREST.set(was);
+            r.unwrap()
+        };
+        let (default, on, off) = (with(None), with(Some(true)), with(Some(false)));
+        assert_ne!(on, off, "the packed path ignores the rounding switch");
+        assert_eq!(default, on, "packed results are not rounded to nearest by default");
+    }
+
+    /// [`stores_v1`]'s translation.
+    fn stores_v1_dxil(body: &[u32]) -> Result<Vec<u8>, ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -977,7 +1009,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        emit(&c, &native, &p, &st, &io, &res).map(|out| out.dxil)
     }
 
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`

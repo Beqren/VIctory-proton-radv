@@ -1989,6 +1989,34 @@ mod tests {
         drop_views(section, &[one, two], SIZE);
     }
 
+    /// A write of ours at one view (the copy-back's: `writing`, then the
+    /// bytes), then the title's through the same view: both are reported at
+    /// the other view. With `VICTORY_OPEN_ONE_VIEW=1` the other view stays
+    /// read-only after our write, and noting it clean again must guard the
+    /// written view again, or the title's write there would not fault.
+    #[test]
+    fn a_title_write_after_ours_at_the_same_view_is_reported_at_the_other() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0), pages(two, 1)]));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()), "nothing written yet");
+        writing(two + BLOCK, BLOCK);
+        assert!(writable(two + BLOCK), "the view written through is open");
+        // SAFETY: the second view, opened by `writing`.
+        unsafe { ((two + BLOCK + 8) as *mut u8).write(1) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 1)]), "our write");
+        // SAFETY: the second view, read-write or opened by the handler.
+        unsafe { ((two + BLOCK + 16) as *mut u8).write(2) };
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 1)]), "the title's write after ours");
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 1)]));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        drop_views(section, &[one, two], SIZE);
+    }
+
     /// A page shown in more than `MANY_VIEWS` views is guarded at each by
     /// itself: the others stay writable, and nothing looks through them all.
     #[test]

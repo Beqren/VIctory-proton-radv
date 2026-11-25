@@ -202,6 +202,9 @@ pub(crate) struct Shader {
     /// bit 14): a compute program whose waves exchange data through memory
     /// they write between group barriers ([`super::lower`], `coherent_uavs`).
     pub coherent_uavs: bool,
+    /// 16-bit integer typed UAV loads read through the slot's raw view
+    /// (`super::lower`, `raw_typed_loads_on`).
+    pub raw_typed_loads: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -264,6 +267,7 @@ impl Shader {
             nonuniform_handles: 0,
             ordered: false,
             coherent_uavs: false,
+            raw_typed_loads: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,

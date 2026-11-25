@@ -995,6 +995,26 @@ mod tests {
         assert_eq!(lowered(&without, Some(true)), lowered(&without, Some(false)), "coherent without a barrier");
     }
 
+    /// A program that stores to UAVs and synchronises its group reads 16-bit
+    /// typed views through the slot's raw view as well (the face network's
+    /// Formula program read stale registers through its typed view on the
+    /// host); without a barrier it does not.
+    #[test]
+    fn typed_16_bit_loads_after_a_group_barrier_read_the_raw_view_by_default() {
+        // s_barrier; buffer_load_format_d16_x v1, v0, s[8:11], 0 idxen; s_waitcnt vmcnt(0)
+        let with = [0xBF8A_0000u32, 0xE200_2000, 0x8002_0100, 0xBF8C_3F70];
+        let without = [0xE200_2000u32, 0x8002_0100, 0xBF8C_3F70];
+        let lowered = |body: &[u32], on: Option<bool>| {
+            let was = super::lower::TEST_RAW_TYPED_LOADS.replace(on);
+            let r = stores_v1_dxil(body);
+            super::lower::TEST_RAW_TYPED_LOADS.set(was);
+            r.unwrap()
+        };
+        assert_ne!(lowered(&with, None), lowered(&with, Some(false)), "typed loads only by default");
+        assert_eq!(lowered(&with, None), lowered(&with, Some(true)));
+        assert_eq!(lowered(&without, None), lowered(&without, Some(false)), "raw loads without a barrier");
+    }
+
     /// [`stores_v1`]'s translation.
     fn stores_v1_dxil(body: &[u32]) -> Result<Vec<u8>, ShaderError> {
         use crate::native::RootParam;

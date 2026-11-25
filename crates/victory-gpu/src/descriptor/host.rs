@@ -1005,6 +1005,23 @@ fn integer_format(format: u32) -> Option<bool> {
     }
 }
 
+/// Whether the slots a draw's table copies are made in (dynamic slots) get
+/// their words in the table by slot (`VICTORY_TABLE_SLOT_WORDS=1`; off by
+/// default; always in tests). With it the 16-bit integer path reaches the
+/// face network (`compute_graph_ops`, bound through tables): in run face-4
+/// (2026-11-25) its output came alive, 196,000-267,000 of 532,480 halves
+/// not zero and changing every frame where it had been all zero, and faces
+/// moved, but grossly: mouths agape, lips and jaw torn out of shape. Some
+/// other stage of the network or its inputs is still wrong, and the still,
+/// neutral faces look better until it is found.
+fn table_slot_words() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_SLOT_WORDS").is_some_and(|v| v == "1"))
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -2217,7 +2234,9 @@ impl HostHeap {
         // slots are (strides, and the format kind 16-bit typed accesses
         // need: the face network's tables, 0aa7934094794dbf and the rest
         // of the `compute_graph_ops`, are all made here).
-        self.slot_word(index, Some(view));
+        if table_slot_words() {
+            self.slot_word(index, Some(view));
+        }
         let kept = make(view, self.cpu(index));
         let mark = MADE_MARK.take();
         if kept.is_none() {
@@ -2243,7 +2262,9 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
-        self.slot_word(index, None);
+        if table_slot_words() {
+            self.slot_word(index, None);
+        }
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -2372,7 +2393,9 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.slot_word(index, None);
+        if table_slot_words() {
+            self.slot_word(index, None);
+        }
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {

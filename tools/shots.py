@@ -295,11 +295,23 @@ def main(argv):
         return 2
     runs = [(a.split("=", 1) if "=" in a else (os.path.basename(a.rstrip("/")), a)) for a in args]
     # The same stretch of the cutscene from both: up to the shorter run's last world frame.
-    until = min(max([float(r["secs_world"]) for r, _ in run_frames(folder)] or [0]) for _, folder in runs)
-    frames = [(label, load(folder, until, show, label)) for label, folder in runs]
-    if any(not f for _, f in frames):
-        print("verdict: cannot tell (a run has no world frames: was VICTORY_CAPTURE_EVERY set?)")
+    ends = [max([float(r["secs_world"]) for r, _ in run_frames(folder)] or [-1]) for _, folder in runs]
+    # No world frame: either the switch was not set, or the run never drew a frame of 500 draws
+    # (most draws dropped), the worst failure there is.
+    empty = [label for (label, _), end in zip(runs, ends) if end < 0]
+    if len(empty) == len(runs):
+        print("verdict: cannot tell (no world frames saved: was VICTORY_CAPTURE_EVERY set?)")
         return 1
+    if empty:
+        (la, _), (lb, _) = runs
+        why = "never reached a frame of 500 draws or more; no world frames saved"
+        if empty[0] == lb:
+            print(f"verdict: {lb} WORSE than {la} ({lb} {why}; check that VICTORY_CAPTURE_EVERY was set)")
+        else:
+            print(f"verdict: {lb} BETTER than {la} ({la} {why}; check that VICTORY_CAPTURE_EVERY was set)")
+        return 0
+    until = min(ends)
+    frames = [(label, load(folder, until, show, label)) for label, folder in runs]
     print(f"world frames up to {until:.0f} s after the world's first")
     print(f"{'all frames: mean (quartiles)':32}" + "".join(f"{label:>26}" for label, _ in frames))
     print(f"{'world frames':32}" + "".join(f"{len(f):>26}" for _, f in frames))

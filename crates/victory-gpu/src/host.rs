@@ -2238,7 +2238,7 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
 }
 
 /// Whether anything is in the air.
-fn flying() -> bool {
+pub(crate) fn flying() -> bool {
     if !late() {
         return false;
     }

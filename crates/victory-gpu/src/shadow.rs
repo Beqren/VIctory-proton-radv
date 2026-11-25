@@ -990,6 +990,88 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
     true
 }
 
+/// Whether a refresh copies the title's writes under a range that an
+/// earlier list of the same submission declared shaders write
+/// (`VICTORY_BUSY_REFRESH=0`: left alone, as before).
+///
+/// Why: upstream ed0dbfd (Marvisak/VIctory): skipped, the title's constants
+/// there (sizes, counts, addresses) stayed stale in the copy for the whole
+/// submission, and a dispatch read its sizes as zeros and looped until the
+/// device was removed. Here the losses of 2026-11-25 were GPU read faults
+/// (the texture unit at high addresses, the scalar cache at 0x0 and
+/// 0xb000), which a stale size or address under such a range fits.
+fn busy_refresh_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUSY_REFRESH").is_none_or(|v| v != "0"))
+}
+
+/// Whether busy ranges are refreshed ([`busy_refresh_on`]): only with
+/// nothing in the air. Then every declared range is this submission's,
+/// whose shaders have not run. Behind flights a range may be one a flight's
+/// shaders are writing now (into a copy in the PC's memory, directly): the
+/// title's bytes there go in beside theirs (`merge_under_writes`) or the
+/// flights are settled first. Not with kept snapshots, whose pieces say
+/// which bytes are current.
+fn busy_refresh(on: bool, keeps: bool, flying: bool) -> bool {
+    on && !keeps && !flying
+}
+
+/// The snapshot of a busy range after its refresh ([`Shadow::update_busy`])
+/// takes the copy's bytes there: no shader has run, so the copy is what
+/// the card starts from.
+fn busy_snapshot(snapshot: &mut [u8], copy: &[u8]) {
+    snapshot.copy_from_slice(copy);
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::{busy_refresh, busy_snapshot, changed_runs};
+
+    #[test]
+    fn busy_ranges_are_refreshed_only_with_nothing_in_the_air() {
+        assert!(busy_refresh(true, false, false));
+        assert!(!busy_refresh(true, false, true));
+        assert!(!busy_refresh(true, true, false));
+        assert!(!busy_refresh(false, false, false));
+    }
+
+    /// A model of a copy in the PC's memory: list A declares a range
+    /// (snapshot taken), the title then writes a size under it, list B of
+    /// the same submission refreshes it. B's dispatch must read the title's
+    /// size; the shaders' writes go back; the title's later write stays.
+    #[test]
+    fn a_title_write_under_a_busy_range_reaches_the_copy_and_is_not_undone() {
+        const N: usize = 64;
+        let base: Vec<u8> = (0..N as u32).map(|i| i as u8).collect();
+        let (mut copy, mut title) = (base.clone(), base.clone());
+        // A declares [0, N): its snapshot.
+        let mut snapshot = copy.clone();
+        // The title writes a size at 16..20.
+        title[16..20].copy_from_slice(&[0x40, 0, 0, 0]);
+        // B's refresh, with nothing in the air: the changed runs go into
+        // the copy, then the snapshot takes the copy's bytes.
+        for (at, n) in changed_runs(&title, &copy) {
+            copy[at..at + n].copy_from_slice(&title[at..at + n]);
+        }
+        busy_snapshot(&mut snapshot, &copy);
+        assert_eq!(&copy[16..20], &[0x40, 0, 0, 0], "the dispatch reads the title's size");
+        // The card runs: a shader writes 40..44.
+        copy[40..44].copy_from_slice(&[9, 9, 9, 9]);
+        // The title writes 16 again after the refresh.
+        title[16] = 0x80;
+        // The copy-back: the card's byte where the copy differs from the
+        // snapshot, else the title's.
+        for i in 0..N {
+            if copy[i] != snapshot[i] {
+                title[i] = copy[i];
+            }
+        }
+        assert_eq!(&title[40..44], &[9, 9, 9, 9], "the shader's write goes back");
+        assert_eq!(title[16], 0x80, "the title's later write stays");
+        assert_eq!(&title[17..20], &[0, 0, 0]);
+    }
+}
+
 /// Whether the copy-back writes into title memory only the 8-byte words
 /// where what shaders wrote changes the title's bytes
 /// (`VICTORY_BACK_EXACT=1`; off by default: everything from the first to
@@ -2743,10 +2825,15 @@ impl Shadow {
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
+            let refresh_busy = busy_refresh(busy_refresh_on(), keeps(), crate::host::flying());
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if refresh_busy && e > a.max(at) {
+                    bytes += self.update_busy(a.max(at), e);
                 }
                 at = at.max(e);
             }
@@ -2756,6 +2843,33 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of `[from, to)`, which an earlier list of the
+    /// submission being prepared declared shaders write, with nothing in
+    /// the air ([`busy_refresh`]): none of those shaders has run, so the
+    /// title's writes there are copied as anywhere else, and the snapshot
+    /// takes the same bytes, so that the copy-back neither takes them for
+    /// the shaders' nor puts them back over a later title write.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        let copied = self.update_free(from, to);
+        if copied == 0 || self.card.is_some() {
+            // A copy in the card's memory has no snapshot: its CPU side,
+            // which the refresh wrote, is the reference, and the changed
+            // runs go up before the lists.
+            return copied;
+        }
+        let (a, e) = self.inside(from, to - from);
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(snapshot) = before.as_mut()
+            && e <= snapshot.len()
+        {
+            // SAFETY: inside the mapping (`inside`); nothing of ours writes
+            // the copy here meanwhile (the submission's preparing).
+            let now = unsafe { std::slice::from_raw_parts(self.data.add(a), e - a) };
+            busy_snapshot(&mut snapshot[a..e], now);
+        }
+        copied
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no

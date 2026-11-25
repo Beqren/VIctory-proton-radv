@@ -632,6 +632,71 @@ macro_rules! once {
     }};
 }
 
+/// Root constant and shader views bound to zeros ([`bind_null_root`]),
+/// since the start.
+pub(crate) static NULL_ROOTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a root view with no host copy behind it is bound to a buffer of
+/// zeros (`VICTORY_NULL_ROOTS=0`: left unset, as before).
+///
+/// Why: left unset, a host root view is whatever the list held, at first
+/// address 0: the shader's scalar loads read GPU address 0 plus their
+/// offset. Runs grave-10 and ports/run1 (2026-11-25) lost the device on a
+/// read by the scalar cache (SQC data) at 0x0 and 0xb000.
+fn null_roots_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_ROOTS").is_none_or(|v| v != "0"))
+}
+
+/// The buffer of zeros a root view with nothing behind it reads
+/// (4 MiB: a root view has no size, and reads past its start by offsets
+/// the title computes).
+fn zero_root() -> Option<u64> {
+    static ZERO: std::sync::OnceLock<Option<(ID3D12Resource, u64)>> = std::sync::OnceLock::new();
+    ZERO.get_or_init(|| {
+        const SIZE: u64 = 4 << 20;
+        let host = crate::host::host()?;
+        let (buffer, data) = host.shared_buffer(SIZE)?;
+        // SAFETY: the buffer's mapping, `SIZE` bytes; nothing reads it yet.
+        unsafe { std::ptr::write_bytes(data, 0, SIZE as usize) };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer, gpu))
+    })
+    .as_ref()
+    .map(|z| z.1)
+}
+
+/// A root constant or shader view `param` that has no host copy (the
+/// title's address `address`, 0 if it set none) reads zeros instead of
+/// whatever the list held ([`null_roots_on`]).
+fn bind_null_root(l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, slot: u8, address: u64) {
+    if !null_roots_on() {
+        return;
+    }
+    let Some(gpu) = zero_root() else {
+        return;
+    };
+    if NULL_ROOTS.fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            slot,
+            srv,
+            compute,
+            address = format_args!("{address:#x}"),
+            "a root view with no host copy behind it reads zeros (left unset it read address 0)"
+        );
+    }
+    // SAFETY: an open list; a live buffer of ours.
+    unsafe {
+        match (compute, srv) {
+            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+        }
+    }
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1231,6 +1296,9 @@ impl State {
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
                         }
+                        if !tabled {
+                            bind_null_root(l, param, compute, srv, slot, 0);
+                        }
                         continue;
                     };
                     // The shader adds the bytes a raw view begins early by.
@@ -1246,6 +1314,7 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        bind_null_root(l, param, compute, srv, slot, address);
                         continue;
                     };
                     if biased {

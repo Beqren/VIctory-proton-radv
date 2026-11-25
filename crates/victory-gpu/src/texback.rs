@@ -224,6 +224,9 @@ pub(crate) struct Back {
     mips: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+    /// With `crate::host::fetch_mark`: where in `buffer` the list writes
+    /// its mark behind the copies, and the mark.
+    mark: Option<(u64, u32)>,
 }
 
 impl Back {
@@ -238,7 +241,7 @@ impl Back {
 /// copies landed that changed nothing (not written), copies whose
 /// allocation went meanwhile, time landing (us).
 static TEXTURES: AtomicU64 = AtomicU64::new(0);
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 const RECORDED: usize = 0;
 const RECORD_US: usize = 1;
 const LANDED: usize = 2;
@@ -252,6 +255,8 @@ const FAILED: usize = 7;
 /// Textures not recorded: the host copy's format is not the title's (a
 /// stand-in of another texel size, `crate::resource::target_format`).
 const OTHER_FORMAT: usize = 8;
+/// Copies whose mark was not behind them: not written.
+const UNMARKED: usize = 9;
 
 /// Records the copy of a list's target (already in COPY_SOURCE) into a
 /// read-back buffer.
@@ -308,7 +313,15 @@ fn record_texture(
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = read_back_buffer(device, total)?;
+    // The mark behind the copies, as the relay's fetch has one
+    // (`crate::host::fetch_mark`): the card may finish a list's fence on a
+    // lost device before the loss is reported, and then the buffer holds
+    // nothing it copied (zeros), which would be tiled into title memory.
+    let mark = crate::host::fetch_mark().then(|| {
+        static SENT: AtomicU64 = AtomicU64::new(0);
+        (total.next_multiple_of(4), crate::host::mark_value(SENT.fetch_add(1, Ordering::Relaxed) + 1))
+    });
+    let buffer = read_back_buffer(device, total + if mark.is_some() { 8 } else { 0 })?;
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -325,10 +338,21 @@ fn record_texture(
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    if let Some((at, value)) = mark {
+        use windows::core::Interface;
+        // SAFETY: our buffer, in the copy destination state; the mark lies
+        // past every footprint.
+        unsafe {
+            let write = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: buffer.GetGPUVirtualAddress() + at, Value: value }];
+            list.cast::<ID3D12GraphicsCommandList2>()
+                .ok()?
+                .WriteBufferImmediate(1, write.as_ptr(), Some([D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT].as_ptr()));
+        }
+    }
     STATS[RECORDED].fetch_add(1, Ordering::Relaxed);
     STATS[RECORD_US].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     report();
-    Some(Back { buffer, footprints, rows, mips, layout, ticket })
+    Some(Back { buffer, footprints, rows, mips, layout, ticket, mark })
 }
 
 /// A read-back buffer of ours (not shader-visible), in the copy
@@ -400,6 +424,19 @@ fn land_now(back: &Back) {
             return;
         }
     }
+    if let Some((at, value)) = back.mark {
+        // SAFETY: inside the mapped buffer (made 8 bytes past the mark).
+        let seen = unsafe { std::ptr::read_volatile(data.cast::<u8>().add(at as usize).cast::<u32>()) };
+        if seen != value {
+            // SAFETY: mapped above.
+            unsafe { back.buffer.Unmap(0, None) };
+            let n = STATS[UNMARKED].fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(n, seen, value, "a texture read-back's mark was not behind its copies: not written (VICTORY_FETCH_MARK)");
+            }
+            return;
+        }
+    }
     let mut ok = true;
     for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
         let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
@@ -427,8 +464,31 @@ fn land_now(back: &Back) {
         STATS[UNCHANGED].fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let written = crate::shadow::put_back(at, &tiled, &read, &[(0, size)]);
+    // Only the pieces that changed are written: bytes the card left as the
+    // title had them are not written back over a title write that may land
+    // between the read above and the write.
+    let mut written = 0;
+    for (lo, hi) in changed_runs(&tiled, &read) {
+        written += crate::shadow::put_back(at + lo, &tiled[lo..hi], &read[lo..hi], &[(0, hi - lo)]);
+    }
     STATS[BYTES].fetch_add(written as u64, Ordering::Relaxed);
+}
+
+/// The runs of 64-byte pieces where `new` differs from `old` (equal
+/// lengths), joined where they touch: (start, end) offsets.
+fn changed_runs(new: &[u8], old: &[u8]) -> Vec<(usize, usize)> {
+    const PIECE: usize = 64;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (i, (a, b)) in new.chunks(PIECE).zip(old.chunks(PIECE)).enumerate() {
+        if a != b {
+            let (lo, hi) = (i * PIECE, i * PIECE + a.len());
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+    }
+    runs
 }
 
 /// Every 10 s while read-backs happen, in every build: textures taken,
@@ -437,24 +497,24 @@ fn land_now(back: &Back) {
 fn report() {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     static NEXT_MS: AtomicU64 = AtomicU64::new(10_000);
-    static LAST: Mutex<([u64; 9], u64)> = Mutex::new(([0; 9], 0));
+    static LAST: Mutex<([u64; 10], u64)> = Mutex::new(([0; 10], 0));
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
     let next = NEXT_MS.load(Ordering::Relaxed);
     if now < next || NEXT_MS.compare_exchange(next, now + 10_000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
-    let stats: [u64; 9] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
+    let stats: [u64; 10] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
     let frame = crate::frame::current();
     let (d, frames) = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let d: [u64; 9] = std::array::from_fn(|i| stats[i] - last.0[i]);
+        let d: [u64; 10] = std::array::from_fn(|i| stats[i] - last.0[i]);
         let frames = frame.saturating_sub(last.1).max(1);
         *last = (stats, frame);
         (d, frames)
     };
     tracing::info!(
         "texture read-back (VICTORY_TEXTURE_BACK), last 10 s: {} textures taken so far; {} copies recorded ({} not: \
-         host format differs), {} landed ({} unchanged), {} stale, {} failed (memory unreadable, not mapped or not \
+         host format differs), {} landed ({} unchanged), {} stale, {} unmarked, {} failed (memory unreadable, not mapped or not \
          tiled); {} KiB written ({:.1} KiB a frame begun over {frames} frames begun); CPU {:.2} ms recording, \
          {:.2} ms landing ({:.3} ms a frame begun)",
         TEXTURES.load(Ordering::Relaxed),
@@ -463,6 +523,7 @@ fn report() {
         d[LANDED],
         d[UNCHANGED],
         d[STALE],
+        d[UNMARKED],
         d[FAILED],
         d[BYTES] >> 10,
         d[BYTES] as f64 / 1024.0 / frames as f64,
@@ -492,6 +553,17 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn changed_runs_are_whole_pieces_joined() {
+        let old = vec![0u8; 300];
+        let mut new = old.clone();
+        assert!(changed_runs(&new, &old).is_empty());
+        new[5] = 1;
+        new[70] = 1;
+        new[299] = 1;
+        assert_eq!(changed_runs(&new, &old), vec![(0, 128), (256, 300)]);
     }
 
     #[test]
@@ -761,8 +833,19 @@ mod tests {
                         land(&back);
                         assert_eq!(STATS[BYTES].load(Ordering::Relaxed), bytes, "{what}: unchanged texels written again");
                         assert_eq!(STATS[UNCHANGED].load(Ordering::Relaxed), unchanged + 1);
-                        // The allocation released meanwhile: not written.
+                        // The mark not behind the copies (as on a device
+                        // lost before the copies ran): nothing written.
                         title[..size].fill(0);
+                        let (mark_at, _) = back.mark.expect("the mark is on by default");
+                        let mut data = std::ptr::null_mut();
+                        back.buffer.Map(0, None, Some(&mut data)).unwrap();
+                        std::ptr::write_volatile(data.cast::<u8>().add(mark_at as usize).cast::<u32>(), 0);
+                        back.buffer.Unmap(0, None);
+                        let unmarked = STATS[UNMARKED].load(Ordering::Relaxed);
+                        land(&back);
+                        assert!(title[..size].iter().all(|&b| b == 0), "{what}: an unmarked read-back written");
+                        assert_eq!(STATS[UNMARKED].load(Ordering::Relaxed), unmarked + 1);
+                        // The allocation released meanwhile: not written.
                         released(0x7e57_0000 + checked);
                         land(&back);
                         assert!(title[..size].iter().all(|&b| b == 0), "{what}: a released allocation written");

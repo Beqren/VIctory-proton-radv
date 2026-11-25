@@ -2895,7 +2895,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// shaders wrote. Three later runs that lost the device (tail-1, tail-2,
 /// pairoff-1) ended at the removal check in [`Host::relay_land`] instead:
 /// it saw the removal in time there.
-fn fetch_mark() -> bool {
+pub(crate) fn fetch_mark() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_MARK").is_none_or(|v| v != "0"))
 }
@@ -2903,7 +2903,7 @@ fn fetch_mark() -> bool {
 /// The mark fetch number `sent` writes ([`fetch_mark`]): never 0, so a
 /// buffer the card never wrote does not pass, and never the mark of the
 /// fetch before, so that one's leftover does not pass either.
-fn mark_value(sent: u64) -> u32 {
+pub(crate) fn mark_value(sent: u64) -> u32 {
     (sent as u32) | 0x8000_0000
 }
 

@@ -384,6 +384,17 @@ Fixes (branch `warm-pipelines`):
   priority (`VICTORY_PIPELINE_WARM=0` turns this off,
   `VICTORY_PIPELINE_WARM_MAX` caps it); a draw that asks for it first takes
   it over.
+- Measured (diagnostics build, 240 s, 200 s of world, one run each,
+  2026-11-25): with an empty record, the world's first frame 3,532 ms (it
+  is still a loading frame), after it the longest frame 834 ms, none over
+  1 s, at most 325 ms of a frame waiting for pipelines; with the record of
+  that run (1,842 pipelines), all 1,853 started were made during the
+  title's load (in 21 s, 3.0 s of translation and 0.9 s of host compile
+  summed: every cache warm), 1,815 of 1,842 first uses found their pipeline
+  made, the world's first frame took 931 ms, the longest 568 ms, at most
+  66 ms of a frame waiting. Of the first uses, 1,820 came more than 10 s
+  after the title created the pipeline. The shared baseline (base15) had
+  frames of 4,454, 1,440 and 1,028 ms before its device was removed at 78 s.
 - Every build logs each frame of more than a second in the world with what
   its threads waited for pipelines, and every second the longest frame and
   the pipeline waits; each host pipeline's translation and host compile

@@ -1425,10 +1425,50 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. A host list
+/// orders its draws, but not its dispatches' shader writes: two
+/// dispatches in a row may overlap without a UAV barrier between them, and
+/// the title orders its compute passes with these syncs. Each records one
+/// (`VICTORY_SYNC_BARRIER`, on; `0`: nothing, as before). The face
+/// network's chain of about a thousand small dispatches a frame
+/// (`compute_graph_ops`) read tensors earlier passes had not finished
+/// writing.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if sync_barriers()
+        && let Some(list) = host_list(this)
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            static FRAME: AtomicU64 = AtomicU64::new(0);
+            let frame = crate::frame::current();
+            if FRAME.swap(frame, Ordering::Relaxed) != frame {
+                let n = COUNT.swap(0, Ordering::Relaxed);
+                if frame.is_multiple_of(20) {
+                    tracing::info!(frame, before = n, "pipeline syncs recorded as UAV barriers in the frame before");
+                }
+            }
+            COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: the same layout; no resource named.
+        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: an open list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
+/// Whether a pipeline sync records a wait for every earlier shader write
+/// ([`sync`]; `VICTORY_SYNC_BARRIER=0` turns it off).
+#[cfg(windows)]
+fn sync_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_none_or(|v| v != "0"))
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.

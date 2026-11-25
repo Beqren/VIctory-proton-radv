@@ -3345,7 +3345,22 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            // The arguments as they stand when the list is recorded, in
+            // title memory and in the host copy's CPU side: what the
+            // dispatches that write them (a culling pass) left there last
+            // (diagnostics: a mesh draw with no groups draws nothing and
+            // is not dropped).
+            let mut title = [0u8; 12];
+            let mut host = [0u8; 12];
+            let words = |b: &[u8; 12]| -> [u32; 3] {
+                [0, 1, 2].map(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+            };
+            let title = crate::host::read_into(arguments as *const u8, &mut title).then(|| words(&title));
+            let host = args.peek(arguments, &mut host).then(|| words(&host));
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x} args title {title:?} host {host:?}"),
+                kind == DISPATCH,
+            )
         });
         if kind == MESH {
             self.mesh_scissor(list, true);

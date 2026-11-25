@@ -2036,6 +2036,44 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+/// A structured buffer view that is neither a raw view (its bytes do not
+/// start on 16 in the host copy, `raw_window`) nor on an element of the
+/// host copy (the copy starts where the title buffer does, which need not
+/// be on the view's stride): the same bytes as a structured view of
+/// dwords, `first` dword and count. Translated shaders read untyped buffers
+/// as bytes at `element * stride + offset`, the stride taken from the
+/// title's view (the slot stride table, `note_buffer`) or the used-resource
+/// entry, not from the host view; a structured view of 12-byte elements
+/// was the one already used when the bytes start on an element.
+///
+/// Before, such views were left null: 128 to 256 distinct views a run of
+/// 12-byte elements ("buffer views left null: not on an element of their
+/// host copy", runs of 2026-11-25), among them the positions the pre-skinned
+/// meshlet culling (`CS_BatchCullPreSkinnedMeshlets`, 9f017d9011377efa)
+/// reads by heap index to bound each meshlet (a guess: with zeros there it
+/// would cull them). Run skin-10 (2026-11-25): 17 views made this way in
+/// the prologue, and the heads were still missing; so it is off by
+/// default, `VICTORY_BUFFER_DWORD_VIEWS=1`.
+fn dword_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_DWORD_VIEWS").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    if stride == 0 || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let start = first.checked_mul(u64::from(stride))?.checked_add(offset)?;
+    if !start.is_multiple_of(4) {
+        return None;
+    }
+    let dwords = u32::try_from(u64::from(count) * u64::from(stride) / 4).ok()?;
+    DWORD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some((start / 4, dwords))
+}
+
+/// Since the start: buffer views made as views of dwords (`dword_window`).
+pub(crate) static DWORD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
@@ -2163,15 +2201,25 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
-    let element = element_size(&desc);
+    let mut element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     if window.is_none() {
         if element == 0 || offset % element != 0 {
-            left_null("not on an element of their host copy", false, address, len, element, buffer.FirstElement);
-            return None;
+            match dword_window(offset, buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride) {
+                Some((first, count)) => {
+                    // Dwords of the same bytes (see `dword_window`).
+                    (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride) = (first, count, 4);
+                    element = 4;
+                }
+                None => {
+                    left_null("not on an element of their host copy", false, address, len, element, buffer.FirstElement);
+                    return None;
+                }
+            }
+        } else {
+            buffer.FirstElement += offset / element;
         }
-        buffer.FirstElement += offset / element;
     }
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
@@ -2227,7 +2275,7 @@ fn buffer_uav(
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
+    let mut element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
@@ -2244,11 +2292,19 @@ fn buffer_uav(
         buffer.NumElements = count;
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    } else {
-        if element == 0 || offset % element != 0 {
-            left_null("not on an element of their host copy", true, address, len, element, buffer.FirstElement);
-            return None;
+    } else if element == 0 || offset % element != 0 {
+        match dword_window(offset, buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride) {
+            Some((first, count)) => {
+                // Dwords of the same bytes (see `dword_window`).
+                (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride) = (first, count, 4);
+                element = 4;
+            }
+            None => {
+                left_null("not on an element of their host copy", true, address, len, element, buffer.FirstElement);
+                return None;
+            }
         }
+    } else {
         buffer.FirstElement += offset / element;
     }
     buffer.CounterOffsetInBytes = 0;

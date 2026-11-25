@@ -2,26 +2,27 @@
 
 How this layer is built and run on Linux, with Wine and vkd3d-proton on a Vulkan
 driver (RADV, AMD RX 9070), what broke there, and how it was fixed. The state is
-that of 2026-11-24. It was found on one machine.
+that of 2026-11-25. Everything measured here was measured on one machine.
 
 Paths here are generic. `<data>` is a data directory outside the repository (it
-holds the game files, the cache, the Wine prefix and the scripts). Nothing from
-the game belongs in the repository (see `asset-policy.md`).
+holds the game files, the cache, the Wine prefixes and the scripts). Nothing from
+the game belongs in the repository (see `asset-policy.md`); only shader hashes and
+counts appear here.
 
 ## What works and what does not
 
-The title boots, reaches the world and renders part of it. It runs at about 0.3 to
-0.5 frames a second. **It is not playable.**
+The title boots, reaches the world and renders part of it. On the stock Proton a
+world frame took 2 to 3 s (0.3 to 0.5 frames a second); on the Proton with the
+patched wineserver (below) it took about 1 s in the first runs, and 324 ms in the
+first 30 s of the world of one run. **It is not playable.** No run has been
+tested past ten minutes.
 
-- Ray tracing is off on purpose. Most of the draws a diagnostics build reports as
-  dropped are ray-tracing passes. Ignore those.
-- Frames are slow, mostly because of the cost of tracking the title's memory
-  under Wine. A late world frame took 2 to 3 s while the GPU needed about 0.2 s,
-  and the process used under 2 s of CPU in a 3.3 s frame: it mostly waits.
-  This comes from a read-only study of the code, not from a measurement (see
-  Known open problems).
-- Some textures arrive late.
-- Some pipelines are still not made (see Known open problems).
+- Ray tracing is off on purpose (see "Ray tracing"). Most of the draws a
+  diagnostics build reports as dropped are ray-tracing passes. Ignore those.
+- Every vertex, pixel and mesh program of the pack translates (14,247 of 14,247
+  and 8,765 of 8,765); 2,677 of 2,682 compute programs do (scan at a22290d).
+- Some textures still arrive late while the card is full.
+- Two failures were seen once each and are open (see Known open problems).
 
 ## Requirements
 
@@ -31,13 +32,16 @@ The title boots, reaches the world and renders part of it. It runs at about 0.3 
   the first world pipeline. Proton Experimental's (g2576c0b4a, 2026-11-12) converts
   them correctly. Checked 2026-11-24 with pixel shader c0a7fe77b1862e10 and compute
   shader 4e296b1885c37b29.
+- **For speed, a copy of Proton Experimental with a patched wineserver** (see "The
+  patched Proton"). Stock Proton works, but its frames are about three times slower.
 - **Microsoft's `d3dcompiler_47.dll` in the prefix's `system32`**, with the DLL
   override `d3dcompiler_47=n`. The layer compiles helper shaders at run time with
   `D3DCompile`. Wine's own `d3dcompiler_47` refuses three of them (the indirect
   argument clamp, the depth-plane twin, the compare on the card). The world's
   indirect draws are then dropped and the screen is mostly black. The DLL was
   copied from a Steam game; Wine's own stays beside it as
-  `d3dcompiler_47.dll.wine-builtin`. A new prefix needs the copy again.
+  `d3dcompiler_47.dll.wine-builtin`. A new prefix needs the copy again (the rebuild
+  script does it).
 - **cargo-xwin** for the Windows build, with a Rust toolchain that has the
   `x86_64-pc-windows-msvc` target. `<data>/toolchain/env.sh` sets `CARGO_HOME`,
   `RUSTUP_HOME` and `PATH` for the toolchain kept in the data directory.
@@ -55,7 +59,7 @@ worktree's `target/` from an existing one to skip a long first build.
 
 A diagnostics build (`--profile diag --features diagnostics`, output under
 `.../diag/`) logs much more, including per-frame timers (`copystat`) and why each
-draw was dropped.
+draw was dropped. Frame capture (below) and the keys switch work in every build.
 
 The shader crate's unit tests run natively and take seconds:
 
@@ -69,12 +73,24 @@ one the game uses). Results go to a log directory in the data directory.
 
 ## Running
 
-The launcher `proton-run-experimental.sh` is a sh script in the data directory:
+Every launch goes through `tools/vx.sh` (below); do not call umu-run or Proton
+directly when several jobs share a machine. Two launchers for a person are in the
+data directory:
+
+- `play.sh`: the merged build on the real screen, with sound, no time limit, on
+  stock Proton Experimental and its prefix.
+- `play-viewtree.sh`: the same on the patched Proton and its own prefix. `test`
+  as an argument starts the newest unmerged test build. It takes its turn behind
+  any automated job.
+
+Both press A on the start screen for the first 90 seconds and write the title's
+output to a log in the data directory. The older `proton-run-experimental.sh`
+starts one job without the queue:
 
     ./proton-run-experimental.sh run 'Z:\path\to\game_scarlett_master.exe' --execute
 
-Paths in the arguments are Windows paths (`Z:` is the Linux root). Its settings,
-each with its reason:
+Paths in the arguments are Windows paths (`Z:` is the Linux root). The settings
+that every launch makes, each with its reason:
 
 - `WINEPREFIX`: a prefix of its own for this layer, with the `d3dcompiler_47.dll`
   described above.
@@ -86,25 +102,37 @@ each with its reason:
 - `VKD3D_SHADER_CACHE_PATH`: vkd3d-proton writes `vkd3d-proton.cache` into the
   working directory unless told where.
 - `VICTORY_KEYS`: presses Enter (the pad's A) every 2 s for the first 90 s, which
-  gets past the start screen without a pad. It needs a build with commit "Input:
-  VICTORY_KEYS works in every build" (before it, only diagnostics builds read it).
-  Set `VICTORY_KEYS=` (empty) to turn it off.
+  gets past the start screen without a pad. It works in every build (commit
+  689166c). Set `VICTORY_KEYS=` (empty) to turn it off.
 - `VICTORY_EXE`: a Linux path of another build.
 - Output: Proton does not relay a console program's output, so the launcher runs
   the program under `cmd /c` with output redirected to `last-run.log` and prints
   it afterwards.
 
-### Several jobs on one machine
+### Several jobs on one machine: `tools/vx.sh`
 
 When several people or agents share one machine, one prefix and one GPU, two Proton
 jobs at once corrupt each other. `tools/vx.sh` (kept in the data directory) takes a
-lock, runs one job and writes a log of its own:
+lock (`<data>/.proton.lock`), runs one job and writes a log of its own:
 
     vx.sh [-s] [-t seconds] [-i idle-seconds] <victory.exe> <log> <victory arguments...>
 
+- Jobs queue in front of the lock. A job of 120 seconds or less goes first, in
+  order of arrival; then the long ones, in order of arrival; a job that has waited
+  ten minutes goes ahead of everything that came after it. (Plain lock waiting sat
+  14 minutes behind a string of four-minute title runs on 2026-11-25.) A job also
+  waits while any `victory.exe` of anybody's is still running.
 - Jobs run in an off-screen KWin (`offscreen.sh`) with sound sent to a null sink.
   `-s` (on the real screen) counts only with `VX_ALLOW_SCREEN=1`; `VX_AUDIO=1`
-  keeps the sound.
+  keeps the sound; `VX_FIRST=1` puts the job first in the queue (a person starting
+  it himself).
+- `VX_PROTON` and `VX_PREFIX` pick another Proton and another prefix (default:
+  Valve's installed Proton Experimental and `<data>/prefix-experimental`). Use
+  both together for the patched Proton:
+
+      VX_PROTON=<compatibilitytools.d>/Proton-Experimental-viewtree VX_PREFIX=<data>/prefix-viewtree \
+        tools/vx.sh -t 60 <victory.exe> <log> config
+
 - `-t` kills the job after that many seconds (default 600; exit status 124).
 - `-i` calls the job hung when `victory.exe` has used no CPU time for that many
   seconds, and kills it (exit status 97). A worker thread that Wine ended leaves
@@ -112,6 +140,91 @@ lock, runs one job and writes a log of its own:
 - The log has the colour codes removed. `<log>.proton` has Proton's output.
 - `run` gets the scripted A presses unless `VICTORY_KEYS` is set.
 - `VICTORY_*` variables pass through.
+
+## The patched Proton
+
+### Why
+
+A world frame was slow because wineserver keeps a process's memory views in a
+linked list. The title holds about 125,000 views (123,000 to 135,000 in diagnostics
+runs), and every page remap the runtime makes goes through two walks of that list
+in the single-threaded server: `map_view` calls `is_valid_view_addr`, which walks
+every view, and `unmap_view` calls `find_mapped_view`, which walks from the head.
+The runtime remaps 1,000 to 4,000 single 64 KiB pages a frame. Each remap is
+Wine view calls that cost more the more views are alive, and ntdll holds its
+process-wide `virtual_mutex` across the server request, so every VirtualProtect,
+VirtualQuery and GetWriteWatch on every thread waits behind it. A bench
+(`viewbench2`) of one page remapped as a view cost 23.6 us with 100 views alive and
+552 us with 125,000 (measured on one machine).
+
+The fix is a published wineserver patch (Wine bug 60868; CachyOS/wine-cachyos pull
+request 50, commit fd66dbca8eb0754839ca974e45b5ea446ca62d2f). It touches only
+`server/file.h`, `server/mapping.c`, `server/process.c` and `server/process.h`: an
+rb-tree keyed by view base, kept beside the list, so each view call is O(log n).
+Only `files/bin/wineserver` of Proton differs.
+
+Measured on one machine (`<data>/wine-viewtree/NOTES.md`):
+
+| views alive | stock, one page remapped | patched |
+|---:|---:|---:|
+| 100 | 63.8 us (noisy; 14-24 us in earlier benches) | 9.3 us |
+| 10,000 | 113.6 us | 11.5 us |
+| 50,000 | 249.8 us | 12.0 us |
+| 125,000 | 520.9 us | 12.2 us |
+
+Title runs of 240 s, median world frame: 2,862 and 3,206 ms on stock; 982 ms on a
+patched run, 708 ms in the owner's patched play, and 324 ms in the first 30 s of
+the world of a second patched run (not representative). With the patch texture
+refreshes fell from about 1.2 s a frame to 7 to 21 ms (they no longer wait for the
+mapping lock), the world was reached 33 to 37 s after the start instead of about
+86 s, and the wineserver used about 7 ticks a second instead of about 79. The
+patched runs dropped fewer draws, not more. Upstream reports a world frame of 3.6 s
+going to 1.1 s. One run of each; the runs were single and not repeated.
+
+### What it is
+
+- A copy of Valve's Proton Experimental (reflink copy) in
+  `<compatibilitytools.d>/Proton-Experimental-viewtree`, with the patched server as
+  `files/bin/wineserver` and Valve's as `files/bin/wineserver.stock`. It has no
+  `compatibilitytool.vdf`, so Steam does not list it: it is for umu, `vx.sh` and
+  `play-viewtree.sh`.
+- Its own prefix, `<data>/prefix-viewtree`, created by Proton on the first run,
+  with Microsoft's `d3dcompiler_47.dll` copied in.
+- Built from Wine's source at the commit Valve's tag names, shallowly fetched, with
+  the patch applied; only `server/wineserver` is built. The binary's dynamic imports
+  are the stock server's (libc only), so it runs in umu's container as it is.
+
+### Keeping it current: `tools/proton-viewtree-rebuild.sh`
+
+The copy stays at the Proton Experimental it was made from until it is rebuilt. Its
+wineserver must match its own `ntdll.so` exactly: **never put this wineserver into
+a newer Proton.** The script `tools/proton-viewtree-rebuild.sh` (a copy of
+`<data>/wine-viewtree/rebuild.sh`, with the paths in variables at its top) does the
+whole rebuild from Valve's installed Proton Experimental:
+
+1. Reads the `version` file for the tag and finds that tag's `wine` submodule commit
+   with the GitHub API.
+2. Fetches only that commit into a fresh source directory, checks the patch's sha256
+   and applies it. If the patch does not apply cleanly it stops and says so: someone
+   has to port the patch.
+3. Runs Wine's own generation steps (`make_vulkan`, `make_specfiles`,
+   `make_requests`, `autoreconf`), configures, and builds only `server/wineserver`
+   (about 2 minutes).
+4. Checks the generated protocol version against the installed `ntdll.so` (Valve's
+   committed header says 930 and lacks the fsync requests; `make_requests`
+   regenerates it as 931, and the stock `ntdll.so` compares against `$0x3a3`). It
+   stops if the version is not found in the `ntdll.so`, because then the tree is not
+   the one Proton was built from.
+5. Stages a new copy of Proton, then, holding the Proton lock (`flock -n` on
+   `<data>/.proton.lock`; it fails with a message if a job holds it) replaces the old
+   copy. A failed build or a held lock leaves the old copy in place.
+6. Makes sure the prefix has Microsoft's `d3dcompiler_47.dll` (copied from the
+   other prefix), and prints what it built and from which commits.
+
+It never touches Valve's install and does not use sudo. It is safe to run twice.
+If Wine merges bug 60868 or Valve takes the patch, drop all this and use stock.
+After a rebuild, the view bench in `<data>/wine-viewtree/` shows that a remap stays
+flat as views grow.
 
 ## Problems found under Proton, and their fixes
 
@@ -147,7 +260,9 @@ Two fixes:
   pipeline is seen, its pipeline is given up (its draws or dispatches are dropped,
   and it is not tried again in the run) and a new worker takes its place. The log
   says "a pipeline worker ended while making a host pipeline". `runstat.py` counts
-  these as "worker deaths".
+  these as "worker deaths". A later change (d1d1a9e) makes a wait for a pipeline
+  never join a worker that is making it, does not make a queued pipeline known to
+  end workers, and remembers what ended a worker by its whole set of shaders.
 - Commit 6b1d840: the cause. The converter's recursion was in
   `CFGNode::find_common_dominator` and `recompute_immediate_dominator`, on a loop
   with two back edges (a `continue`). DXC writes loops with one latch only, so
@@ -156,6 +271,68 @@ Two fixes:
   program does the same either way. With one latch the three convert and their
   pipelines are made. `VICTORY_ONE_LATCH=0` turns it off; the shader cache keys on
   the switch.
+
+### A mesh pipeline refused for blending on an integer target
+
+The mesh pipeline [mesh f5e50eb2108c425b, pixel ce3f0432a08f1d35] blends an
+`R8_UINT` render target with MAX, and vkd3d-proton refused it with `E_INVALIDARG` in
+every run. Fixed in commit 4f51ca6: host pipelines do not blend on integer targets.
+A refused mesh pipeline's warning now names its state.
+
+### "dstorage: request failed ... hr=0x800703e6" in the middle of a run
+
+Symptom: a run ended at the title's own breakpoint after a DirectStorage request
+failed with `ERROR_NOACCESS`. It happened one start in three within two seconds in
+one batch of runs, and three minutes into the owner's play on the patched Proton.
+The patched wineserver reaches it sooner because the world is reached sooner; it
+also happened on stock Proton.
+
+Cause: a race. Every such failure was a raw request (options 0x0) of 1 to 45 KB: a
+file read by the kernel straight into title memory. The kernel's write does not
+fault into the layer's page guard handler, so the layer opened the guarded blocks
+first (`kernel_will_write`), but a copy on another thread could put the guard back
+before the read landed, and the read failed.
+
+Fix, commits bda311b, 37e360d and 7669a65: requests into a title address are read
+into a buffer of the layer's and written in from user mode (`write_title_memory`:
+a block guarded meanwhile faults, is opened and noted as written). The write holds
+the reading lock so that no remapping leaves a gap, checks that each page is
+committed and writable or guarded by the layer, and is tried again 12 times
+(`VICTORY_DSTORAGE_RETRIES`) before the request fails. `fread` into title memory
+reads beside in 1 MiB chunks the same way. After review, every view of the written
+pages is noted as written after the write. `VICTORY_READ_BESIDE=0` reads in place,
+as before. A test under Proton shows `0x800703e6` read in place and `S_OK` read
+beside.
+
+### The character's black face
+
+Symptom: the main character's head, face and neck were drawn black or as the null
+placeholder in the opening's close-ups, for tens of frames.
+
+Cause, from the slot listing (`VICTORY_LIST_SLOTS`): the head's 1024x1024 BC5 and
+BC7 maps and a 512x512 BC7 map were in the queue of textures picked by index, due
+since frame 835 among about 9,000 due slots, and were still null at frame 866. While
+the card was at nine tenths of its budget the pass admitted nothing new and gave up
+after 256 slots; the card then stood at 97% for minutes. A second cause was the
+stale rule: under the 4 KiB rule 42,974 slots were made stale in one run and the
+face was black again, with no view made stale it was drawn.
+
+Fixes, helped by the faster frames of the patched wineserver:
+
+- Commit 20efa1a (`VICTORY_TEXTURE_STARVED=0` turns this and the next off): on a
+  full card the pass serves the slots written longest ago first, and slots due 8
+  frames or more take a reserve band up to 96% of the budget
+  (`VICTORY_TEXTURE_RESERVE_PERCENT`), at most 64 MB a pass.
+- Commit 083b06c: the draws of the character shaders note the slots their material
+  record names, and on a full card those come first and may be made up to 99% of
+  the budget, 32 MB a pass (`VICTORY_TEXTURE_ASKED=0` turns it off).
+- The stale rule stays at the overlap rule (a newer view makes an older one stale
+  wherever their spans overlap). `VICTORY_STALE_TEXTURES=start` selects the 4 KiB
+  rule, `=0` makes none stale; the two runs that tried the 4 KiB rule were under the
+  stock Wine, and it is not the default until a run under the patched one measures it.
+- `tools/face_time.py` measures the result: from the per-frame log line of character
+  textures asked for and missing on the card, it prints the frames and seconds after
+  the world's first frame until none is missing.
 
 ### "a descriptor read only as data"
 
@@ -171,28 +348,121 @@ it (width, height and base level are in dwords 1 to 3).
 Fix, commit fa37224: the size comes from the host, as it does for a descriptor that
 is sampled. 35 pixel programs of the pack translated afterwards, and three of them
 had dropped about 10 draws a frame. Shortcut: such a descriptor is taken for a 2D
-texture's, as nothing says what it is.
+texture's, as nothing says what it is. Commit 94676fc does the same for a buffer
+descriptor loaded only for its address or record count.
 
 This one is not Proton-specific. It was found while looking at dropped draws in
 Proton runs.
 
-### Translator additions (commit c93f5b7)
+### Other translator additions
 
-`v_cvt_f32_f64` and `v_add_f64` sums, the first half of an interpolation read as
-data, and `v_permlane16`/`v_permlanex16`. Ported from victory-fork's 3bff182 and
-31714de. 12 more programs of the pack translate. Also not Proton-specific.
+Not Proton-specific either: `v_cvt_f32_f64` and `v_add_f64` sums, the first half of
+an interpolation read as data, and `v_permlane16`/`v_permlanex16` (c93f5b7, 12
+programs); a sampler picked between immediate samplers by a join (cd0ca14, 40
+programs); primitive-ordered pixel programs, with their heap UAVs as
+rasterizer-ordered views (e3fc61c, ten programs); a lane mask copied a dword at a
+time (f8016e0); first halves of interpolations evaluated as pairs only in a program
+refused for one, with the second translation made in `emit` so that the offline
+tools get it too (8dfd60d, a22290d). With these the scan reaches the counts above.
+
+## What was tried for the frame time
+
+Frames were slow because of the view list (see "The patched Proton"). Before that
+was found, the measured breakdown of a 3.6 s world frame on stock Proton was:
+preparing submissions 3,096 ms (texture refreshes 1,634, of which 1,481 waiting
+for the title-memory mapping lock; buffer-copy refreshes 1,109, of which 1,018 in
+write-watch and guard checks), waiting for the GPU 164 ms, copying back what shaders
+wrote 314 ms. The submitting thread ran only about 255 ms of CPU in the frame: it
+waited. wineserver ran at one core, 85 to 90 ticks a second.
+
+Tried on stock Proton and what came of it (`<data>/notes/`):
+
+- Title memory's mapping lock by range (`VICTORY_MAP_RANGES=1`, e49433f): reads'
+  wait fell from a median of 202 ms a frame to 0, all of it false contention, but
+  the median world frame stayed at 2.4 s because the frame waits on the remaps
+  themselves.
+- The GPU's page mappings as private copies, not Wine views
+  (`VICTORY_ALIAS_COPY=1`, dd30398): 1,830 ms a frame down to 840 ms (2.2x), views
+  alive 122-129k down to 83-86k. Not correct: 34 to 622 copies a frame differed from
+  their page. It stays off. It showed what removing the views is worth.
+- Joining page views (`VICTORY_VIEW_JOIN=1`, 3d694f4): views 123-126k down to
+  98-100k, each remap memory call 0.57-0.80 down to 0.43-0.57 ms, but the GPU's
+  mappings' time a page did not fall. Not a demonstrated win: off.
+- Leaving page mappings undone that change nothing (`VICTORY_REMAP_SAME`): 0 of
+  2,000 to 3,700 pages a frame were already mapped as asked. Gained nothing.
+- Known ranges in view memory go to the guards without a failing `GetWriteWatch`
+  call (`VICTORY_VIEWS_KNOWN`, on by default): failed calls fell from 4,536-7,852 a
+  frame to 536-687; frame time unchanged within noise.
+- Also without gain: `VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
+  `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`,
+  `VICTORY_LATE_WAIT_LISTS=256`.
+- Mapping memory behind Wine's back (memfd and `mmap` through raw Linux system calls,
+  for a true alias that costs no Wine view) is not possible. Wine 11 turns on
+  syscall user dispatch for every thread: a raw `syscall` instruction in the layer's
+  code outside glibc is trapped and served as an NT system call (getpid returned
+  0xC0000005, memfd_create 0xC000001C, which are NT status codes). The ways round
+  it depend on Wine internals and work around the interception; the answer was the
+  server patch above.
+- `winbench` (`tools/winbench`) times the Windows memory calls the write tracking
+  uses, alone and with four contending threads. Contention is what multiplies
+  costs: a write-watch reset that finds pages 10x, a guard fault 9x,
+  `VirtualProtect` on a 256 MiB view 38x. `VirtualProtect` on views costs about 19x
+  more a page than on private memory. These are inferences from one machine, not
+  traced.
+
+## Ray tracing
+
+It stays off. The builder programs (52) all translate and get host pipelines, and
+28 of the 33 trace programs dumped for the study translate; the 1,000 per-material
+resolve programs translate too. What is missing is correctness: with
+`VICTORY_BVH_BUILDER=1` the title crashes within seconds on pointers that have
+become bounding-box bit patterns (`0x7c007c00fc00fc00`, `0x7f800000ff800000`, the
+empty-box values), so the builder's stores land in the title's own objects. Cause
+not proven; the likely one is memory reached through pointers read out of memory,
+which is not made ready (a documented shortcut). With the quarantine switch the
+process ran on silent until the time limit. Five shadowmask trace programs do not
+translate (`emit: a descriptor read only as data`), and the cost of the address
+path is unmeasured. The ordered work to first lit shadows is in
+`<data>/notes/ray-tracing-plan.md`: estimated at 3 to 5 weeks of one person, most of
+the uncertainty in finding where the builder's stores land.
+
+TuxBox (another project) was tried on this card and renders black, and it is not a
+way over: its translator refuses every program with the console's node instruction,
+and the only exceptions are programs of a different title matched by hash. Its own
+builder is not used for this title. In a traced run every batched build carried a
+console extension that TuxBox refuses, and host structures do not fit the
+console's buffers (host TLAS sizes were larger). What transfers is the point to
+intercept builder calls, for a guard rail and for make-ready extents
+(`<data>/notes/ray-tracing-tuxbox.md`).
+
+## Capture
+
+`VICTORY_CAPTURE=<folder>` saves presented frames in every build.
+`VICTORY_CAPTURE_EVERY=<k>` saves every k-th frame from the world's first frame on
+(the first frame of 500 draws or more); a save costs 70 to 80 ms of a 2.5 to 3 s
+world frame. The folder holds `frame-<n>.png` (1920x1080) and `frames.tsv`. Use a
+fresh folder a run, as a Windows path.
+
+- `tools/shots.py`: compares the frames two runs saved. Frames of the same shot are
+  paired by thumbnail, because the opening cutscene runs on the title's clock and
+  frame N is not the same picture from run to run; it judges by the median of the
+  pairs' differences. A run without world frames is the worse one.
+- `sheet.py` (in the data directory's `tools/`): a contact sheet of one run's world frames, labelled with the
+  frame and the seconds since the world's first frame (needs Pillow).
+- `tools/face_time.py`: see "The character's black face".
 
 ## Checking tools
 
-These live in `tools/` of the data directory, not in the repository. All launches go
+`vx.sh`, `scan.sh`, `pipes.sh`, `time1.sh`, `offscreen.sh`, `runstat.py` and
+`sheet.py` live in `tools/` of the data directory; `shots.py`, `face_time.py`, the
+rebuild script and `winbench` are in the repository's `tools/`. All launches go
 through `vx.sh`.
 
 - `scan.sh <victory.exe>`: translates every program of the shader pack, off-screen,
   in about 3 minutes. The numbers are exact (the same build gives the same). It
-  prints how many programs translate per stage and the failures by kind. Baseline
-  at c93f5b7: 14199 of 14247 vertex and pixel, 2674 of 2682 compute, 8762 of 8765
-  mesh. (The comment in `scan.sh` still gives the figures of fa37224: 14191, 2670,
-  8762.)
+  prints how many programs translate per stage and the failures by kind. Baseline at
+  a22290d (2026-11-25): 14,247 of 14,247 vertex and pixel, 2,677 of 2,682 compute,
+  8,765 of 8,765 mesh.
 - `pipes.sh <victory.exe> <.cdxil file or directory>...`: for each shader, does it
   translate and does the host make a pipeline of it. About 5 s a file. Prints `OK`,
   `HUNG` (idle for 10 s) or `FAIL` with what the tool said. Corpora in the data
@@ -208,8 +478,9 @@ through `vx.sh`.
 
       vx.sh -t 180 <victory.exe> <log> run 'Z:\path\to\game_scarlett_master.exe' --execute
 
-  Judge it by its log only. Scenes differ between runs by wall-clock time, so
-  differences in frame time under about 30% between two single runs are noise.
+  It runs off-screen and muted. Judge it by its log only. Scenes differ between runs
+  by wall-clock time, so differences in frame time under about 30% between two single
+  runs are noise.
 - `runstat.py <label>=<log> ...`: a table to compare logs. What its rows mean:
   - frames presented: the last `frame presented` number.
   - ms/frame, draws/frame, dropped (no pipeline), dropped (indirect): medians over
@@ -226,27 +497,24 @@ through `vx.sh`.
   the other VIctory repositories (victory-amd, victory-fork, VIctory) that moved
   since the last look. `--ack` records the heads as seen.
 
-I have not run these tools for this guide, so there are no run figures here beyond
-the scan baseline above.
-
 ## Known open problems
 
-- Frame time. The working account, from a read-only code study at c93f5b7 and not
-  yet measured: the title's memory is tracked with Wine's write watches
-  (`GetWriteWatch`) and page guards. A late diagnostics frame showed 66.5
-  submissions, 3038 watch calls costing 1762 ms (guard time included), and about
-  2 s between a present and the first command list call. The same range is asked
-  about again and again, and nothing is kept between submissions. The statistics
-  are misleading: "checked" counts answers from the journal too, so 15.9 GB checked
-  is not bytes scanned by the kernel. The notes (`tools/notes-write-watch.md`) list
-  ranked suggestions, none tried, and unexplained time (what the title does in
-  those 2 s). Tried without gain: `VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
-  `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`,
-  `VICTORY_LATE_WAIT_LISTS=256`.
-- Shaders that do not translate: at c93f5b7, 48 vertex and pixel, 8 compute and 3
-  mesh programs of the pack.
-- Ray tracing is off.
-- Some textures arrive late.
-- vkd3d-proton's converter may fail on other programs the same way. The worker
-  watch makes that cost one pipeline, not a lost worker, but the pipeline is then
-  missing for the run.
+- A GPU ring timeout, seen once: the kernel's amdgpu log said "ring gfx timeout" and
+  the device was removed, after a submission of compute pipelines that took 2 s. The
+  cause is not known.
+- An access violation in the title, seen once. The cause is not known.
+- Nothing has been tested past ten minutes.
+- The patched Proton goes stale whenever Valve updates Proton Experimental: run
+  `tools/proton-viewtree-rebuild.sh`.
+- Some textures still arrive late while the card is full. The black face is helped,
+  not proven fixed.
+- Ray tracing is off (see "Ray tracing").
+- Shaders that do not translate: 5 of the pack's 2,682 compute programs.
+- Copying back what shaders wrote into title memory
+  took 0.3 to 2.4 s a frame on stock Proton and nothing splits that time; it was not
+  measured on the patched one.
+- vkd3d-proton's converter may fail on other programs the same way. The worker watch
+  makes that cost one pipeline, not a lost worker, but the pipeline is then missing
+  for the run.
+- Whether the DirectStorage failure still happens after the fix was not measured in a
+  long run.

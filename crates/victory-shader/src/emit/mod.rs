@@ -270,23 +270,7 @@ pub struct UserData {
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
-///
-/// A program refused because the first half of an interpolation is read as
-/// data is translated once more with first halves evaluated as the pair
-/// they start (`lower::with_first_half_pairs`), and only such a program
-/// (after victory-fork a26859f: with that on for every program, 8,551 pixel
-/// programs of the title that already translated came out changed, an
-/// extra evaluation in each).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_plain(container) {
-        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
-            lower::with_first_half_pairs(|| translate_plain(container))
-        }
-        other => other,
-    }
-}
-
-fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -325,6 +309,20 @@ pub fn emit(
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
+    // A program refused because the first half of an interpolation is read
+    // as data: once more with first halves evaluated as the pair they start
+    // (`lower::with_first_half_pairs`), and only such a program (after
+    // victory-fork a26859f: with that on for every program, 8,551 pixel
+    // programs of the title that already translated came out changed, an
+    // extra evaluation in each). Here, where the offline tools and the
+    // running title both come through.
+    let original = match original {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::take_needs();
+            lower::with_first_half_pairs(|| emit_program(c, native, p, st, io, res))
+        }
+        other => other,
+    };
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -1725,13 +1723,9 @@ mod barycentric_tests {
             e1,
             S_ENDPGM,
         ];
-        // Refused as it comes, and translated with the pairs: what
-        // `translate` does for such a program, and for no other.
-        assert!(matches!(
-            pixel(&words, PERSP_CENTER),
-            Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF
-        ));
-        let shader = lower::with_first_half_pairs(|| pixel(&words, PERSP_CENTER)).unwrap();
+        // (Refused as it comes, then translated with the pairs: `emit` does
+        // that for such a program, and for no other.)
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
         validate(&shader);
     }
 

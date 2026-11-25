@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*", "xtask"]
+members = ["crates/*", "apps/*", "xtask", "tools/winbench"]
 # Fixtures are standalone crates built on demand by integration tests.
 exclude = ["tests/fixtures"]
 

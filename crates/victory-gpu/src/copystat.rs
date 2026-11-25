@@ -127,8 +127,162 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// `GetWriteWatch` itself, every call (`Watches` counts only those that
+    /// succeed, and `WatchUs` includes the guards): calls, microseconds and
+    /// bytes passed; of them the calls that failed (not write-watched
+    /// memory), their microseconds and bytes.
+    KernelCalls,
+    KernelUs,
+    KernelBytes,
+    KernelFailed,
+    KernelFailedUs,
+    KernelFailedBytes,
+    /// Waiting for the journal's lock and for the guards' lock (all
+    /// threads), microseconds.
+    JournalWaitUs,
+    GuardLockUs,
+    /// `VirtualProtect` calls of the guards and their microseconds.
+    ProtectCalls,
+    ProtectUs,
+    /// Microseconds inside our handler of guard faults.
+    FaultUs,
+    /// `VirtualQuery` asked by the guards (`is_view`, `uncommitted_end`)
+    /// and their microseconds.
+    GuardQueries,
+    GuardQueryUs,
+    /// Waiting for the submission lock alone (the `lock` of the thread
+    /// lines adds settles and the sweep), microseconds.
+    SubmitLockUs,
+    /// From a present to the first list call after it: the process's
+    /// processor time (user + kernel, all threads), microseconds.
+    UntilRecordCpuUs,
+    /// Of that window, our own code's time on all threads that we can see:
+    /// in submissions and in list calls are counted elsewhere; these are
+    /// the title's frame waits that fall in it.
+    UntilRecordPaceUs,
+    /// The lock over title memory's mappings (`watch::MAPPING`): taken
+    /// alone by the runtime to remap, and shared by reads in place; how
+    /// many times, microseconds waited, microseconds held (summed).
+    RemapCalls,
+    RemapWaitUs,
+    RemapHeldUs,
+    ReadingCalls,
+    ReadingWaitUs,
+    ReadingHeldUs,
+    /// The runtime's page mappings: the GPU's page-mapping copies
+    /// (`map_alias`) and `XMemMapPhysicalPages`; calls, pages, pages that
+    /// showed what they were to show already, microseconds.
+    AliasCalls,
+    AliasPages,
+    AliasSame,
+    AliasUs,
+    PhysicalCalls,
+    PhysicalPages,
+    PhysicalSame,
+    PhysicalUs,
+    /// Inside the remaps: the runtime's memory calls (split, map, unmap of
+    /// views), and our notes of a remapping (`title_memory_remapped`), of
+    /// them waiting for the guards' lock; microseconds.
+    RemapSysCalls,
+    RemapSysUs,
+    RemappedUs,
+    RemappedGuardWaitUs,
+    /// Pages of the GPU's page-mapping copies by kind (pool pages in a run,
+    /// one pool page over many, unmapped, left), and of the second kind
+    /// those whose pool page holds zeros only.
+    PagesRun,
+    PagesOne,
+    PagesUnmapped,
+    PagesLeft,
+    PagesOneZero,
+    /// Mappings of the runtime that could join a neighbouring view, those
+    /// that did, and joins that failed (`xmem` `map_joined`).
+    JoinCould,
+    JoinDone,
+    JoinFailed,
+    /// Reads in place that met a change of mapping under way over their
+    /// range and waited for it (`VICTORY_MAP_RANGES=1`, `watch::Span`).
+    ReadingMet,
+    /// The GPU's page mappings as copies (`VICTORY_ALIAS_COPY=1`): pages
+    /// copied, copies taken away that still held what their page holds and
+    /// those that did not, copies written again with their page, copies
+    /// taken away with no view of their page to compare with.
+    CopyMade,
+    CopySame,
+    CopyDiffered,
+    CopyRewritten,
+    CopyUnchecked,
 }
-const COUNTERS: usize = 80;
+
+/// What became of a copy of a physical page: 0 made, 1 taken away the
+/// same as its page, 2 taken away different, 3 written again with its
+/// page, 4 taken away unchecked.
+pub fn alias_copy_event(what: u8) {
+    add(
+        match what {
+            0 => C::CopyMade,
+            1 => C::CopySame,
+            2 => C::CopyDiffered,
+            3 => C::CopyRewritten,
+            _ => C::CopyUnchecked,
+        },
+        1,
+    );
+}
+
+/// Copies of physical pages alive now (a gauge).
+static COPIES: AtomicU64 = AtomicU64::new(0);
+
+pub fn copies_alive(n: usize) {
+    COPIES.store(n as u64, Relaxed);
+}
+
+/// A mapping could join a neighbouring view (0), did (1), or failed to (2).
+pub fn view_join(what: u8) {
+    add(
+        match what {
+            0 => C::JoinCould,
+            1 => C::JoinDone,
+            _ => C::JoinFailed,
+        },
+        1,
+    );
+}
+
+/// Views of physical pages the runtime has mapped now (a gauge, not a
+/// count per frame), and the most there were.
+static VIEWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The runtime holds `n` views of physical pages now, `alias` of them
+/// mapped by the GPU's page-mapping copies (`map_alias`).
+pub fn views_alive(n: usize, alias: usize) {
+    VIEWS[0].store(n as u64, Relaxed);
+    VIEWS[1].fetch_max(n as u64, Relaxed);
+    VIEWS[2].store(alias as u64, Relaxed);
+}
+
+/// A memory call of the runtime's remapping took `us`.
+pub fn remap_call(us: u64) {
+    add(C::RemapSysCalls, 1);
+    add(C::RemapSysUs, us);
+}
+
+/// A page mapping of the runtime (`alias`: the GPU's page-mapping copies,
+/// else `XMemMapPhysicalPages`) of `pages` pages, `same` of which already
+/// showed what they were to show, took `us`.
+pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
+    let [c, p, s, t] = if alias {
+        [C::AliasCalls, C::AliasPages, C::AliasSame, C::AliasUs]
+    } else {
+        [C::PhysicalCalls, C::PhysicalPages, C::PhysicalSame, C::PhysicalUs]
+    };
+    add(c, 1);
+    add(p, pages);
+    add(s, same);
+    add(t, us);
+}
+const COUNTERS: usize = 120;
+const _: () = assert!((C::CopyUnchecked as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -948,6 +1102,35 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
+/// The process's processor time (user + kernel, microseconds) at the last
+/// present; the thread that presented and the one that made the first list
+/// call after it (for the stack samples, `VICTORY_STACKS=every:...`).
+static PRESENT_CPU: AtomicU64 = AtomicU64::new(0);
+static PRESENTER: AtomicU64 = AtomicU64::new(0);
+static FIRST_RECORDER: AtomicU64 = AtomicU64::new(0);
+/// Threads inside a submission now.
+static SUBMITTING_NOW: AtomicU64 = AtomicU64::new(0);
+
+/// Whether no list call has followed the last present yet.
+pub(crate) fn before_recording() -> bool {
+    !RECORDED_SINCE.load(Relaxed)
+}
+
+/// Where the frame stands, for a stack sample: milliseconds since the last
+/// present, whether a list call and a submission followed it, the threads
+/// that presented and that recorded first, and the threads in a submission.
+pub fn phase() -> String {
+    format!(
+        "since present {} ms, recorded {}, submitted {}, presenter {}, first recorder {}, in submissions {}",
+        now_us().saturating_sub(PRESENTED_AT.load(Relaxed)) / 1000,
+        RECORDED_SINCE.load(Relaxed),
+        SUBMITTED_SINCE.load(Relaxed),
+        PRESENTER.load(Relaxed),
+        FIRST_RECORDER.load(Relaxed),
+        SUBMITTING_NOW.load(Relaxed),
+    )
+}
+
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
@@ -956,6 +1139,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
+        let (user, kernel) = process_times();
+        add(C::UntilRecordCpuUs, (user + kernel).saturating_sub(PRESENT_CPU.load(Relaxed)));
+        FIRST_RECORDER.store(u64::from(thread_id()), Relaxed);
     }
     OURS.with(|o| o.set(o.get() + ns));
     let (unsent, calls) = UNSENT.with(|u| u.get());
@@ -977,6 +1163,7 @@ pub(crate) fn recorded(started: std::time::Instant) {
 /// A submission is called on this thread (before it waits for the
 /// submission lock).
 pub(crate) fn submission_begins() {
+    SUBMITTING_NOW.fetch_add(1, Relaxed);
     let now = now_us();
     if !SUBMITTED_SINCE.load(Relaxed) && !SUBMITTED_SINCE.swap(true, Relaxed) {
         add(C::UntilSubmitUs, now.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -997,6 +1184,7 @@ pub(crate) fn submission_begins() {
 /// The submission returns; it waited `lock` microseconds for the
 /// submission lock.
 pub(crate) fn submission_ends(lock: u64) {
+    SUBMITTING_NOW.fetch_sub(1, Relaxed);
     let now = now_us();
     SUBMITTED_AT.store(now, Relaxed);
     let (user, kernel) = thread_times();
@@ -1019,6 +1207,9 @@ pub(crate) fn present_begins() {
 /// A frame was presented.
 pub(crate) fn presented() {
     add(C::Frames, 1);
+    let (user, kernel) = process_times();
+    PRESENT_CPU.store(user + kernel, Relaxed);
+    PRESENTER.store(u64::from(thread_id()), Relaxed);
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
     SUBMITTED_SINCE.store(false, Relaxed);
@@ -1153,6 +1344,75 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    // The write watch and the guards taken apart, and the locks around
+    // them; and what the process did from a present to the first list call.
+    tracing::info!(
+        "watch account per frame: GetWriteWatch {:.0} calls {:.2} ms {:.1} MB passed, of them {:.0} failed \
+         {:.2} ms {:.1} MB; journal lock waited {:.2} ms; guards: {:.0} VirtualProtect {:.2} ms, {:.0} \
+         queries {:.2} ms, lock waited {:.2} ms, {:.2} ms in the fault handler; submission lock waited \
+         {:.2} ms; from a present to the first list call the process ran {:.1} ms (all threads), \
+         {:.1} ms of the title's frame waits fell in it; title memory's mapping lock: {:.0} remaps \
+         waited {:.1} ms held {:.1} ms, {:.0} reads in place ({:.0} met a remap of their range) waited {:.1} ms held {:.1} ms; page \
+         mappings: the GPU's {:.0} calls {:.0} pages ({:.0} already so) {:.1} ms, physical {:.0} \
+         calls {:.0} pages ({:.0} already so) {:.1} ms; in them {:.0} memory calls {:.1} ms, our notes \
+         {:.1} ms ({:.1} ms waiting for the guards' lock); the GPU's page mappings by kind: {:.0} pages \
+         in runs, {:.0} one pool page over many ({:.0} of them a page of zeros), {:.0} unmapped, {:.0} \
+         left; views of physical pages alive {} (at most {}; the GPU's mappings' {}); mappings that could join a neighbouring \
+         view {:.0}, joined {:.0}, joins failed {:.0}; copies of physical pages alive {}, made {:.0}, \
+         taken away {:.0} the same as their page and {:.0} differed ({:.0} unchecked), written again {:.0}",
+        c[C::KernelCalls as usize],
+        ms(c[C::KernelUs as usize]),
+        mb(c[C::KernelBytes as usize]),
+        c[C::KernelFailed as usize],
+        ms(c[C::KernelFailedUs as usize]),
+        mb(c[C::KernelFailedBytes as usize]),
+        ms(c[C::JournalWaitUs as usize]),
+        c[C::ProtectCalls as usize],
+        ms(c[C::ProtectUs as usize]),
+        c[C::GuardQueries as usize],
+        ms(c[C::GuardQueryUs as usize]),
+        ms(c[C::GuardLockUs as usize]),
+        ms(c[C::FaultUs as usize]),
+        ms(c[C::SubmitLockUs as usize]),
+        ms(c[C::UntilRecordCpuUs as usize]),
+        ms(c[C::UntilRecordPaceUs as usize]),
+        c[C::RemapCalls as usize],
+        ms(c[C::RemapWaitUs as usize]),
+        ms(c[C::RemapHeldUs as usize]),
+        c[C::ReadingCalls as usize],
+        c[C::ReadingMet as usize],
+        ms(c[C::ReadingWaitUs as usize]),
+        ms(c[C::ReadingHeldUs as usize]),
+        c[C::AliasCalls as usize],
+        c[C::AliasPages as usize],
+        c[C::AliasSame as usize],
+        ms(c[C::AliasUs as usize]),
+        c[C::PhysicalCalls as usize],
+        c[C::PhysicalPages as usize],
+        c[C::PhysicalSame as usize],
+        ms(c[C::PhysicalUs as usize]),
+        c[C::RemapSysCalls as usize],
+        ms(c[C::RemapSysUs as usize]),
+        ms(c[C::RemappedUs as usize]),
+        ms(c[C::RemappedGuardWaitUs as usize]),
+        c[C::PagesRun as usize],
+        c[C::PagesOne as usize],
+        c[C::PagesOneZero as usize],
+        c[C::PagesUnmapped as usize],
+        c[C::PagesLeft as usize],
+        VIEWS[0].load(Relaxed),
+        VIEWS[1].load(Relaxed),
+        VIEWS[2].load(Relaxed),
+        c[C::JoinCould as usize],
+        c[C::JoinDone as usize],
+        c[C::JoinFailed as usize],
+        COPIES.load(Relaxed),
+        c[C::CopyMade as usize],
+        c[C::CopySame as usize],
+        c[C::CopyDiffered as usize],
+        c[C::CopyUnchecked as usize],
+        c[C::CopyRewritten as usize],
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

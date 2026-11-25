@@ -56,13 +56,15 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::{alias_copy_event, copies_alive, page_mapping, phase as frame_phase, remap_call, view_join, views_alive};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    TitleWrite, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    TitleWrite, title_memory_copy, title_memory_reading, title_memory_remapped, title_memory_remapping,
     write_title_memory, writing as kernel_will_write,
 };
 #[cfg(all(windows, feature = "test-hooks"))]

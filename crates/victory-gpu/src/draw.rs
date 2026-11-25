@@ -1069,7 +1069,18 @@ impl State {
             _ => 0,
         };
         if address == 0 {
-            once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
+            static SEEN: std::sync::Mutex<Vec<(usize, u8, u32)>> = std::sync::Mutex::new(Vec::new());
+            let key = (self.pipeline, slot, dword);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 200 && !seen.contains(&key) {
+                seen.push(key);
+                tracing::warn!(
+                    slot,
+                    dword,
+                    shaders = crate::pipeline::shaders_text_any(self.pipeline as This),
+                    "a shader takes the address of a buffer view that is not there: it reads 0"
+                );
+            }
         }
         if kind == USER_VIEW_ADDRESS {
             address as u32

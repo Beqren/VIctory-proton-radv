@@ -157,6 +157,25 @@ impl Memory {
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
+                // Its view in every heap's run before any directory entry
+                // names it: the directory is one buffer that lists in the
+                // air read as they run, and a run slot not yet made for the
+                // copy read through an entry that names it is a read at the
+                // page's offset from address 0 (runs play-va2 and play-va3,
+                // 2026-11-25: scalar reads at 0x3f000, 0x80000, 0xb000 ...).
+                if run_first() {
+                    let (_, len) = shadow.span();
+                    for (&key, run) in self.heaps.iter_mut() {
+                        // SAFETY: a heap leaves the map when it is dropped
+                        // (`heap_gone`), under the lock held here.
+                        let heap = unsafe { &*(key as *const HostHeap) };
+                        heap.raw_uav_at(run.0 + 1 + n as u32, &shadow.buffer, 0, len);
+                        heap.set_mark(run.0 + 1 + n as u32, shadow.mark_entry_at(0, 4));
+                        if run.1 as usize == n {
+                            run.1 = n as u32 + 1;
+                        }
+                    }
+                }
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -239,6 +258,21 @@ impl Memory {
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted (and, with `writes`, copied back after). None if the host
 /// cannot hold it; the draw is then dropped.
+/// Whether a copy's view is made in every heap's run before its directory
+/// entry names it, and runs start as views of zeros
+/// (`VICTORY_MEMORY_RUN_FIRST`, on).
+fn run_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_RUN_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Host view heap `heap` is let go: its run leaves the map.
+pub(crate) fn heap_gone(heap: usize) {
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&heap);
+    }
+}
+
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
@@ -283,6 +317,14 @@ pub(crate) fn ready(
             // Held for the heap's life: not given back with a list's slots.
             let base = heap.dynamic(COPIES + 1)?;
             heap.null_raw_uav_at(base);
+            // Every slot of the run reads zeros until its copy's view is
+            // made (not the null texture views the heap starts with: read
+            // as a buffer, those are a wild address).
+            if run_first() {
+                for i in 1..=COPIES {
+                    heap.null_raw_uav_at(base + i);
+                }
+            }
             (base, 0)
         }
     };

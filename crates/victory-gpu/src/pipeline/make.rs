@@ -295,12 +295,31 @@ fn compute_waits(p: &Pending) -> bool {
 
 /// Waits for `p` until it is made, its worker ended, or
 /// [`COMPUTE_WAIT_MOST`] passed.
+/// [`COMPUTE_WAIT_MOST`] is for all such waits of a frame together (review
+/// finding: two waits one after the other could pass the title's watchdog).
 fn wait_long(p: &Pending) {
+    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    let frame = crate::frame::current();
+    let most = {
+        let spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 == frame { COMPUTE_WAIT_MOST.saturating_sub(spent.1) } else { COMPUTE_WAIT_MOST }
+    };
     let started = Instant::now();
+    wait_until(p, started, most);
+    let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    if spent.0 != frame {
+        *spent = (frame, Duration::ZERO);
+    }
+    spent.1 += started.elapsed();
+}
+
+/// Waits for `p` until it is made, its worker ended, or `most` passed
+/// since `started`.
+fn wait_until(p: &Pending, started: Instant, most: Duration) {
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.died.load(Ordering::Relaxed) {
-        let rest = COMPUTE_WAIT_MOST.saturating_sub(started.elapsed());
+        let rest = most.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }

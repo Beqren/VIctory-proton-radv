@@ -1049,6 +1049,26 @@ fn own_bits_on() -> bool {
 }
 
 /// What [`set_host_max_wave`] was told (0: nothing).
+/// The refusal of a first half of an interpolation whose result is read
+/// as data ([`Lower::interp`]).
+pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
+
+thread_local! {
+    /// Whether first halves of interpolations are evaluated as the pair
+    /// they start ([`with_first_half_pairs`]).
+    static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with first halves of interpolations evaluated as the
+/// pair they start: the translation of a program refused with
+/// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
+pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_HALF_PAIRS.replace(true);
+    let result = translate();
+    FIRST_HALF_PAIRS.set(before);
+    result
+}
+
 pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1532,10 +1552,17 @@ impl<'a> Lower<'a> {
                 // A live first half (for example, an f16 second half preserving the
                 // other half of its destination) uses the completed interpolation as
                 // an approximation of the console's partial result P0 + i P10.
-                for (_, interp) in &x.io.interps {
-                    if let Interp::Interpolated { first, .. } = interp {
-                        for &site in first {
-                            interps.entry(site).or_insert(interp);
+                // Only in the second translation of a program the first one
+                // refused for it ([`with_first_half_pairs`]): in every
+                // program it put an extra evaluation into 8,551 pixel
+                // programs of the title that translated already (found by
+                // fxceless, victory-fork a26859f).
+                if FIRST_HALF_PAIRS.get() && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
+                    for (_, interp) in &x.io.interps {
+                        if let Interp::Interpolated { first, .. } = interp {
+                            for &site in first {
+                                interps.entry(site).or_insert(interp);
+                            }
                         }
                     }
                 }
@@ -9103,7 +9130,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {

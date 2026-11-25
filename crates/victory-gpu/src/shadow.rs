@@ -3327,8 +3327,9 @@ pub(crate) fn view_writes() -> Option<u64> {
 /// not compared because nothing marked them; ranges cut to their marked
 /// pieces, and compared whole (a writer that does not mark); with `check`,
 /// pieces that differed although unmarked; submissions with and without
-/// their marks taken.
-pub(crate) static MARK_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// their marks taken; with `check`, pieces that differed in copies all of
+/// whose writers marked (marked or not), and in other copies.
+pub(crate) static MARK_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Page marks, with `check`: unmarked pieces that differed, over the run.
 pub(crate) static MARK_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -3342,7 +3343,8 @@ pub(crate) fn marks_line(frames: f64) {
     tracing::info!(
         "page marks per frame: {:.1} MB of declared ranges not compared (unmarked), {:.1} ranges cut to marked pieces, \
          {:.1} compared whole (a writer that does not mark); {:.1} submissions took their marks, {:.1} did not; \
-         check: {:.1} unmarked pieces differed ({} in the run)",
+         check: {:.1} unmarked pieces differed ({} in the run) of {:.1} that differed in copies all of whose writers mark, \
+         {:.1} differed in other copies",
         c[0] / (1 << 20) as f64,
         c[1],
         c[2],
@@ -3350,6 +3352,8 @@ pub(crate) fn marks_line(frames: f64) {
         c[5],
         c[3],
         MARK_MISSES.load(Ordering::Relaxed),
+        c[6],
+        c[7],
     );
 }
 
@@ -3436,8 +3440,10 @@ pub(crate) fn check_marks(
     let mut suspects = SUSPECTS.lock().unwrap_or_else(|e| e.into_inner());
     for ((shadow, _, _), found) in work.iter().zip(found) {
         if shadow.place.is_some() || !has_marks(shadow) || unmarked.contains(&(Arc::as_ptr(shadow) as usize)) {
+            MARK_STATS[7].fetch_add(found.len() as u64, Ordering::Relaxed);
             continue;
         }
+        MARK_STATS[6].fetch_add(found.len() as u64, Ordering::Relaxed);
         for &(at, n) in found {
             if shadow.piece_marked(bits, at) {
                 continue;

@@ -393,8 +393,11 @@ Fixes (branch `warm-pipelines`):
   summed: every cache warm), 1,815 of 1,842 first uses found their pipeline
   made, the world's first frame took 931 ms, the longest 568 ms, at most
   66 ms of a frame waiting. Of the first uses, 1,820 came more than 10 s
-  after the title created the pipeline. The shared baseline (base15) had
-  frames of 4,454, 1,440 and 1,028 ms before its device was removed at 78 s.
+  after the title created the pipeline. The shared baseline (base15, same
+  settings, without these changes) had a world's first frame of 4,454 ms,
+  then 1,440 ms (a burst of 39 new pipelines) and 1,028 ms before its device
+  was removed 78 s into the world. Dropped draws, refused pipelines and
+  worker deaths (`runstat.py`) did not rise.
 - Every build logs each frame of more than a second in the world with what
   its threads waited for pipelines, and every second the longest frame and
   the pipeline waits; each host pipeline's translation and host compile

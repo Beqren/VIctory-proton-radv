@@ -3024,6 +3024,246 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
+/// A texture view's description, for [`view_fits`].
+enum ViewRange<'a> {
+    Shader(&'a mut D3D12_SHADER_RESOURCE_VIEW_DESC),
+    Unordered(&'a mut D3D12_UNORDERED_ACCESS_VIEW_DESC),
+}
+
+/// Views whose mips, slices or dimension [`view_fits`] cut to the texture
+/// (0), and refused (1), since the start.
+pub(crate) static VIEW_FITS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a view's mips and array slices lie in the texture (its host
+/// copy): mips and slices past the texture's are cut off, and a view whose
+/// first mip or slice lies past it, or whose dimension the texture does not
+/// have, is refused (a null view) (`VICTORY_VIEW_FITS=0`: neither, as
+/// before).
+///
+/// Why: vkd3d-proton makes the view it is given; a view of mips or slices
+/// the image does not have reads past its memory, a texture-unit page
+/// fault at a high address (every device loss of 2026-11-25 but two; the
+/// owner's sessions lost it in 2-8 minutes while moving streamed new areas
+/// in, whose textures are made then, with views written again as mips
+/// arrive). The host copy is made from one description (the first view, or
+/// the resource) and later views of the title's memory may name more.
+fn view_fits(texture: &ID3D12Resource, view: &mut ViewRange) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_FITS").is_none_or(|v| v != "0")) {
+        return true;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let (mips, slices) = (u32::from(d.MipLevels.max(1)), u32::from(d.DepthOrArraySize.max(1)));
+    let dim = d.Dimension;
+    let before = view_summary(view);
+    let result = fit_range(dim, mips, slices, view);
+    match result {
+        Some(false) => {}
+        Some(true) => {
+            if VIEW_FITS[0].fetch_add(1, Relaxed) < 20 {
+                tracing::warn!(
+                    texture = ?(dim.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0),
+                    view = before,
+                    to = view_summary(view),
+                    "a view of mips or slices the texture does not have: cut to the texture"
+                );
+            }
+        }
+        None => {
+            if VIEW_FITS[1].fetch_add(1, Relaxed) < 20 {
+                tracing::warn!(
+                    texture = ?(dim.0, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels, d.Format.0),
+                    view = before,
+                    "a view that lies past its texture or has another dimension: a null view"
+                );
+            }
+            return false;
+        }
+    }
+    true
+}
+
+/// A view's dimension, mips and slices in a few words (the logs of
+/// [`view_fits`]).
+fn view_summary(view: &ViewRange) -> String {
+    // SAFETY (all union reads): the member the dimension names.
+    unsafe {
+        match view {
+            ViewRange::Shader(v) => match v.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE1D => format!("1d mips {}+{}", v.Anonymous.Texture1D.MostDetailedMip, v.Anonymous.Texture1D.MipLevels as i32),
+                D3D12_SRV_DIMENSION_TEXTURE1DARRAY => { let t = v.Anonymous.Texture1DArray; format!("1d array mips {}+{} slices {}+{}", t.MostDetailedMip, t.MipLevels as i32, t.FirstArraySlice, t.ArraySize) }
+                D3D12_SRV_DIMENSION_TEXTURE2D => format!("2d mips {}+{}", v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels as i32),
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => { let t = v.Anonymous.Texture2DArray; format!("2d array mips {}+{} slices {}+{}", t.MostDetailedMip, t.MipLevels as i32, t.FirstArraySlice, t.ArraySize) }
+                D3D12_SRV_DIMENSION_TEXTURE3D => format!("3d mips {}+{}", v.Anonymous.Texture3D.MostDetailedMip, v.Anonymous.Texture3D.MipLevels as i32),
+                D3D12_SRV_DIMENSION_TEXTURECUBE => format!("cube mips {}+{}", v.Anonymous.TextureCube.MostDetailedMip, v.Anonymous.TextureCube.MipLevels as i32),
+                D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => { let t = v.Anonymous.TextureCubeArray; format!("cube array mips {}+{} faces {} cubes {}", t.MostDetailedMip, t.MipLevels as i32, t.First2DArrayFace, t.NumCubes) }
+                other => format!("dimension {}", other.0),
+            },
+            ViewRange::Unordered(v) => match v.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE1D => format!("uav 1d mip {}", v.Anonymous.Texture1D.MipSlice),
+                D3D12_UAV_DIMENSION_TEXTURE1DARRAY => { let t = v.Anonymous.Texture1DArray; format!("uav 1d array mip {} slices {}+{}", t.MipSlice, t.FirstArraySlice, t.ArraySize) }
+                D3D12_UAV_DIMENSION_TEXTURE2D => format!("uav 2d mip {}", v.Anonymous.Texture2D.MipSlice),
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => { let t = v.Anonymous.Texture2DArray; format!("uav 2d array mip {} slices {}+{}", t.MipSlice, t.FirstArraySlice, t.ArraySize) }
+                D3D12_UAV_DIMENSION_TEXTURE3D => { let t = v.Anonymous.Texture3D; format!("uav 3d mip {} w {}+{}", t.MipSlice, t.FirstWSlice, t.WSize) }
+                other => format!("uav dimension {}", other.0),
+            },
+        }
+    }
+}
+
+/// Mips `most`, `levels` (`u32::MAX`: all) against a texture of `mips`:
+/// the levels cut to fit, or `None` past the end.
+fn fit_mips(most: u32, levels: u32, mips: u32) -> Option<u32> {
+    if most >= mips {
+        return None;
+    }
+    Some(if levels == u32::MAX || levels == 0 || most + levels > mips { if levels == u32::MAX { u32::MAX } else { mips - most } } else { levels })
+}
+
+/// Slices `first`, `size` against `slices`: the size cut to fit, or `None`
+/// past the end.
+fn fit_slices(first: u32, size: u32, slices: u32) -> Option<u32> {
+    if first >= slices {
+        return None;
+    }
+    Some(size.min(slices - first).max(1))
+}
+
+/// [`view_fits`] for a texture of dimension `dim` with `mips` and `slices`
+/// (depth for 3D): `Some(changed)` or `None` (refused).
+fn fit_range(dim: D3D12_RESOURCE_DIMENSION, mips: u32, slices: u32, view: &mut ViewRange) -> Option<bool> {
+    const D1: D3D12_RESOURCE_DIMENSION = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
+    const D2: D3D12_RESOURCE_DIMENSION = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    const D3: D3D12_RESOURCE_DIMENSION = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let mut changed = false;
+    let mut mip = |most: u32, levels: &mut u32| -> Option<()> {
+        let fit = fit_mips(most, *levels, mips)?;
+        if fit != *levels {
+            *levels = fit;
+            changed = true;
+        }
+        Some(())
+    };
+    // SAFETY (all union accesses): the member the dimension names.
+    unsafe {
+        match view {
+            ViewRange::Shader(v) => match v.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE1D if dim == D1 => {
+                    let t = &mut v.Anonymous.Texture1D;
+                    mip(t.MostDetailedMip, &mut t.MipLevels)?;
+                }
+                D3D12_SRV_DIMENSION_TEXTURE1DARRAY if dim == D1 => {
+                    let t = &mut v.Anonymous.Texture1DArray;
+                    mip(t.MostDetailedMip, &mut t.MipLevels)?;
+                    let size = fit_slices(t.FirstArraySlice, t.ArraySize, slices)?;
+                    changed |= size != t.ArraySize;
+                    t.ArraySize = size;
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2D if dim == D2 => {
+                    let t = &mut v.Anonymous.Texture2D;
+                    mip(t.MostDetailedMip, &mut t.MipLevels)?;
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY if dim == D2 => {
+                    let t = &mut v.Anonymous.Texture2DArray;
+                    mip(t.MostDetailedMip, &mut t.MipLevels)?;
+                    let size = fit_slices(t.FirstArraySlice, t.ArraySize, slices)?;
+                    changed |= size != t.ArraySize;
+                    t.ArraySize = size;
+                }
+                D3D12_SRV_DIMENSION_TEXTURE3D if dim == D3 => {
+                    let t = &mut v.Anonymous.Texture3D;
+                    mip(t.MostDetailedMip, &mut t.MipLevels)?;
+                }
+                D3D12_SRV_DIMENSION_TEXTURECUBE if dim == D2 => {
+                    if slices < 6 {
+                        return None;
+                    }
+                    let t = &mut v.Anonymous.TextureCube;
+                    mip(t.MostDetailedMip, &mut t.MipLevels)?;
+                }
+                D3D12_SRV_DIMENSION_TEXTURECUBEARRAY if dim == D2 => {
+                    let t = &mut v.Anonymous.TextureCubeArray;
+                    mip(t.MostDetailedMip, &mut t.MipLevels)?;
+                    if t.First2DArrayFace + 6 > slices {
+                        return None;
+                    }
+                    let cubes = ((slices - t.First2DArrayFace) / 6).min(t.NumCubes).max(1);
+                    changed |= cubes != t.NumCubes;
+                    t.NumCubes = cubes;
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2DMS | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY if dim == D2 => {}
+                D3D12_SRV_DIMENSION_BUFFER | D3D12_SRV_DIMENSION_UNKNOWN => {}
+                _ => return None,
+            },
+            ViewRange::Unordered(v) => match v.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE1D if dim == D1 => {
+                    if v.Anonymous.Texture1D.MipSlice >= mips {
+                        return None;
+                    }
+                }
+                D3D12_UAV_DIMENSION_TEXTURE1DARRAY if dim == D1 => {
+                    let t = &mut v.Anonymous.Texture1DArray;
+                    if t.MipSlice >= mips {
+                        return None;
+                    }
+                    let size = fit_slices(t.FirstArraySlice, t.ArraySize, slices)?;
+                    changed |= size != t.ArraySize;
+                    t.ArraySize = size;
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2D if dim == D2 => {
+                    if v.Anonymous.Texture2D.MipSlice >= mips {
+                        return None;
+                    }
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY if dim == D2 => {
+                    let t = &mut v.Anonymous.Texture2DArray;
+                    if t.MipSlice >= mips {
+                        return None;
+                    }
+                    let size = fit_slices(t.FirstArraySlice, t.ArraySize, slices)?;
+                    changed |= size != t.ArraySize;
+                    t.ArraySize = size;
+                }
+                D3D12_UAV_DIMENSION_TEXTURE3D if dim == D3 => {
+                    let t = &mut v.Anonymous.Texture3D;
+                    if t.MipSlice >= mips {
+                        return None;
+                    }
+                    let depth = (slices >> t.MipSlice).max(1);
+                    let size = fit_slices(t.FirstWSlice, t.WSize, depth)?;
+                    changed |= size != t.WSize;
+                    t.WSize = size;
+                }
+                D3D12_UAV_DIMENSION_BUFFER | D3D12_UAV_DIMENSION_UNKNOWN => {}
+                _ => return None,
+            },
+        }
+    }
+    Some(changed)
+}
+
+#[cfg(test)]
+mod view_fit_tests {
+    use super::{fit_mips, fit_slices};
+
+    #[test]
+    fn mips_and_slices_are_cut_to_the_texture() {
+        // A texture of 5 mips: a view of 0+9 is cut to 0+5, 2+9 to 2+3, all
+        // stays all, one past the end is refused.
+        assert_eq!(fit_mips(0, 9, 5), Some(5));
+        assert_eq!(fit_mips(2, 9, 5), Some(3));
+        assert_eq!(fit_mips(2, 2, 5), Some(2));
+        assert_eq!(fit_mips(0, u32::MAX, 5), Some(u32::MAX));
+        assert_eq!(fit_mips(5, 1, 5), None);
+        // 6 slices: 4+4 is cut to 4+2; 6+1 is refused.
+        assert_eq!(fit_slices(4, 4, 6), Some(2));
+        assert_eq!(fit_slices(0, 6, 6), Some(6));
+        assert_eq!(fit_slices(6, 1, 6), None);
+    }
+}
+
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -3207,7 +3447,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false)
+                    || desc.as_mut().is_some_and(|d| !view_fits(texture, &mut ViewRange::Shader(d)))
+                {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -3268,7 +3510,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 None => texture,
             };
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true)
+                || desc.as_mut().is_some_and(|d| !view_fits(texture, &mut ViewRange::Unordered(d)))
+            {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.

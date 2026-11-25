@@ -115,6 +115,48 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// Whether every host pad, and the keyboard's stand-in, drive the first pad
+/// ([`as_one_pad`]). On by default; `VICTORY_ONE_PAD=0` gives the title each
+/// host pad as its own device, as before.
+///
+/// Why: the title takes its player from the first pad, and the scripted A
+/// press (`VICTORY_KEYS`) goes to the first pad. Under Wine a controller can
+/// show up twice (run of 2026-11-25: slots 0 and 1 both connected with one
+/// controller in hand: Steam's stand-in X-Box 360 pad, which says nothing
+/// outside a Steam game, and the controller itself), and then the pad in the
+/// player's hands was the second one, which the title did not listen to.
+fn one_pad() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ONE_PAD").is_none_or(|v| v != "0"))
+}
+
+/// All the host pads as one, in the first slot: a button held on any of them
+/// (or its key on the keyboard's stand-in) is held, each trigger is the one
+/// pulled furthest, each stick axis the one pushed furthest. With no host
+/// pad nothing changes (the stand-in is its own device then).
+fn as_one_pad(pads: [Option<PadState>; PADS], keys: &[KeyState]) -> [Option<PadState>; PADS] {
+    if pads.iter().all(Option::is_none) {
+        return pads;
+    }
+    let further = |a: f32, b: f32| if b.abs() > a.abs() { b } else { a };
+    let mut one = fallback(keys);
+    for pad in pads.into_iter().flatten() {
+        one.buttons |= pad.buttons;
+        one.left_trigger = one.left_trigger.max(pad.left_trigger);
+        one.right_trigger = one.right_trigger.max(pad.right_trigger);
+        one.left_x = further(one.left_x, pad.left_x);
+        one.left_y = further(one.left_y, pad.left_y);
+        one.right_x = further(one.right_x, pad.right_x);
+        one.right_y = further(one.right_y, pad.right_y);
+    }
+    let mut out: [Option<PadState>; PADS] = Default::default();
+    out[0] = Some(one);
+    out
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -454,6 +496,7 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let pads = if one_pad() { as_one_pad(pads, &keys) } else { pads };
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -1271,6 +1314,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn every_host_pad_drives_the_first() {
+        let silent = PadState::default();
+        let held = PadState { buttons: 0x4, left_x: -0.8, right_trigger: 0.5, ..Default::default() };
+        let one = as_one_pad([Some(silent), Some(held), None, None], &[]);
+        assert_eq!(one[0], Some(held), "the second pad's state is the first's");
+        assert!(one[1..].iter().all(Option::is_none), "and the title sees one pad");
+        // No host pad: left alone, the keyboard's stand-in is its own device.
+        assert_eq!(as_one_pad([None; PADS], &[]), [None; PADS]);
+    }
     use crate::HleResolver;
     use crate::HostPolicy;
     use victory_loader::Provenance;

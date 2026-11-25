@@ -6087,6 +6087,74 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                {
+                    let mb = |v: u64| v >> 20;
+                    let e = crate::descriptor::host::EVICTION.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    let r = crate::resource::EVICTED.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    let read = crate::draw::TEXTURES_READ.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    let [budget, used] = host().and_then(|h| h.video_memory()).map_or([0, 0], |m| [m[0], m[1]]);
+                    tracing::info!(
+                        "card room: {} MB in use of a budget of {} MB ({} MB under four fifths of it, the line card copies of \
+                         buffers keep to); textures the title fills that slots show, by their last read: {} MB in the last \
+                         frames, {} MB within 30 s, {} MB longer ago, {} MB shown by slots whose reads are not seen; \
+                         slot makings refused for room since the start: {}, of them {} of slots read lately; made at once as \
+                         their texture was on the card: {}; eviction (VICTORY_TEXTURE_EVICT={}): {} passes, {} textures {} MB \
+                         chosen, {} let go {} MB, {} used again first, {} MB waiting; {} slots made null, {} of them put back by \
+                         an asking, {} made again by a table read, {} left by the sweep; textures made again after an \
+                         eviction: {} ({} within 10 s, {} within 60 s); after an idle let-go within 5 s: {}, within 30 s: {}",
+                        mb(used),
+                        mb(budget),
+                        (mb(budget) / 5 * 4) as i64 - mb(used) as i64,
+                        mb(read[0]),
+                        mb(read[1]),
+                        mb(read[2]),
+                        mb(read[3]),
+                        e[5],
+                        e[6],
+                        e[4],
+                        u8::from(crate::descriptor::host::evict_switch().0),
+                        e[0],
+                        r[0],
+                        mb(r[1]),
+                        r[2],
+                        mb(r[3]),
+                        r[4],
+                        mb(r[10]),
+                        e[1],
+                        e[2],
+                        e[3],
+                        e[7],
+                        r[5],
+                        r[6],
+                        r[7],
+                        r[8],
+                        r[9],
+                    );
+                    let m = crate::descriptor::host::MISSING.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    let c = crate::draw::PLACED_COPIES.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    tracing::info!(
+                        "null slots draws asked for by index, per frame and slot since the start, by why (queued, evicted, \
+                         stale, a table's lately, not a placed view, unmapped, out of the queue): the record's first 16 \
+                         words {:?}, the other places {:?}; host copies of placed textures: {} {} MB, of them {} share \
+                         their start with another copy ({} MB beyond the largest of each start)",
+                        &m[..7],
+                        &m[7..],
+                        c[0],
+                        c[1] >> 20,
+                        c[2],
+                        c[3] >> 20
+                    );
+                    if crate::descriptor::host::stale_list() {
+                        let st = crate::descriptor::host::STALE_READS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                        tracing::info!(
+                            "stale slots read later (VICTORY_STALE_LIST=1): {} slots, {} through a table, {} as a material \
+                             record names them; {} still hold the old view in the title's slot; the newer view of the same size \
+                             and format: {} (and levels: {}); starting where the newer does: {}; first 4 KiB changed since: {}; \
+                             views from mip 0 with a level clamp: {}",
+                            st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8]
+                        );
+                    }
+                }
                 let [views, shown, waiting, tables, gone, own, free, start, other, shows, back] =
                     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|i: usize| crate::descriptor::host::SWEPT[i].load(Ordering::Relaxed));
                 tracing::info!(

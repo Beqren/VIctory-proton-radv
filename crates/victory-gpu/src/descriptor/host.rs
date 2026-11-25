@@ -85,6 +85,17 @@ pub(crate) struct HostHeap {
     /// there by index, as far as the host can tell (`draw.rs`,
     /// `note_asked`); 0: never. The pass on a full card serves these first.
     asked: Vec<std::sync::atomic::AtomicU32>,
+    /// Per title slot: when a draw last read it as far as the host can
+    /// tell (a moment of `crate::host::moment`; 0: never): through a table,
+    /// or by index as a draw's material record names it (`draw.rs`,
+    /// `note_asked`). What the eviction goes by ([`HostHeap::evict`]).
+    read: Vec<std::sync::atomic::AtomicU64>,
+    /// Title slots the eviction made null, with the record their host slot
+    /// was made from: made again when next read (a table read makes it
+    /// itself, a draw's asking puts it back into the queue), and left out
+    /// of the sweep and of the slots made due by memory changes, which
+    /// would make them again unread.
+    evicted: Mutex<std::collections::HashMap<u32, u64>>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -117,6 +128,15 @@ pub(crate) struct Spans {
     /// mip: worked out once for each (a title writes the views of a few
     /// thousand descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<([u32; 14], u32), Option<u64>>,
+    /// What the last [`Spans::note`] made stale: per slot, the span and
+    /// resource description it had (for the listing, [`stale_list`]).
+    gone: Vec<(u32, (u64, u64), [u32; 14])>,
+    /// Under [`Rule::Head`]: per span, a fingerprint of its first
+    /// [`HEAD`] bytes when it was noted, and what takes one (title memory
+    /// through the kernel, `crate::texture::fingerprint`; tests give their
+    /// own).
+    heads: std::collections::HashMap<(u64, u64), u64>,
+    print: Option<fn(u64, u64) -> u64>,
 }
 
 /// The frames a draw's asking for a slot counts ([`HostHeap::texture_slot_asked`]).
@@ -141,8 +161,28 @@ pub(crate) enum Rule {
     /// `VICTORY_STALE_TEXTURES=start` ([`stale_rule`]).
     #[default]
     Start,
-    /// Whenever their spans overlap: the default ([`stale_rule`]).
+    /// Whenever their spans overlap (`VICTORY_STALE_TEXTURES=overlap`; the
+    /// default before [`Rule::Head`]).
     Overlap,
+    /// When its span overlaps the older one's and the older texture's
+    /// first [`HEAD`] bytes (its smallest mips, which a title streams in
+    /// first and lets go last) are no longer what they were when its view
+    /// was noted: the older texture is gone from its memory
+    /// (the default, [`stale_rule`]). Spans may overlap.
+    ///
+    /// The listing of stale slots read later (`VICTORY_STALE_LIST=1`, run
+    /// room-3 of 2026-11-25): of the null slots the character programs
+    /// asked for by index, 51,280 slot-frames of 53,500 (first 16 words of
+    /// the record) and 220,787 of 352,000 (the other places) were stale,
+    /// none for want of room. Stale slots whose title descriptor was still
+    /// the old one, as listed: 150 of 150 were small textures (16x4 to
+    /// 32x16, one level) packed at 0x400 to 0x1000 steps inside the span of
+    /// a newer 1024x1024 BC1 view of nine levels that starts 0x3c000 to
+    /// 0xa3000 before them (no level clamp): the title places small
+    /// textures where a streamed texture's large mips would be. Their own
+    /// first 4 KiB had not changed in any (6,045 of the 54,419 stale slots
+    /// read later had, most of them rewritten since).
+    Head,
     /// Never; a view that would be stale under [`Rule::Overlap`] is left
     /// out of the spans instead. `VICTORY_STALE_TEXTURES=0`.
     Never,
@@ -169,7 +209,7 @@ impl Spans {
         // before may reach here (under [`Rule::Never`] a view that would
         // overlap is left out). Under [`Rule::Start`] spans overlap: the
         // spans of the last 16 starts before are looked at.
-        let starts = if self.rule == Rule::Start { 16 } else { 1 };
+        let starts = if matches!(self.rule, Rule::Start | Rule::Head) { 16 } else { 1 };
         let mut before: Vec<u64> = Vec::new();
         for (&(at, _), _) in self.spans.range(..(start, 0)).rev() {
             if before.last() != Some(&at) {
@@ -197,8 +237,12 @@ impl Spans {
                 .range((start.saturating_sub(HEAD - 1), 0)..(start.saturating_add(HEAD), 0))
                 .map(|(&span, _)| span)
                 .collect(),
-            Rule::Overlap | Rule::Never => self.overlapping(start, end),
+            Rule::Overlap | Rule::Never | Rule::Head => self.overlapping(start, end),
         };
+        if self.rule == Rule::Head {
+            // Only those whose smallest mips changed.
+            spans.retain(|span| self.head_changed(*span));
+        }
         spans.retain(|span| {
             let same = span.0 == start && (span.1 == end || self.spans.get(span).is_some_and(|s| s.0 == *desc));
             !same
@@ -212,6 +256,7 @@ impl Spans {
     /// returned, and forgotten. Otherwise (a draw made the slot from what
     /// it held) a view that overlaps other spans is left out.
     fn note(&mut self, index: u32, start: u64, end: u64, desc: &[u32; 14], newer: bool) -> Vec<u32> {
+        self.gone.clear();
         if self.by_slot.get(&index) == Some(&(start, end)) {
             return Vec::new();
         }
@@ -224,7 +269,9 @@ impl Spans {
             if !newer {
                 return stale;
             }
-            if let Some((_, slots)) = self.spans.remove(&span) {
+            self.heads.remove(&span);
+            if let Some((old, slots)) = self.spans.remove(&span) {
+                self.gone.extend(slots.iter().map(|&slot| (slot, span, old)));
                 // Diagnostics: stale though the newer view starts 4 KiB or
                 // more from it (victory-fork 310c6eb keeps those).
                 if span.0.abs_diff(start) >= 4096 {
@@ -236,9 +283,24 @@ impl Spans {
                 }
             }
         }
+        if self.rule == Rule::Head
+            && !self.spans.contains_key(&(start, end))
+            && let Some(print) = self.print
+        {
+            self.heads.insert((start, end), print(start, (end - start).min(HEAD)));
+        }
         self.spans.entry((start, end)).or_insert_with(|| (*desc, Default::default())).1.insert(index);
         self.by_slot.insert(index, (start, end));
         stale
+    }
+
+    /// Under [`Rule::Head`]: whether the first bytes of `span` changed
+    /// since it was noted.
+    fn head_changed(&self, span: (u64, u64)) -> bool {
+        match (self.print, self.heads.get(&span)) {
+            (Some(print), Some(&then)) => print(span.0, (span.1 - span.0).min(HEAD)) != then,
+            _ => false,
+        }
     }
 
     /// Slot `index` holds no placed texture view any more.
@@ -250,6 +312,7 @@ impl Spans {
             span.1.remove(&index);
             if span.1.is_empty() {
                 self.spans.remove(&at);
+                self.heads.remove(&at);
             }
         }
     }
@@ -321,9 +384,162 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// made stale; ranges of memory noted as mapped, unmapped or written;
 /// ranges dropped because no pass took them; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
+/// A slot made stale ([`Spans`]), for the listing of stale slots that
+/// draws read later ([`stale_list`]).
+#[derive(Clone, Debug)]
+pub(crate) struct StaleRec {
+    /// The frame it was made stale in.
+    frame: u64,
+    /// Its span and resource description, and its view's words if its
+    /// host slot was made then.
+    old_span: (u64, u64),
+    old_resource: [u32; 14],
+    old_view: Option<[u32; 10]>,
+    /// The slot written with the newer view, and that view's span,
+    /// resource description and words.
+    newer: u32,
+    new_span: (u64, u64),
+    new_resource: [u32; 14],
+    new_view: [u32; 10],
+    /// A fingerprint of its first 4 KiB (its smallest mips) when it was
+    /// made stale.
+    head: u64,
+    /// Whether a read of it was listed.
+    said: bool,
+}
+
+/// The slots made stale since the start, while [`stale_list`] is on.
+static STALE_RECS: Mutex<std::collections::BTreeMap<u32, StaleRec>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Stale slots read later, since the start (while [`stale_list`] is on):
+/// distinct slots read; of them, read through a table, asked for by a
+/// material record; whose title descriptor still names the old texture;
+/// whose newer view has the old one's resource description but for the
+/// mips (same size and format); same size, format and levels; that start
+/// where the newer does; whose first 4 KiB changed since; whose view
+/// shows mips from the first on (word 4 = 0) with a level clamp (word 7).
+pub(crate) static STALE_READS: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// Since the start, per frame and slot: null slots a draw asked for by
+/// index (`draw.rs`, `note_asked`), by why
+/// ([`HostHeap::texture_slot_why_null`]); the first seven for the first
+/// 16 words of the material record, the next seven for the other places.
+pub(crate) static MISSING: [std::sync::atomic::AtomicU64; 14] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// Whether slots made stale are noted and their later reads listed
+/// (`VICTORY_STALE_LIST=1`; every build).
+pub(crate) fn stale_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_LIST").is_some_and(|v| v == "1"))
+}
+
+/// A draw reads title slot `index` (`how`: through a table, or by index
+/// as a material record names it) whose host slot is null; `now` is the
+/// view the title's slot holds now. If the slot was made stale, the first
+/// such read is listed: the old view against the newer one, whether the
+/// title wrote the slot since, and whether the memory changed.
+pub(crate) fn stale_read(index: u32, now: &View, how: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let rec = {
+        let mut recs = STALE_RECS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = recs.get_mut(&index) else {
+            return;
+        };
+        if rec.said {
+            return;
+        }
+        rec.said = true;
+        rec.clone()
+    };
+    let (still, view_now) = match now {
+        View::Placed(false, resource, desc) => {
+            let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            (start == rec.old_span.0 && *resource == rec.old_resource, Some(desc))
+        }
+        _ => (false, None),
+    };
+    // Width, height, depth or layers, levels, format: words 4, 6, 7 (two
+    // halves), 8 of the resource description.
+    let size = |r: &[u32; 14]| (r[0], r[4], r[6], r[7] & 0xffff, r[8]);
+    let levels = |r: &[u32; 14]| r[7] >> 16;
+    let same_size = size(&rec.old_resource) == size(&rec.new_resource);
+    let same_levels = same_size && levels(&rec.old_resource) == levels(&rec.new_resource);
+    let same_start = rec.old_span.0 == rec.new_span.0;
+    let head = crate::texture::fingerprint(rec.old_span.0, (rec.old_span.1 - rec.old_span.0).min(4096));
+    let words = view_now.map(|d| [d[4], d[5], d[7]]).or(rec.old_view.map(|v| [v[4], v[5], v[7]]));
+    let clamped = words.is_some_and(|[first, _, clamp]| first == 0 && f32::from_bits(clamp) > 0.0);
+    STALE_READS[0].fetch_add(1, Relaxed);
+    STALE_READS[if how == "table" { 1 } else { 2 }].fetch_add(1, Relaxed);
+    for (i, yes) in [(3, still), (4, same_size), (5, same_levels), (6, same_start), (7, head != rec.head), (8, clamped)] {
+        STALE_READS[i].fetch_add(u64::from(yes), Relaxed);
+    }
+    if still && STALE_READS[3].load(Relaxed) <= 150 {
+        let differ: Vec<usize> = (0..14).filter(|&i| rec.old_resource[i] != rec.new_resource[i]).collect();
+        let desc = |r: &[u32; 14]| format!("dim {} {}x{}x{} levels {} f{}", r[0], r[4], r[6], r[7] & 0xffff, r[7] >> 16, r[8]);
+        tracing::info!(
+            "a stale texture slot read: slot {index} by {how}, {} frames after; title slot {}; old {:#x}+{:#x} {} view {:x?};              newer (slot {}) {:#x}+{:#x} {} view {:x?}, starts {:+#x} from the old; resource words differing {differ:?};              same size and format {same_size}, same levels {same_levels}; old first 4 KiB {}; view words 4,5,7 now {:x?}",
+            crate::frame::current().saturating_sub(rec.frame),
+            if still { "unchanged" } else { "written since" },
+            rec.old_span.0,
+            rec.old_span.1 - rec.old_span.0,
+            desc(&rec.old_resource),
+            rec.old_view,
+            rec.newer,
+            rec.new_span.0,
+            rec.new_span.1 - rec.new_span.0,
+            desc(&rec.new_resource),
+            rec.new_view,
+            rec.new_span.0 as i64 - rec.old_span.0 as i64,
+            if head != rec.head { "changed" } else { "unchanged" },
+            words,
+        );
+    }
+}
+
 /// Since the start: null slots draws asked for that were out of the queue
 /// and were put back ([`HostHeap::texture_slot_requeue`]).
 pub(crate) static REQUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The eviction (`VICTORY_TEXTURE_EVICT`, [`HostHeap::evict`]) since the
+/// start: its passes that chose any; slots it made null; of them, put back
+/// into the queue by a draw's asking; made again by a table read; and
+/// slots the texture pass made while the card was full because their
+/// texture was on the card already (no new memory); slot makings the pass
+/// refused for room, and of them slots a draw had read lately; slots the
+/// sweep left out as evicted.
+pub(crate) static EVICTION: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Whether the eviction runs (`VICTORY_TEXTURE_EVICT=1`), and the seconds
+/// unread after which it lets textures go whether the card is full or not
+/// (`VICTORY_TEXTURE_EVICT_AGE_S`, 30; 0: only when a slot read lately is
+/// refused for room).
+///
+/// Off by default: the host sees too few reads for it. Runs room-1 (off)
+/// and room-2 (on, 30 s) of 2026-11-25, 180 s of the opening each: of the
+/// 6.2-6.4 GB of host copies the title fills that slots show, 6.2 GB are
+/// shown by a slot whose reads the host never sees (a program picks it by
+/// an index the host cannot follow), so they are not the eviction's; the
+/// rest is read through tables or by material records every few seconds.
+/// With it on, 2,803 textures (573 MB) were let go, 1,864 made again, 1,261
+/// of them within 10 s (thrash); the card stayed at 12.0 GB of 12.9 GB
+/// (11.5 of 12.3 off), slots read lately refused for room went from 434 to
+/// 10,497, and slots asked for and missing 30 frames or more summed 6,975
+/// over 363 frames (8,041 over 390 off). Frame time 350 ms against 343
+/// (noise). What would make it work is a read signal from the GPU.
+pub(crate) fn evict_switch() -> (bool, Option<u64>) {
+    static ON: std::sync::OnceLock<(bool, Option<u64>)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEXTURE_EVICT").is_some_and(|v| v == "1");
+        let age = std::env::var("VICTORY_TEXTURE_EVICT_AGE_S")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(30);
+        (on, (age > 0).then_some(age * 1000))
+    })
+}
 
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -334,11 +550,23 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 pub(crate) static STALE_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// When a view the title writes makes older views of other memory stale
-/// ([`Rule`]): wherever their spans overlap, by default;
-/// `VICTORY_STALE_TEXTURES=start`: where it starts within 4 KiB of theirs;
-/// `VICTORY_STALE_TEXTURES=0`: never. (Left at the overlap rule until a
-/// run under the patched Wine measures the 4 KiB rule; the two runs below
-/// were under the stock one. The tests are about the 4 KiB rule.)
+/// ([`Rule`]): by default where their spans overlap and the older one's
+/// first 4 KiB changed since it was noted ([`Rule::Head`]);
+/// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, as
+/// before; `=start`: where it starts within 4 KiB of theirs; `=0`: never.
+/// (The tests are about the 4 KiB rule unless they say otherwise.)
+///
+/// The head rule, runs room-3 (overlap) and room-4 (head) of 2026-11-25,
+/// 180 s of the opening, patched Wine: slots made stale 68,820 to 708;
+/// null slots the character programs asked for that were stale 51,280
+/// slot-frames (first 16 words of the record) to 0; slots asked for and
+/// missing 30 frames or more, summed over the frames, 7,626 to 2,624;
+/// world frame 357 to 344 ms (noise). In the diner shots the waitress's
+/// face, the hoodie, the shirts and the posters were black or dark under
+/// the overlap rule and are textured under the head rule (frames
+/// room-3/880-990 against room-4/1060-1170). The card holds more: 11.9
+/// GB of 12.5 at the end against 13.2 of 13.5 (the budget differs from run
+/// to run), 7.6 GB of placed textures' host copies against 6.7.
 ///
 /// The slot listing of the main character's head (`VICTORY_LIST_SLOTS`,
 /// 2026-11-25): under the overlap rule its 1024x1024 colour map (slot 40964
@@ -352,9 +580,10 @@ fn stale_rule() -> Rule {
     static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
         Ok("start") => Rule::Start,
+        Ok("overlap") => Rule::Overlap,
         Ok("0") => Rule::Never,
         _ if cfg!(test) => Rule::Start,
-        _ => Rule::Overlap,
+        _ => Rule::Head,
     })
 }
 
@@ -893,6 +1122,10 @@ impl HostHeap {
             asked: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            read: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            evicted: Mutex::default(),
             placed: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -1049,6 +1282,35 @@ impl HostHeap {
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
 
+    /// Why title slot `index`, which a draw asks for and whose host slot
+    /// is null, is so (for [`MISSING`]): 0 in the queue; 1 made null by the
+    /// eviction; 2 made stale (while [`stale_list`] is on); 3 a table's
+    /// slot lately; 4 not a placed texture's view; 5 its memory not mapped;
+    /// 6 none of these (out of the queue).
+    pub(crate) fn texture_slot_why_null(&self, index: u32, view: Option<&View>, frame: u64) -> usize {
+        if self.textures.lock().unwrap_or_else(|e| e.into_inner()).slots.contains_key(&index) {
+            return 0;
+        }
+        if self.is_evicted(index) {
+            return 1;
+        }
+        if stale_list() && STALE_RECS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index) {
+            return 2;
+        }
+        if self.tabled_lately(index, frame) {
+            return 3;
+        }
+        let Some(View::Placed(false, resource, desc)) = view else {
+            return 4;
+        };
+        let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        let len = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc)).unwrap_or(1);
+        if crate::texture::mapped_bytes(start as *const u8, len as usize) == 0 {
+            return 5;
+        }
+        6
+    }
+
     /// Whether host slot `index` shows a view made from the title's (not
     /// null).
     pub(crate) fn texture_slot_made(&self, index: u32) -> bool {
@@ -1093,6 +1355,185 @@ impl HostHeap {
         if let Some(stamp) = self.asked.get(index as usize) {
             stamp.store((frame as u32).wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
         }
+        self.texture_slot_read(index);
+    }
+
+    /// A draw reads the texture at title slot `index` now, as far as the
+    /// host can tell ([`HostHeap::read`]).
+    pub(crate) fn texture_slot_read(&self, index: u32) {
+        if let Some(stamp) = self.read.get(index as usize) {
+            stamp.store(crate::host::moment(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a draw read title slot `index` within the last
+    /// `crate::evict::KEEP_FRAMES` frames, as far as the host can tell.
+    pub(crate) fn texture_slot_read_lately(&self, index: u32) -> bool {
+        self.read.get(index as usize).is_some_and(|stamp| {
+            let read = stamp.load(std::sync::atomic::Ordering::Relaxed);
+            read != 0 && !crate::evict::before(read, crate::host::moment(), 0, crate::evict::KEEP_FRAMES)
+        })
+    }
+
+    /// A draw reads title slot `index`, whose host slot is null: if the
+    /// eviction made it null, it goes back into the queue, due now
+    /// ([`HostHeap::evicted`]). Returns whether it did.
+    pub(crate) fn texture_slot_evicted_read(&self, index: u32, frame: u64) -> bool {
+        let back = {
+            let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+            !evicted.is_empty() && evicted.remove(&index).is_some()
+        };
+        if back {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            textures.written(index, frame, frame, false);
+            EVICTION[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        back
+    }
+
+    /// Whether the eviction made title slot `index` null and nothing read
+    /// it since.
+    fn is_evicted(&self, index: u32) -> bool {
+        let evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+        !evicted.is_empty() && evicted.contains_key(&index)
+    }
+
+    /// Lets go of host copies of textures the title fills that slots show
+    /// but that no draw has read lately (`VICTORY_TEXTURE_EVICT=1`): with
+    /// `age` (milliseconds), every one not read for that long; otherwise as
+    /// many as hold `need` bytes, read longest ago first
+    /// ([`crate::evict::pick`]). Their slots become null as before they
+    /// were made ([`HostHeap::evicted`]), and the sweep
+    /// (`crate::resource::let_go_idle`) lets the copies go once neither a
+    /// slot nor a list not yet reset holds them. Only copies whose every
+    /// slot is one whose next read the host sees (a table's, or one a
+    /// draw's material record names), so that it is made again then; none
+    /// read in the last frames; none a dynamic slot (a list's table) shows.
+    /// Returns textures chosen, their bytes, and slots made null.
+    pub(crate) fn evict(&self, need: u64, age: Option<u64>) -> [u64; 3] {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        if self.sampler {
+            return [0; 3];
+        }
+        let candidates = crate::resource::evictable();
+        if candidates.is_empty() {
+            return [0; 3];
+        }
+        // Per host texture: its title slots, the latest read, and whether
+        // every slot's reads are seen.
+        let mut by: std::collections::HashMap<usize, (Vec<u32>, u64, bool)> = std::collections::HashMap::new();
+        {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, shown) in kept.iter().enumerate() {
+                let Some(shown) = shown else { continue };
+                let at = shown.as_raw() as usize;
+                let Some(&(_, _, used)) = candidates.get(&at) else { continue };
+                let entry = by.entry(at).or_insert_with(|| (Vec::new(), used, true));
+                let Some(read) = self.read.get(index) else {
+                    // A dynamic slot: a list's table holds it.
+                    (entry.1, entry.2) = (u64::MAX, false);
+                    continue;
+                };
+                let read = read.load(Relaxed);
+                entry.0.push(index as u32);
+                entry.1 = entry.1.max(read);
+                entry.2 &= read != 0;
+            }
+        }
+        let shown: Vec<crate::evict::Shown> = by
+            .iter()
+            .map(|(&id, (_, read, known))| crate::evict::Shown { id, bytes: candidates[&id].1, read: *read, known: *known })
+            .collect();
+        let chosen = crate::evict::pick(&shown, need, crate::host::moment(), age);
+        if chosen.is_empty() {
+            return [0; 3];
+        }
+        let mut titles = Vec::with_capacity(chosen.len());
+        let mut slots = 0u64;
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+            for at in &chosen {
+                titles.push(candidates[at].0);
+                for &index in &by[at].0 {
+                    // Still showing it (under `made`'s lock nothing makes
+                    // the slot meanwhile).
+                    let same = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
+                        .as_ref()
+                        .is_some_and(|k| k.as_raw() as usize == *at);
+                    let key = made[index as usize];
+                    if !same || key == 0 {
+                        continue;
+                    }
+                    self.release_evicted_slot(&mut made, index);
+                    evicted.insert(index, key);
+                    slots += 1;
+                }
+            }
+        }
+        {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for at in &chosen {
+                for index in &by[at].0 {
+                    textures.rechecks.remove(index);
+                }
+            }
+        }
+        let bytes = crate::resource::mark_evicted(&titles);
+        EVICTION[0].fetch_add(1, Relaxed);
+        EVICTION[1].fetch_add(slots, Relaxed);
+        [titles.len() as u64, bytes, slots]
+    }
+
+    /// The one place the eviction makes a slot null and lets go of what it
+    /// held: for now as a stale slot is ([`HostHeap::unmake`]: the slot's
+    /// reference waits for the submissions running now). shortcut: a list
+    /// recorded but not yet submitted that reads the slot is not waited for.
+    fn release_evicted_slot(&self, made: &mut [u64], index: u32) {
+        self.unmake(made, index);
+    }
+
+    /// For the 5 s line: the bytes of host copies of textures the title
+    /// fills that slots show, by when a draw last read them as far as the
+    /// host can tell: within the last frames ([`crate::evict::KEEP_FRAMES`]
+    /// and two seconds), within 30 s, longer ago, and those a slot shows
+    /// whose reads the host does not see (programs that pick it by an
+    /// index the host cannot follow; the eviction leaves them).
+    pub(crate) fn read_census(&self) -> [u64; 4] {
+        use windows::core::Interface;
+        if self.sampler {
+            return [0; 4];
+        }
+        let candidates = crate::resource::evictable();
+        let mut by: std::collections::HashMap<usize, (u64, bool)> = std::collections::HashMap::new();
+        {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, shown) in kept.iter().enumerate() {
+                let Some(shown) = shown else { continue };
+                let at = shown.as_raw() as usize;
+                let Some(&(_, _, used)) = candidates.get(&at) else { continue };
+                let entry = by.entry(at).or_insert((used, true));
+                let read = self.read.get(index).map_or(u64::MAX, |r| r.load(std::sync::atomic::Ordering::Relaxed));
+                entry.0 = entry.0.max(read);
+                entry.1 &= read != 0;
+            }
+        }
+        let now = crate::host::moment();
+        let mut out = [0u64; 4];
+        for (at, (read, known)) in by {
+            let class = if !known {
+                3
+            } else if !crate::evict::before(read, now, crate::evict::KEEP_MS, crate::evict::KEEP_FRAMES) {
+                0
+            } else if !crate::evict::before(read, now, 30_000, 0) {
+                1
+            } else {
+                2
+            };
+            out[class] += candidates[&at].1;
+        }
+        out
     }
 
     /// Whether a draw asked for the texture at title slot `index` within
@@ -1209,6 +1650,14 @@ impl HostHeap {
         };
         slots.sort_unstable();
         slots.dedup();
+        // Slots the eviction made null hold nothing to bring up to date:
+        // made again when next read.
+        {
+            let evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+            if !evicted.is_empty() {
+                slots.retain(|slot| !evicted.contains_key(slot));
+            }
+        }
         // A table's slot waits for its draw, as a write of it does: the
         // draw takes it out again. Left out altogether, a slot that shaders
         // also pick by index kept what it showed before.
@@ -1332,6 +1781,11 @@ impl HostHeap {
                 counts[3] += 1;
                 continue;
             }
+            // Made null by the eviction: made again when next read.
+            if self.is_evicted(index) {
+                EVICTION[7].fetch_add(1, Relaxed);
+                continue;
+            }
             let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             if !crate::texture::committed(start as *const u8, 1) {
                 counts[4] += 1;
@@ -1430,6 +1884,7 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
+            self.texture_slot_read(index);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
@@ -1546,6 +2001,7 @@ impl HostHeap {
                     SPANNED[1].fetch_max(end, Relaxed);
                     let rule = stale_rule();
                     placed.rule = rule;
+                    placed.print = Some(crate::texture::fingerprint);
                     placed.note(index, start, end, resource, !seen && rule != Rule::Never)
                 }
                 None => {
@@ -1554,6 +2010,34 @@ impl HostHeap {
                 }
             }
         };
+        if !stale.is_empty() && stale_list() {
+            let gone = std::mem::take(&mut self.placed.lock().unwrap_or_else(|e| e.into_inner()).gone);
+            if let (Some(View::Placed(false, resource, desc)), Some((_, start, _))) = (view, placed_view) {
+                let first = crate::resource::first_mip(desc);
+                let end = start.saturating_add(crate::resource::placed_bytes_from(resource, first).unwrap_or(0));
+                let mut recs = STALE_RECS.lock().unwrap_or_else(|e| e.into_inner());
+                if recs.len() < 1 << 20 {
+                    for (slot, span, old) in gone {
+                        let head = crate::texture::fingerprint(span.0, (span.1 - span.0).min(4096));
+                        recs.insert(
+                            slot,
+                            StaleRec {
+                                frame: crate::frame::current(),
+                                old_span: span,
+                                old_resource: old,
+                                old_view: None,
+                                newer: index,
+                                new_span: (start, end),
+                                new_resource: *resource,
+                                new_view: desc[..10].try_into().unwrap_or([0; 10]),
+                                head,
+                                said: false,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
@@ -1808,6 +2292,17 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            if for_draw && made[index as usize] == 0 && stale_list() {
+                stale_read(index, &view, "table");
+            }
+            // Made again (a table read) or written anew: no longer the
+            // eviction's.
+            if made[index as usize] == 0 {
+                let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+                if !evicted.is_empty() && evicted.remove(&index).is_some() && for_draw {
+                    EVICTION[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -1815,6 +2310,14 @@ impl HostHeap {
             let mut tinted = Vec::new();
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
+                    if stale_list() {
+                        let key = made[stale as usize];
+                        if let Some(View::Placed(false, _, desc)) = view_at(key as u32, (key >> 32) as u32)
+                            && let Some(rec) = STALE_RECS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&stale)
+                        {
+                            rec.old_view = desc[..10].try_into().ok();
+                        }
+                    }
                     self.unmake(&mut made, stale);
                     #[cfg(feature = "diagnostics")]
                     tinted.push(stale);
@@ -3347,6 +3850,26 @@ mod tests {
     }
 
     /// A resource description of its own for every span.
+    /// Under the head rule a newer view makes an older one of other memory
+    /// stale only once the older one's first bytes changed: small textures
+    /// packed where a newer streamed texture's large mips would be stay.
+    #[test]
+    fn under_the_head_rule_only_a_changed_head_makes_stale() {
+        static CHANGED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        fn print(at: u64, _: u64) -> u64 {
+            u64::from(CHANGED.lock().unwrap().contains(&at))
+        }
+        let mut spans = Spans { rule: Rule::Head, print: Some(print), ..Default::default() };
+        // Small textures at 0x10000 and 0x11000.
+        assert!(spans.note(1, 0x10000, 0x11000, &shape(0x10000, 0x11000), true).is_empty());
+        assert!(spans.note(2, 0x11000, 0x12000, &shape(0x11000, 0x12000), true).is_empty());
+        // A large texture before them whose span covers both: they stay.
+        assert!(spans.note(3, 0x8000, 0x20000, &shape(0x8000, 0x20000), true).is_empty());
+        // The second one's memory changed: the next view over it makes it stale.
+        CHANGED.lock().unwrap().push(0x11000);
+        assert_eq!(spans.note(4, 0x8000, 0x20000, &shape(0x8000, 0x20001), true), [2]);
+    }
+
     fn shape(start: u64, end: u64) -> [u32; 14] {
         let mut desc = [0; 14];
         (desc[0], desc[4], desc[6]) = (3, start as u32, end as u32);

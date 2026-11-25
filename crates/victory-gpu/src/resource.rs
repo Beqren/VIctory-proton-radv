@@ -1155,7 +1155,26 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// When the eviction chose its host copy (a moment of
+    /// `crate::host::moment`; 0: not chosen): [`let_go_idle`] lets it go
+    /// without waiting for it to be idle, unless something used it since.
+    mark: std::sync::atomic::AtomicU64,
+    /// When its host copy was last let go (milliseconds since the start,
+    /// plus one; 0: never), and whether the eviction had chosen it: what
+    /// says how soon a texture let go is made again.
+    gone_ms: std::sync::atomic::AtomicU64,
+    evicted: std::sync::atomic::AtomicBool,
 }
+
+/// Counts of the eviction (`VICTORY_TEXTURE_EVICT`, [`mark_evicted`]) since
+/// the start: textures chosen and their bytes; let go and their bytes;
+/// chosen but used again before they could go; made again after an
+/// eviction, and of those within 10 s and within 60 s of it; host copies
+/// let go as idle (not chosen) made again within 5 s and within 30 s; and
+/// the bytes chosen but not let go yet.
+#[cfg(windows)]
+pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
@@ -1357,6 +1376,19 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
+            // How soon after it was let go: soon means the wrong one went.
+            let gone = r.host.gone_ms.load(Relaxed);
+            if gone != 0 {
+                let after = (crate::host::now_ms() + 1).saturating_sub(gone);
+                if r.host.evicted.swap(false, Relaxed) {
+                    EVICTED[5].fetch_add(1, Relaxed);
+                    EVICTED[6].fetch_add(u64::from(after < 10_000), Relaxed);
+                    EVICTED[7].fetch_add(u64::from(after < 60_000), Relaxed);
+                } else {
+                    EVICTED[8].fetch_add(u64::from(after < 5_000), Relaxed);
+                    EVICTED[9].fetch_add(u64::from(after < 30_000), Relaxed);
+                }
+            }
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
@@ -1488,21 +1520,44 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            // Chosen by the eviction ([`mark_evicted`]): it need not be
+            // idle, only unused since it was chosen (a use is a read the
+            // eviction did not see coming, and it stays).
+            let mark = r.host.mark.load(Relaxed);
+            let used_since = mark != 0 && r.host.used.load(Relaxed) > mark;
+            if used_since || mark != 0 && made.is_none() {
+                r.host.mark.store(0, Relaxed);
+                if let Some((host, _)) = made.as_ref() {
+                    EVICTED[4].fetch_add(1, Relaxed);
+                    EVICTED[10].fetch_sub(host.bytes.min(EVICTED[10].load(Relaxed)), Relaxed);
+                }
+            }
+            let chosen = mark != 0 && !used_since;
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                (chosen || crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES))
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
             if idle {
+                r.host.gone_ms.store(crate::host::now_ms() + 1, Relaxed);
+                r.host.evicted.store(chosen, Relaxed);
+                if chosen {
+                    r.host.mark.store(0, Relaxed);
+                    if let Some((host, _)) = made.as_ref() {
+                        EVICTED[2].fetch_add(1, Relaxed);
+                        EVICTED[3].fetch_add(host.bytes, Relaxed);
+                        EVICTED[10].fetch_sub(host.bytes.min(EVICTED[10].load(Relaxed)), Relaxed);
+                    }
+                }
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
-                made.take()
+                made.take().map(|made| (made, chosen))
             } else {
                 None
             }
         };
-        if let Some((host, twin)) = gone {
+        if let Some(((host, twin), chosen)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -1511,10 +1566,14 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
-            // The twin too: dropped here, a list may still read it.
-            if let Some(twin) = twin {
-                crate::host::retire(twin);
+            if chosen {
+                release_evicted(host, twin);
+            } else {
+                crate::host::retire(host);
+                // The twin too: dropped here, a list may still read it.
+                if let Some(twin) = twin {
+                    crate::host::retire(twin);
+                }
             }
         }
     }
@@ -1527,6 +1586,117 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// The host copies the eviction may let go (`VICTORY_TEXTURE_EVICT`), by
+/// the address of the host texture: the title texture, the copy's bytes
+/// and when it was last used. Only copies [`let_go_idle`] could let go:
+/// of a texture the title fills ([`fills`]) that the host never copied
+/// into, held by no list not yet reset (a list holds the copies of the
+/// textures it uses: a pass in flight); descriptor slots may show them.
+/// Not render targets, depth or unordered access textures: their contents
+/// exist on the host alone.
+#[cfg(windows)]
+pub(crate) fn evictable() -> std::collections::HashMap<usize, (usize, u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    let mut out = std::collections::HashMap::new();
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && std::sync::Arc::strong_count(host) == 1
+            && r.host.mark.load(Relaxed) == 0
+        {
+            out.insert(host.texture.as_raw() as usize, (at, host.bytes, r.host.used.load(Relaxed)));
+        }
+    }
+    out
+}
+
+/// For the 5 s line: host copies of placed textures the title fills, and
+/// their bytes; of them, the ones that share their title memory's start
+/// with another host copy (another description of the same memory), and
+/// the bytes beyond the largest copy of each such start.
+#[cfg(windows)]
+pub(crate) fn placed_copies() -> [u64; 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut by: std::collections::HashMap<usize, (u64, u64, u64)> = std::collections::HashMap::new();
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref() {
+            let e = by.entry(r.data() as usize).or_default();
+            e.0 += 1;
+            e.1 += host.bytes;
+            e.2 = e.2.max(host.bytes);
+        }
+    }
+    let mut out = [0u64; 4];
+    for (n, bytes, most) in by.into_values() {
+        out[0] += n;
+        out[1] += bytes;
+        if n > 1 {
+            out[2] += n;
+            out[3] += bytes - most;
+        }
+    }
+    out
+}
+
+/// The one place a host copy the eviction chose is released, once no slot
+/// and no list holds it (`VICTORY_TEXTURE_EVICT`): for now as the sweep
+/// releases an idle one (`crate::host::retire`, which waits for the
+/// submissions running now). shortcut: lists recorded but not yet
+/// submitted, and slots made null while a list that reads them waits,
+/// are not waited for; a deferred release keyed on the last submission
+/// that could use the texture belongs here.
+#[cfg(windows)]
+fn release_evicted(host: std::sync::Arc<HostTexture>, twin: Option<std::sync::Arc<Twin>>) {
+    // Both through the graveyard (`crate::host::retire`): a list being
+    // recorded may still read either.
+    crate::host::retire(host);
+    if let Some(twin) = twin {
+        crate::host::retire(twin);
+    }
+}
+
+/// The eviction chose the host copies of these title textures: the next
+/// sweeps ([`let_go_idle`]) let each go once no slot and no list holds it,
+/// unless it is used first. Returns the bytes chosen.
+#[cfg(windows)]
+pub(crate) fn mark_evicted(titles: &[usize]) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = crate::host::moment();
+    let all = textures();
+    let mut bytes = 0;
+    for &at in titles {
+        if !all.contains(&at) {
+            continue;
+        }
+        // SAFETY: as in `let_go_idle`: in the table, under its lock.
+        let r = unsafe { &*(at as *const Resource) };
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && r.host.mark.swap(now, Relaxed) == 0
+        {
+            bytes += host.bytes;
+            EVICTED[0].fetch_add(1, Relaxed);
+            EVICTED[1].fetch_add(host.bytes, Relaxed);
+            EVICTED[10].fetch_add(host.bytes, Relaxed);
+        }
+    }
+    bytes
 }
 
 /// For the memory line: title textures with a host copy the host renders
@@ -1647,6 +1817,13 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
     (before != wanted).then(|| (host.texture.as_raw(), before))
+}
+
+/// Whether title texture `this` has its host copy now (not made here, and
+/// no use).
+#[cfg(windows)]
+pub(crate) fn host_copy_made(this: This) -> bool {
+    !this.is_null() && resource(this).host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if
@@ -1836,6 +2013,9 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            mark: std::sync::atomic::AtomicU64::new(0),
+            gone_ms: std::sync::atomic::AtomicU64::new(0),
+            evicted: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
@@ -2131,7 +2311,7 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
 /// The resource [`texture_at`] made for a texture placed at `address` with
 /// the description `desc`, if it has made one: never made here (for the
 /// frame listing, which must not count as a use).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     map.get(&(address, *desc)).map(|&r| r as This)

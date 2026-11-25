@@ -1564,8 +1564,10 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// whether every write there is marked (page marks,
+    /// `crate::shadow::marks_mode`).
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1600,6 +1602,9 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Page marks' check: the copies the list's shaders write (by address)
+    /// and the pipeline that declared each, for the log.
+    writers: Vec<(usize, String)>,
 }
 
 impl Deferred {
@@ -1891,6 +1896,106 @@ fn late_writes() -> bool {
 /// (address, end).
 type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 
+thread_local! {
+    /// Page marks' check: the pipeline whose writes are being declared on
+    /// this thread ([`HostList::defer_gpu_write`]).
+    pub(crate) static WRITER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Page marks (`crate::shadow::marks_mode`): a submission's marks, copied
+/// down from the bitmap by a list of ours queued behind its lists, which
+/// clears the bitmap after the copy ([`Host::marks_take`]). The list, the
+/// read-back buffer and its mapping go back to [`MARK_POOL`] once read.
+struct MarkTake {
+    list: Prelude,
+    back: ID3D12Resource,
+    data: usize,
+    /// Words copied down.
+    words: usize,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the mapping is read only after
+// the submission's fence has passed.
+unsafe impl Send for MarkTake {}
+
+static MARK_POOL: Mutex<Vec<MarkTake>> = Mutex::new(Vec::new());
+
+impl MarkTake {
+    /// The marks, from bit 0. Only once the submission has run.
+    fn bits(&self) -> &[u32] {
+        // SAFETY: the mapped read-back buffer holds `VIEW_WRITE_BITS` bits,
+        // `words` of them written by the finished copy.
+        unsafe { std::slice::from_raw_parts(self.data as *const u32, self.words) }
+    }
+
+    fn done(self) {
+        MARK_POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self);
+    }
+}
+
+/// Page marks: what the submissions being landed marked, and which copies
+/// they declared a write to that is not marked (by address).
+#[derive(Default)]
+struct MarkView {
+    /// The marks of all of them; `None` if none took any.
+    bits: Option<Vec<u32>>,
+    unmarked: std::collections::HashSet<usize>,
+    /// Check: who declared writes to each copy.
+    writers: Vec<(usize, String)>,
+    /// The number of the last of them.
+    landed: u64,
+}
+
+impl MarkView {
+    /// Adds one submission's marks (`take`) and declarations.
+    fn add(&mut self, take: Option<&MarkTake>, unmarked: &std::collections::HashSet<usize>, writers: &[(usize, String)]) {
+        if let Some(take) = take {
+            let bits = take.bits();
+            let all = self.bits.get_or_insert_with(Vec::new);
+            if all.len() < bits.len() {
+                all.resize(bits.len(), 0);
+            }
+            for (a, b) in all.iter_mut().zip(bits) {
+                *a |= *b;
+            }
+        }
+        self.unmarked.extend(unmarked.iter().copied());
+        for w in writers {
+            if !self.writers.contains(w) && self.writers.len() < 512 {
+                self.writers.push(w.clone());
+            }
+        }
+    }
+
+    /// Check: the pipelines that declared writes to `shadow`.
+    fn who(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> String {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let names: Vec<&str> = self.writers.iter().filter(|(k, _)| *k == key).map(|(_, n)| n.as_str()).collect();
+        names.join(", ").chars().take(600).collect()
+    }
+}
+
+/// Page marks: of the writes `runs` declare, the copies with one that is
+/// not marked (by address); and whether any is marked. A submission whose
+/// marks are not taken counts every copy as unmarked.
+fn marked_writes(runs: &[&HostList]) -> (std::collections::HashSet<usize>, bool, Vec<(usize, String)>) {
+    let (mut unmarked, mut any) = (std::collections::HashSet::new(), false);
+    let mut writers = Vec::new();
+    for list in runs {
+        let deferred = list.deferred();
+        for step in &deferred.copies {
+            if let Step::GpuWrite(shadow, _, _, marked) = step {
+                any |= *marked;
+                if !*marked {
+                    unmarked.insert(std::sync::Arc::as_ptr(shadow) as usize);
+                }
+            }
+        }
+        writers.extend(deferred.writers.iter().cloned());
+    }
+    (unmarked, any, writers)
+}
+
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
 struct Sent {
@@ -1898,6 +2003,11 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Page marks: its marks, the copies with an unmarked write, and (check)
+    /// who declared what.
+    marks: Option<MarkTake>,
+    unmarked: std::collections::HashSet<usize>,
+    writers: Vec<(usize, String)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -1913,6 +2023,10 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// As in [`Sent`].
+    marks: Option<MarkTake>,
+    unmarked: std::collections::HashSet<usize>,
+    writers: Vec<(usize, String)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2405,7 +2519,7 @@ fn relay_worker() {
 /// once, the pieces that differ found on several threads; but the merge is
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
-fn relay_hand_back(back: &[Declared]) {
+fn relay_hand_back(back: &[Declared], marks: &MarkView) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
@@ -2413,10 +2527,12 @@ fn relay_hand_back(back: &[Declared]) {
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
         join_ranges(&mut spans, declared.iter().copied());
-        for &(from, to) in &spans {
-            shadow.relay_compared(from, to - from);
-        }
         work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
+    }
+    // Page marks: only the pieces shaders marked, where all of them mark.
+    let work = crate::shadow::cut_to_marks(work, marks.bits.as_deref(), &marks.unmarked);
+    for (shadow, from, to) in &work {
+        shadow.relay_compared(*from, to - from);
     }
     if work.is_empty() {
         return;
@@ -2429,6 +2545,17 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    // Check: a piece that differs may be a later flight's, still in the air
+    // (its marks come with its landing): judged once the flights started
+    // by now have landed.
+    crate::shadow::check_marks(
+        &work,
+        &found,
+        marks.bits.as_deref(),
+        &marks.unmarked,
+        |s| marks.who(s),
+        Some((marks.landed, STARTED.load(Ordering::Acquire))),
+    );
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
@@ -2616,7 +2743,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, _) = step {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -2659,7 +2786,7 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+fn hand_back(back: &[Declared], marks: &MarkView) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -2679,11 +2806,15 @@ fn hand_back(back: &[Declared]) {
             }
             work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
         }
+        // Page marks: only the pieces shaders marked, where all of them mark.
+        let work = crate::shadow::cut_to_marks(work, marks.bits.as_deref(), &marks.unmarked);
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+        crate::shadow::check_marks(&work, &found, marks.bits.as_deref(), &marks.unmarked, |s| marks.who(s), None);
+        crate::shadow::marks_landed(None, &std::collections::HashSet::new(), u64::MAX);
         for ((shadow, from, to), found) in work.iter().zip(found) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -2716,7 +2847,8 @@ fn hand_back(back: &[Declared]) {
                 _ => spans.push((from, to)),
             }
         }
-        for (from, to) in spans {
+        let work = spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)).collect();
+        for (_, from, to) in crate::shadow::cut_to_marks(work, marks.bits.as_deref(), &marks.unmarked) {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -2957,6 +3089,82 @@ impl Host {
         }
     }
 
+    /// Page marks: a list that copies the written-pages bitmap down
+    /// (the words handed out so far) into a read-back buffer and then clears
+    /// it, to run in a call of its own right behind a submission's lists
+    /// (the bitmap is then in the common state). Its barriers order the copy
+    /// after every earlier shader's marks and the clear before every later
+    /// one's, so the buffer holds exactly this submission's marks (and those
+    /// of submissions before it that took none). `None` if it cannot be made.
+    fn marks_take(&self) -> Option<MarkTake> {
+        let gpu = crate::shadow::mark_bitmap()?;
+        let words = crate::shadow::mark_words();
+        let pooled = MARK_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let mut take = match pooled {
+            Some(take) => take,
+            None => {
+                let list = self.make_prelude()?;
+                let back = self.read_back_buffer(u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8))?;
+                name(&back, || "written pages, read back".into());
+                let mut data = std::ptr::null_mut();
+                // SAFETY: a read-back buffer of ours, mapped for good; read
+                // only after the copies into it have run.
+                unsafe { back.Map(0, None, Some(&mut data)) }.ok()?;
+                MarkTake {
+                    list,
+                    back,
+                    data: data as usize,
+                    words: 0,
+                }
+            }
+        };
+        take.words = words;
+        let bytes = (words * 4) as u64;
+        let (allocator, list) = &take.list;
+        // SAFETY: the list's last run finished (a take goes back to the pool
+        // only once its submission has landed); live buffers holding
+        // `bytes`.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+                list.ResourceBarrier(&[
+                    transition(&gpu.bitmap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(&gpu.zeros, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                ]);
+                list.CopyBufferRegion(&take.back, 0, &gpu.bitmap, 0, bytes);
+                list.ResourceBarrier(&[transition(
+                    &gpu.bitmap,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.CopyBufferRegion(&gpu.bitmap, 0, &gpu.zeros, 0, bytes);
+                list.ResourceBarrier(&[
+                    transition(&gpu.bitmap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+                    transition(&gpu.zeros, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                ]);
+                list.Close()
+            })()
+        };
+        match recorded {
+            Ok(()) => Some(take),
+            Err(e) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(error = %e, "page marks: the copy-down of the bitmap could not be recorded; copies are compared whole"));
+                None
+            }
+        }
+    }
+
     /// Before a submission's lists run, for copies in the card's memory
     /// ([`crate::shadow::cards`]): what changed on their CPU side since
     /// the last submission goes to their card side (a list of ours, run
@@ -2976,7 +3184,7 @@ impl Host {
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, _) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
@@ -3383,7 +3591,10 @@ impl Host {
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
                 self.relay_card_back(&plans, fetch);
                 let mut back: Vec<Declared> = Vec::new();
+                let mut view = MarkView::default();
                 for flight in &flights {
+                    view.add(flight.marks.as_ref(), &flight.unmarked, &flight.writers);
+                    view.landed = view.landed.max(flight.number);
                     for (shadow, ranges) in &flight.back {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                             Some((_, all)) => {
@@ -3397,7 +3608,8 @@ impl Host {
                         }
                     }
                 }
-                relay_hand_back(&back);
+                crate::shadow::marks_landed(view.bits.as_deref(), &view.unmarked, view.landed);
+                relay_hand_back(&back, &view);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
@@ -3422,6 +3634,9 @@ impl Host {
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
+                    }
+                    if let Some(m) = flight.marks {
+                        m.done();
                     }
                     landed.push((flight.lists, flight.order));
                 }
@@ -3641,6 +3856,9 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                marks: sent.marks,
+                unmarked: sent.unmarked,
+                writers: sent.writers,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -3685,6 +3903,9 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                marks: sent.marks,
+                unmarked: sent.unmarked,
+                writers: sent.writers,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -3787,10 +4008,12 @@ impl Host {
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
+                let mut view = MarkView::default();
                 for item in &items {
                     let Late::Run(flight) = item else {
                         continue;
                     };
+                    view.add(flight.marks.as_ref(), &flight.unmarked, &flight.writers);
                     if let Some(card) = &flight.card {
                         self.card_back(card, submitted, &mut seen);
                     }
@@ -3807,7 +4030,7 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
+                hand_back(&back, &view);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -3822,6 +4045,9 @@ impl Host {
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if let Some(m) = flight.marks {
+                            m.done();
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -3980,12 +4206,33 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // Page marks: this submission's, copied down and cleared behind its
+        // lists. Without them every copy it writes is compared whole.
+        let (mut unmarked, marking, writers) = marked_writes(runs);
+        let marks = if marking { self.marks_take() } else { None };
+        if marking && marks.is_none() {
+            for list in runs {
+                for step in &list.deferred().copies {
+                    if let Step::GpuWrite(shadow, ..) = step {
+                        unmarked.insert(std::sync::Arc::as_ptr(shadow) as usize);
+                    }
+                }
+            }
+        }
+        if crate::shadow::marks_mode() != 0 {
+            crate::shadow::MARK_STATS[if marks.is_some() { 4 } else { 5 }].fetch_add(1, Ordering::Relaxed);
+        }
+        let marks_list: Option<ID3D12CommandList> = marks.as_ref().and_then(|m| m.list.1.cast().ok());
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
+                // Its own call: the bitmap is in the common state there.
+                if let Some(m) = &marks_list {
+                    self.queue.ExecuteCommandLists(&[Some(m.clone())]);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -4003,6 +4250,9 @@ impl Host {
                 card,
                 back,
                 writes,
+                marks,
+                unmarked,
+                writers,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -4027,6 +4277,11 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len()
+                    && let Some(m) = &marks_list
+                {
+                    self.queue.ExecuteCommandLists(&[Some(m.clone())]);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -4112,7 +4367,12 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        let mut view = MarkView::default();
+        view.add(marks.as_ref(), &unmarked, &writers);
+        hand_back(&back, &view);
+        if let Some(m) = marks {
+            m.done();
+        }
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -4909,10 +5169,19 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        // Page marks' check: who declared it, for the log.
+        if crate::shadow::marks_mode() == 2 {
+            WRITER.with_borrow(|w| {
+                let key = (std::sync::Arc::as_ptr(shadow) as usize, w.clone());
+                if !deferred.writers.contains(&key) && deferred.writers.len() < 256 {
+                    deferred.writers.push(key);
+                }
+            });
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -5127,7 +5396,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -5711,6 +5980,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
+        crate::shadow::marks_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {

@@ -245,6 +245,7 @@ pub(crate) fn ready(
     addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    marking: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -288,6 +289,8 @@ pub(crate) fn ready(
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        // Page marks: the view begins at the copy's first byte.
+        heap.set_mark(base + 1 + n as u32, shadow.mark_entry_at(0, 4));
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
@@ -304,7 +307,7 @@ pub(crate) fn ready(
             shadow.refresh(list, start, len);
         }
         if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+            shadow.gpu_writes(list, start, len, marking);
         }
     }
     if first_read {

@@ -776,8 +776,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
-            log_removal_context();
         }
+        // Every way a run ends on the host GPU (a fetch mark the card never
+        // wrote comes before the removal is reported: run play-va2 printed
+        // no address map): the trail, the graveyard and the address map.
+        log_removal_context();
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(

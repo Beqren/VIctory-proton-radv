@@ -986,15 +986,25 @@ thread_local! {
     /// memory from user mode; a guard fault meanwhile is the copy-back's
     /// race with a refresh ([`reopen_for_card`]).
     static CARD_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// That write met a block guarded again (faulted, or seen read-only
+    /// before it: [`card_raced`]).
+    static CARD_RACED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `write` (the copy-back's user-mode write) with guard faults on
-/// this thread counted as raced writes (diagnostics builds).
-pub(crate) fn as_card_write<T>(write: impl FnOnce() -> T) -> T {
+/// this thread counted as raced writes; also whether it raced.
+pub(crate) fn as_card_write<T>(write: impl FnOnce() -> T) -> (T, bool) {
+    CARD_RACED.with(|c| c.set(false));
     CARD_WRITE.with(|c| c.set(true));
     let out = write();
     CARD_WRITE.with(|c| c.set(false));
-    out
+    (out, CARD_RACED.with(|c| c.get()))
+}
+
+/// The user-mode write of [`as_card_write`] found its destination guarded
+/// again before writing.
+pub(crate) fn card_raced() {
+    CARD_RACED.with(|c| c.set(true));
 }
 
 /// Tests: called by the copy-back (`crate::shadow::put_back`) between
@@ -1548,12 +1558,16 @@ fn install() {
         #[cfg(feature = "diagnostics")]
         prep(P_FAULT_LOCK_US, started.elapsed().as_micros() as u64);
         if open(&mut g, at, at + 1, Why::Fault) {
+            let card = CARD_WRITE.with(|c| c.get());
+            if card {
+                CARD_RACED.with(|c| c.set(true));
+            }
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
                 add(C::GuardFaults, 1);
                 add(C::FaultUs, started.elapsed().as_micros() as u64);
-                if CARD_WRITE.with(|c| c.get()) {
+                if card {
                     add(C::BackRaced, 1);
                 }
             }

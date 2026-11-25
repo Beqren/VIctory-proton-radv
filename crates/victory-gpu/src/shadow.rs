@@ -1083,6 +1083,7 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
             // the guards' handler, which opens the block and notes it
             // written. Handed to the kernel's write it would fail.
             PAGE_READONLY if back_retry() && crate::watch::guarded_by_us(p, stop.min(end)) => {
+                crate::watch::card_raced();
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::BackRaced, 1);
             }
@@ -1170,14 +1171,20 @@ fn back_left_out(at: usize, n: usize, why: &str) {
 /// Writes `bytes` (what shaders wrote, merged) into title memory at `at`,
 /// after `crate::watch::writing_from_card` opened the guards there.
 fn write_back(at: usize, bytes: &[u8]) {
-    if back_user() && crate::watch::as_card_write(|| write_user(at, bytes)) {
-        told_after(at, bytes.len());
-        return;
+    if back_user() {
+        let (written, raced) = crate::watch::as_card_write(|| write_user(at, bytes));
+        if written {
+            if raced {
+                told_after(at, bytes.len());
+            }
+            return;
+        }
     }
     let mut failed = crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
-    if !back_retry() {
+    if failed.is_empty() || !back_retry() {
         return;
     }
+    let mut raced = false;
     for _ in 0..BACK_TRIES {
         if failed.is_empty() {
             break;
@@ -1185,6 +1192,7 @@ fn write_back(at: usize, bytes: &[u8]) {
         let mut again = Vec::new();
         for (a, n) in failed {
             if crate::watch::reopen_for_card(a, n) {
+                raced = true;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::BackRaced, 1);
             } else if !crate::watch::writable(a) {
@@ -1201,13 +1209,22 @@ fn write_back(at: usize, bytes: &[u8]) {
     for (a, n) in failed {
         back_left_out(a, n, "still refused after it was opened again 8 times");
     }
-    told_after(at, bytes.len());
+    if raced {
+        told_after(at, bytes.len());
+    }
 }
 
-/// With [`back_retry`]: the texture side is told of the write after it as
-/// well as before (`crate::watch::writing_from_card`): a texture pass
-/// between the two took the bytes from before (review finding on the race
-/// fix: a raced write that lands by a fault told nobody).
+/// With [`back_retry`], after a raced write: the texture side is told of
+/// the write after it as well as before (`crate::watch::writing_from_card`):
+/// a texture pass between the two took the bytes from before (review
+/// finding on the race fix: a raced write that lands by a fault told
+/// nobody).
+///
+/// Only raced writes: telling it after every write (~1,750 a frame) went
+/// with a changed picture in both title runs that did (runs 4 and 5: the
+/// diner's tall glass drawn as chrome, the phone dark), against clear glass
+/// in the control without the fix (run 6) and in earlier captures. Not
+/// proven the cause, and the narrowed form was not run in the title.
 fn told_after(at: usize, len: usize) {
     if back_retry() {
         crate::descriptor::host::remapped(at, len);

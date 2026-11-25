@@ -961,6 +961,7 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE, VirtualQuery,
     };
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     let end = at + bytes.len();
     let Some(_mapped) = crate::watch::title_memory_reading_now(at, bytes.len()) else {
         return false;
@@ -973,13 +974,24 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
         if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0
             || info.State != MEM_COMMIT
             || info.Protect & PAGE_GUARD != 0
-            || !matches!(info.Protect & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
         {
             return false;
         }
         let stop = (info.BaseAddress as usize).saturating_add(info.RegionSize);
         if stop <= p {
             return false;
+        }
+        match info.Protect & 0xff {
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE => {}
+            // Guarded again by a copy's refresh since the guards were
+            // opened (the race of [`back_retry`]): the write faults into
+            // the guards' handler, which opens the block and notes it
+            // written. Handed to the kernel's write it would fail.
+            PAGE_READONLY if back_retry() && crate::watch::guarded_by_us(p, stop.min(end)) => {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackRaced, 1);
+            }
+            _ => return false,
         }
         p = stop;
     }
@@ -990,10 +1002,112 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
     true
 }
 
+/// Whether a write of what shaders wrote that finds its destination guarded
+/// again is opened again and written again, not dropped (on by default;
+/// `VICTORY_BACK_RETRY=0` drops it without a word, as before).
+///
+/// The race: [`put_back`] opens the guards at the destination
+/// (`crate::watch::writing_from_card`, which notes the blocks written),
+/// then writes. A copy's refresh on another thread (the copy-back runs on
+/// the relay thread while the next submission is prepared) can come in
+/// between: it takes the mark, copies the title's old bytes into its host
+/// copy, makes the block read-only again and calls it clean. The kernel's
+/// write then fails on the read-only page (under Wine a wineserver request
+/// writing with `process_vm_writev`, which honours the protection:
+/// `STATUS_PARTIAL_COPY`, see `crate::host::write_mapped`), which went on
+/// to the next piece: the shader's bytes were lost from title memory, and
+/// the copies of it held the bytes from before. [`write_user`] saw the
+/// page read-only and handed it to the kernel's write, with the same end.
+///
+/// With the switch a refused piece whose block is ours again is opened
+/// again (noted written, so the refresh that ran is followed by one that
+/// sees the bytes) and written again, up to [`BACK_TRIES`] times;
+/// [`write_user`] writes into such a block and the write faults into the
+/// guards' handler, which opens it. A piece refused for another reason is
+/// counted: not mapped (left alone, as always), or committed and refused
+/// (warned once: [`BACK_DROPPED`]). No lock is held across the write: the
+/// title's threads already wait 40-45 ms a frame in the fault handler for
+/// the guards' lock, and the kernel's writes take ~21 ms a frame.
+pub(crate) fn back_retry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_RETRY").is_none_or(|v| v != "0"))
+}
+
+/// Writes of a raced piece ([`back_retry`]) before it counts as dropped.
+const BACK_TRIES: usize = 8;
+
+/// Bytes of what shaders wrote that could not be put into committed title
+/// memory, since the start (warned once).
+pub(crate) static BACK_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `n` bytes at `at` of what shaders wrote are not in title memory: not
+/// mapped (as always, left alone), or refused and so lost (counted, and
+/// warned once).
+fn back_left_out(at: usize, n: usize, why: &str) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let known = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0;
+    if known && info.State != MEM_COMMIT {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackUnmappedBytes, n as u64);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::BackDroppedBytes, n as u64);
+    if BACK_DROPPED.fetch_add(n as u64, Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            "what shaders wrote could not be put into title memory: {n} bytes at {at:#x} {why} \
+             (protection {:#x}, state {:#x}); counted from now on, not warned again",
+            info.Protect,
+            info.State,
+        );
+    }
+}
+
+/// Writes `bytes` (what shaders wrote, merged) into title memory at `at`,
+/// after `crate::watch::writing_from_card` opened the guards there.
+fn write_back(at: usize, bytes: &[u8]) {
+    if back_user() && crate::watch::as_card_write(|| write_user(at, bytes)) {
+        return;
+    }
+    let mut failed = crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+    if failed.is_empty() || !back_retry() {
+        return;
+    }
+    let mut raced = false;
+    for _ in 0..BACK_TRIES {
+        let mut again = Vec::new();
+        for (a, n) in failed {
+            if crate::watch::reopen_for_card(a, n) {
+                raced = true;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackRaced, 1);
+                again.extend(crate::host::write_mapped(a as *mut u8, bytes[a - at..].as_ptr(), n));
+            } else {
+                back_left_out(a, n, "refused (not guarded by us)");
+            }
+        }
+        failed = again;
+        if failed.is_empty() {
+            break;
+        }
+    }
+    for (a, n) in failed {
+        back_left_out(a, n, "still refused after it was opened again 8 times");
+    }
+    // The texture side was told before the first write; a pass between
+    // then and now took the bytes from before.
+    if raced {
+        crate::descriptor::host::remapped(at, bytes.len());
+    }
+}
+
 /// Puts `merged` (the title's bytes at `address` with what shaders wrote
 /// put in) into title memory; `runs` ([`merged_runs`]) are the parts that
 /// differ from what title memory held. Returns the bytes written.
-fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
+pub(crate) fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
     if runs.is_empty() {
         return 0;
     }
@@ -1012,14 +1126,14 @@ fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
         #[cfg(feature = "diagnostics")]
         let opening = std::time::Instant::now();
         crate::watch::writing_from_card(at, bytes.len());
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::watch::card_between(at, bytes.len());
         #[cfg(feature = "diagnostics")]
         let writing = {
             crate::copystat::add(crate::copystat::C::BackOpenUs, opening.elapsed().as_micros() as u64);
             std::time::Instant::now()
         };
-        if !(back_user() && write_user(at, bytes)) {
-            crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
-        }
+        write_back(at, bytes);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackWriteUs, writing.elapsed().as_micros() as u64);
         written += bytes.len();

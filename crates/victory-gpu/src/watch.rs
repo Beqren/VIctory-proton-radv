@@ -942,6 +942,74 @@ pub(crate) fn writing_from_card(at: usize, len: usize) {
     writing_why(at, len, Why::Card);
 }
 
+/// After a write of the copy-back's into `[at, at + len)` failed (the
+/// kernel refused it) or found the destination read-only: whether a block
+/// there is guarded by us again, which can only be a copy's refresh that
+/// took the block (and called it clean) between [`writing_from_card`] and
+/// the write. If so it is opened again and noted written, as
+/// [`writing_from_card`] does, all under the guards' lock: the caller
+/// writes again, and the refresh that ran is followed by another that sees
+/// the bytes. False when no block there is ours: the write failed for
+/// another reason (memory not mapped, or read-only by the title's hand).
+///
+/// The same lock is what a refresh takes to guard a block again
+/// (`protect_here`, `protect_alias`), and a block noted clean is always
+/// one we made read-only: so a refresh that consumed the mark at this view
+/// made it read-only, and a kernel write after that fails rather than
+/// landing unseen. Holding the lock across the write instead would make
+/// the title's threads wait in the fault handler for each write (they
+/// already wait 40-45 ms a frame for it), and a user-mode write that
+/// faults would wait for itself.
+pub(crate) fn reopen_for_card(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    {
+        let g = guards();
+        if g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).next().is_none() {
+            return false;
+        }
+    }
+    // Opened as the first time, holding the lock again: a block guarded
+    // between the look and this is opened too.
+    writing_why(at, len, Why::Card);
+    true
+}
+
+/// Whether every block of `[start, end)` is one we made read-only: a write
+/// there faults into our handler, which opens it and notes it written.
+pub(crate) fn guarded_by_us(start: usize, end: usize) -> bool {
+    let g = guards();
+    (start / BLOCK..end.div_ceil(BLOCK)).all(|b| g.protected.contains(&b))
+}
+
+thread_local! {
+    /// Diagnostics: this thread is writing what shaders wrote into title
+    /// memory from user mode; a guard fault meanwhile is the copy-back's
+    /// race with a refresh ([`reopen_for_card`]).
+    static CARD_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `write` (the copy-back's user-mode write) with guard faults on
+/// this thread counted as raced writes (diagnostics builds).
+pub(crate) fn as_card_write<T>(write: impl FnOnce() -> T) -> T {
+    CARD_WRITE.with(|c| c.set(true));
+    let out = write();
+    CARD_WRITE.with(|c| c.set(false));
+    out
+}
+
+/// Tests: called by the copy-back (`crate::shadow::put_back`) between
+/// opening the guards and writing.
+#[cfg(any(test, feature = "test-hooks"))]
+static CARD_BETWEEN: Mutex<Option<fn(usize, usize)>> = Mutex::new(None);
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn card_between(at: usize, len: usize) {
+    let hook = *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hook) = hook {
+        hook(at, len);
+    }
+}
+
 fn writing_why(at: usize, len: usize, why: Why) {
     // The length is the title's (`fread`'s size times count, saturated).
     let end = at.saturating_add(len);
@@ -1485,6 +1553,9 @@ fn install() {
                 use crate::copystat::{C, add};
                 add(C::GuardFaults, 1);
                 add(C::FaultUs, started.elapsed().as_micros() as u64);
+                if CARD_WRITE.with(|c| c.get()) {
+                    add(C::BackRaced, 1);
+                }
             }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2098,6 +2169,97 @@ mod tests {
 
     /// Tests that set the hook of `write_title_memory`, one at a time.
     static HOOKS: Mutex<()> = Mutex::new(());
+
+    /// Under Wine the kernel's write into a block we made read-only is
+    /// refused, not faulted into our handler: `NtWriteVirtualMemory` is a
+    /// wineserver request writing with `process_vm_writev`, which honours
+    /// the protection. What the copy-back's race comes to.
+    #[test]
+    fn a_kernel_write_into_a_guarded_block_is_refused() {
+        let (section, one, two) = two_views(BLOCK);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        let bytes = *b"from the card";
+        let (status, written) = crate::host::kernel_write(one + 8, bytes.as_ptr(), bytes.len());
+        println!("NtWriteVirtualMemory into a guarded block: status {status:#x}, {written} bytes written");
+        assert!(status < 0, "the write is refused ({status:#x})");
+        // SAFETY: our view, readable.
+        assert_ne!(unsafe { std::slice::from_raw_parts((one + 8) as *const u8, 13) }, &bytes);
+        writing_from_card(one + 8, bytes.len());
+        let (status, written) = crate::host::kernel_write(one + 8, bytes.as_ptr(), bytes.len());
+        assert!(status >= 0 && written == bytes.len(), "opened, it lands ({status:#x}, {written})");
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// Clears the copy-back's hook when dropped.
+    struct NoCardHook;
+    impl Drop for NoCardHook {
+        fn drop(&mut self) {
+            *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// The view a copy-back hook refreshes.
+    static REFRESHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The copy-back's race (`crate::shadow::back_retry`): between opening
+    /// the guards and writing, a copy's refresh takes the block (reports it
+    /// written, copies it, guards it again and calls it clean). What shaders
+    /// wrote must still land, and the block be reported written again so
+    /// that the copy takes the new bytes. Fails with `VICTORY_BACK_RETRY=0`
+    /// (the kernel's write is refused and the bytes were dropped).
+    #[test]
+    fn a_write_from_the_card_raced_by_a_refresh_lands_and_is_reported() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _one_at_a_time = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let (section, one, two) = two_views(BLOCK);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()), "nothing written yet");
+        REFRESHED.store(one, Relaxed);
+        let _reset = NoCardHook;
+        *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(|_, _| {
+            let one = REFRESHED.load(Relaxed);
+            assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]), "the refresh takes the mark");
+        });
+        let merged = *b"what shaders wrote";
+        crate::shadow::put_back(one + 8, &merged, &[(0, merged.len())]);
+        *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // SAFETY: our view, readable.
+        assert_eq!(unsafe { std::slice::from_raw_parts((one + 8) as *const u8, merged.len()) }, &merged, "the write landed");
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]), "the copy is told the block changed again");
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// The race at another view: the refresh is of a copy at the other view
+    /// of the same page, which guards the view written through
+    /// (`protect_views_of`) and calls its own block clean. Both views'
+    /// copies must see the bytes.
+    #[test]
+    fn a_write_from_the_card_raced_by_a_refresh_at_another_view_is_reported_there() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _one_at_a_time = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let (section, one, two) = two_views(BLOCK);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()), "nothing written yet");
+        assert_eq!(guard(two, two + BLOCK), Some(Vec::new()), "nothing written yet");
+        REFRESHED.store(two, Relaxed);
+        let _reset = NoCardHook;
+        *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(|_, _| {
+            let two = REFRESHED.load(Relaxed);
+            assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]), "the other view's refresh");
+        });
+        let merged = *b"what shaders wrote";
+        crate::shadow::put_back(one + 8, &merged, &[(0, merged.len())]);
+        *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // SAFETY: the other view, readable.
+        assert_eq!(unsafe { std::slice::from_raw_parts((two + 8) as *const u8, merged.len()) }, &merged, "the write landed");
+        assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]), "the other view's copy is told again");
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        assert_eq!(guard(two, two + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
+    }
 
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used

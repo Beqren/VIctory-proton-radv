@@ -321,6 +321,10 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// made stale; ranges of memory noted as mapped, unmapped or written;
 /// ranges dropped because no pass took them; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
+/// Since the start: null slots draws asked for that were out of the queue
+/// and were put back ([`HostHeap::texture_slot_requeue`]).
+pub(crate) static REQUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -1049,6 +1053,34 @@ impl HostHeap {
     /// null).
     pub(crate) fn texture_slot_made(&self, index: u32) -> bool {
         self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(|&key| key != 0)
+    }
+
+    /// A draw asks for title slot `index` in `frame` and its host slot is
+    /// null: if no pass will make it (out of the queue), it goes back in,
+    /// due now. Returns whether it did.
+    ///
+    /// A slot leaves the queue null when a newer view of other memory makes
+    /// its view stale (the overlap rule, [`stale_rule`]) or when a table
+    /// read takes it out and the draw's own make finds no room; it then
+    /// stayed null until the title wrote the slot again, which a material
+    /// that is drawn every frame never does. In the opening's diner shots
+    /// (run skin-5, 2026-11-25) 2,078 of the 3,029 null slots the
+    /// character pixel programs named were out of the queue, among them
+    /// the first word of a drawn material record (a 512x512 BC1 map), and
+    /// the skin program discarded every pixel of the heads.
+    /// `VICTORY_TEXTURE_ASKED_REQUEUE=0`: left out, as before.
+    pub(crate) fn texture_slot_requeue(&self, index: u32, frame: u64) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_REQUEUE").is_none_or(|v| v != "0")) {
+            return false;
+        }
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if textures.slots.contains_key(&index) {
+            return false;
+        }
+        textures.written(index, frame, frame, false);
+        REQUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     /// A draw asks for the texture at title slot `index` in `frame`.

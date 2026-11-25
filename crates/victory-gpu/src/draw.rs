@@ -361,24 +361,52 @@ pub(crate) static HEAP_TEXTURES_RESERVED: AtomicU64 = AtomicU64::new(0);
 /// `tools`' measure of how soon the characters' textures arrive is the
 /// first frame after the world's first in which none was missing.
 fn asked_census(frame: u64, index: u32, made: bool) {
-    type Census = (u64, std::collections::HashSet<u32>, u32);
+    /// Frames a slot may be missing before it counts as long missing.
+    const LONG: u64 = 30;
+    // The frame, the slots asked for in it, how many of them were missing,
+    // and of those how many have been missing at every ask for `LONG`
+    // frames or more; and per slot missing now, the frame since which.
+    type Census = (u64, std::collections::HashSet<u32>, u32, u32, std::collections::HashMap<u32, u64>);
     static CENSUS: std::sync::Mutex<Option<Census>> = std::sync::Mutex::new(None);
     let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
-    let c = census.get_or_insert_with(|| (frame, Default::default(), 0));
+    let c = census.get_or_insert_with(|| (frame, Default::default(), 0, 0, Default::default()));
     if c.0 != frame {
         if !c.1.is_empty() {
             tracing::info!(
                 frame = c.0,
                 asked = c.1.len(),
                 missing = c.2,
+                missing_long = c.3,
+                wide = asked_wide(),
                 "character textures the frame's draws asked for, and of them missing on the card"
             );
         }
-        *c = (frame, Default::default(), 0);
+        // Slots not asked for in the frame just told are forgotten.
+        let asked = std::mem::take(&mut c.1);
+        c.4.retain(|slot, _| asked.contains(slot));
+        (c.0, c.2, c.3) = (frame, 0, 0);
     }
-    if c.1.insert(index) && !made {
-        c.2 += 1;
+    if !c.1.insert(index) {
+        return;
     }
+    if made {
+        c.4.remove(&index);
+        return;
+    }
+    c.2 += 1;
+    let since = *c.4.entry(index).or_insert(frame);
+    if frame.saturating_sub(since) >= LONG {
+        c.3 += 1;
+    }
+}
+
+/// Whether character draws ask for every slot their pixel program may take
+/// a texture from, not only the first 16 words of the material record
+/// (`State::asked_wide_words`); `VICTORY_TEXTURE_ASKED_WIDE=0`: those 16
+/// words alone, as before.
+fn asked_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_WIDE").is_none_or(|v| v != "0"))
 }
 
 /// Since the start: slots draws asked for (`State::note_asked`), and
@@ -1708,8 +1736,14 @@ impl State {
             return;
         };
         let frame = crate::frame::current();
-        for w in record.chunks_exact(4) {
-            let index = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let mut words: Vec<u32> =
+            record.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        if asked_wide() {
+            self.asked_wide_words(&t, heap, (base, len, at), &mut words);
+        }
+        words.sort_unstable();
+        words.dedup();
+        for index in words {
             if index != 0
                 && heap
                     .handle(index)
@@ -1719,7 +1753,82 @@ impl State {
             {
                 host.texture_slot_asked(index, frame);
                 HEAP_TEXTURES_ASKED[0].fetch_add(1, Ordering::Relaxed);
-                asked_census(frame, index, host.texture_slot_made(index));
+                let made = host.texture_slot_made(index);
+                if !made {
+                    host.texture_slot_requeue(index, frame);
+                }
+                asked_census(frame, index, made);
+            }
+        }
+    }
+
+    /// The other places a character draw's pixel program takes texture
+    /// slots from, beside the first 16 words of its material record
+    /// (`note_asked`), as `slots_text` lists them (from fxceless's reading
+    /// of `PS_DeferredPedTexturedNC`, victory-fork 310c6eb): the record's
+    /// second part (512 bytes at 0x790), the record the second root
+    /// constant names in the buffer at table 0, dword 688, every word of
+    /// the small buffers and constants of the draw's tables, and the
+    /// textures its tables hold. The 16 words alone missed the slot whose
+    /// texture, empty, made the skin program discard every pixel of the
+    /// heads in the opening (diner shots, runs skin-1 to skin-3 of
+    /// 2026-11-25: eyes, teeth and hair drawn, head and neck not; with
+    /// `VICTORY_NULL_MAGENTA_ALL=1` the heads came back as solid shapes),
+    /// while the per-frame line said none was missing.
+    /// shortcut: a word that is a small number by chance and names a
+    /// texture view is asked for too.
+    fn asked_wide_words(
+        &self,
+        t: &crate::pipeline::Translated,
+        heap: &crate::descriptor::Heap,
+        (base, len, at): (u64, u64, u64),
+        words: &mut Vec<u32>,
+    ) {
+        const GLOBAL: u32 = 688;
+        const SECOND: u64 = 1936;
+        let read = |address: u64, bytes: usize, words: &mut Vec<u32>| {
+            let mut buf = vec![0u8; bytes & !3];
+            if !buf.is_empty() && crate::host::read_into(address as *const u8, &mut buf) {
+                words.extend(buf.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+            }
+        };
+        if at + SECOND + 512 <= len {
+            read(base + at + SECOND, 512, words);
+        }
+        let entry = |slot: u8, dwords: u32| -> Option<View> {
+            let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(dwords) * 4)
+        };
+        let uses_global =
+            t.used.iter().any(|u| u.root == RootType::Table && u.slot == 0 && u.table_offset_dwords == GLOBAL);
+        if uses_global
+            && let Some(slot) = t.used.iter().find(|u| u.root == RootType::Constants).map(|u| u.slot)
+            && let Some(Root::Constants(constants)) = self.roots_ref(false).get(usize::from(slot))
+            && let Some(&record) = constants.get(1)
+            && let Some((g, glen)) = entry(0, GLOBAL).as_ref().and_then(crate::descriptor::host::buffer_range)
+            && u64::from(record) + 64 <= glen
+        {
+            read(g + u64::from(record), 64, words);
+        }
+        for u in t.used.iter().filter(|u| u.root == RootType::Table && u.kind != ResourceType::Sampler) {
+            let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(view) = crate::descriptor::view(handle) else {
+                continue;
+            };
+            let range = match &view {
+                View::Constant(address, size) => Some((*address, u64::from(*size))),
+                other => crate::descriptor::host::buffer_range(other),
+            };
+            match range {
+                Some((address, n)) if n <= 2048 => read(address, n.min(512) as usize, words),
+                Some(_) => {}
+                // A texture the table holds: its own slot.
+                None => words.extend(heap.index(handle)),
             }
         }
     }

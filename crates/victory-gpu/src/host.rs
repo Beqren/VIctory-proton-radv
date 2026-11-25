@@ -5752,12 +5752,13 @@ impl Meter {
                     "textures picked by index, looked at again after their upload: {same} looks found them unchanged, \
                      {changed} changed (uploaded again), {waiting} wait for a look; early passes: {} at a frame's first draw, \
                      {} before a draw of the decoration bake; {} made in the reserve band of a full card; \
-                     slots draws asked for: {} noted, {} made on a full card",
+                     slots draws asked for: {} noted, {} made on a full card, {} null and out of the queue put back",
                     crate::draw::EARLY_TEXTURE_PASSES[0].load(Ordering::Relaxed),
                     crate::draw::EARLY_TEXTURE_PASSES[1].load(Ordering::Relaxed),
                     crate::draw::HEAP_TEXTURES_RESERVED.load(Ordering::Relaxed),
                     crate::draw::HEAP_TEXTURES_ASKED[0].load(Ordering::Relaxed),
-                    crate::draw::HEAP_TEXTURES_ASKED[1].load(Ordering::Relaxed)
+                    crate::draw::HEAP_TEXTURES_ASKED[1].load(Ordering::Relaxed),
+                    crate::descriptor::host::REQUEUED.load(Ordering::Relaxed)
                 );
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));

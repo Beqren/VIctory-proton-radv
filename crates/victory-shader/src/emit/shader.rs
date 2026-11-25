@@ -771,6 +771,12 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        // One latch a loop, for vkd3d-proton's converter (`Module::one_latch`);
+        // `VICTORY_ONE_LATCH=0` leaves the loops as the lowering made them.
+        // Part of the translation: the shader cache keys on the switch.
+        if std::env::var_os("VICTORY_ONE_LATCH").is_none_or(|v| v != "0") {
+            self.m.one_latch();
+        }
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());

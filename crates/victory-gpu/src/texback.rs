@@ -41,6 +41,11 @@
 //! what the list's last write left; a title read in between sees the frame
 //! before, as it would before the console's GPU has run. Only writes through
 //! a view `crate::draw` sees as unordered access are noticed.
+//!
+//! shortcut: every remap of title memory takes the tickets' lock (a list of
+//! the few textures copied back), and a landing holds it across its guarded
+//! write, so a remap may wait for one landing (a stall, not a deadlock:
+//! nothing in the landing waits for a lock a remap holds).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -146,6 +151,8 @@ pub(crate) fn remapped(at: usize, len: usize) {
 pub(crate) struct Target {
     pub(crate) copy: Arc<crate::resource::HostTexture>,
     layout: victory_formats::texture::Layout,
+    /// The title's format.
+    format: u32,
     ticket: Arc<Ticket>,
 }
 
@@ -154,10 +161,11 @@ impl Target {
         // The host copy, held apart from the title resource's lifetime.
         let copy = crate::resource::host_copy(resource)?;
         let (layout, at, size) = crate::resource::title_texture(resource)?;
+        let (_, _, format) = crate::resource::texture_kind(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         first_seen(resource, at, size, &layout);
         let ticket = track(resource as usize, at, end);
-        Some(Self { copy, layout, ticket })
+        Some(Self { copy, layout, format, ticket })
     }
 
     pub(crate) fn owner(&self) -> usize {
@@ -224,7 +232,7 @@ impl Back {
 /// copies landed that changed nothing (not written), copies whose
 /// allocation went meanwhile, time landing (us).
 static TEXTURES: AtomicU64 = AtomicU64::new(0);
-static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 const RECORDED: usize = 0;
 const RECORD_US: usize = 1;
 const LANDED: usize = 2;
@@ -232,12 +240,18 @@ const BYTES: usize = 3;
 const UNCHANGED: usize = 4;
 const STALE: usize = 5;
 const LAND_US: usize = 6;
+/// Copies landed that could not be: title memory not all readable (partly
+/// mapped), or the read-back not mapped, or the texels not tiled.
+const FAILED: usize = 7;
+/// Textures not recorded: the host copy's format is not the title's (a
+/// stand-in of another texel size, `crate::resource::target_format`).
+const OTHER_FORMAT: usize = 8;
 
 /// Records the copy of a list's target (already in COPY_SOURCE) into a
 /// read-back buffer.
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
     let host = crate::host::host()?;
-    record_texture(&host.device, list, &target.copy.texture, target.layout, target.ticket)
+    record_texture(&host.device, list, &target.copy.texture, target.layout, target.format, target.ticket)
 }
 
 /// [`record`] for host texture `texture` (in COPY_SOURCE) of console layout
@@ -247,6 +261,7 @@ fn record_texture(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
     layout: victory_formats::texture::Layout,
+    format: u32,
     ticket: Arc<Ticket>,
 ) -> Option<Back> {
     if !ticket.valid.load(Ordering::Acquire) {
@@ -255,6 +270,10 @@ fn record_texture(
     let started = std::time::Instant::now();
     // SAFETY: a live texture the list holds.
     let desc = unsafe { texture.GetDesc() };
+    if desc.Format.0 as u32 != format {
+        STATS[OTHER_FORMAT].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let mips = u32::from(desc.MipLevels.max(1));
     let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
     let n = subresources as usize;
@@ -363,6 +382,7 @@ fn land_now(back: &Back) {
     let mut read = vec![0u8; size];
     // The title's bytes the subresources do not cover are kept.
     if !crate::host::read_into(at as *const u8, &mut read) {
+        STATS[FAILED].fetch_add(1, Ordering::Relaxed);
         return;
     }
     let mut tiled = read.clone();
@@ -370,6 +390,7 @@ fn land_now(back: &Back) {
     // SAFETY: our read-back buffer, written by the list that has run.
     unsafe {
         if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+            STATS[FAILED].fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
@@ -392,6 +413,7 @@ fn land_now(back: &Back) {
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
     if !ok {
+        STATS[FAILED].fetch_add(1, Ordering::Relaxed);
         return;
     }
     STATS[LANDED].fetch_add(1, Ordering::Relaxed);
@@ -409,30 +431,33 @@ fn land_now(back: &Back) {
 fn report() {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     static NEXT_MS: AtomicU64 = AtomicU64::new(10_000);
-    static LAST: Mutex<([u64; 7], u64)> = Mutex::new(([0; 7], 0));
+    static LAST: Mutex<([u64; 9], u64)> = Mutex::new(([0; 9], 0));
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
     let next = NEXT_MS.load(Ordering::Relaxed);
     if now < next || NEXT_MS.compare_exchange(next, now + 10_000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
     }
-    let stats: [u64; 7] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
+    let stats: [u64; 9] = std::array::from_fn(|i| STATS[i].load(Ordering::Relaxed));
     let frame = crate::frame::current();
     let (d, frames) = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let d: [u64; 7] = std::array::from_fn(|i| stats[i] - last.0[i]);
+        let d: [u64; 9] = std::array::from_fn(|i| stats[i] - last.0[i]);
         let frames = frame.saturating_sub(last.1).max(1);
         *last = (stats, frame);
         (d, frames)
     };
     tracing::info!(
-        "texture read-back (VICTORY_TEXTURE_BACK), last 10 s: {} textures taken so far; {} copies recorded, {} landed \
-         ({} unchanged, {} stale); {} KiB written ({:.1} KiB a frame over {frames} frames); CPU {:.2} ms recording, \
-         {:.2} ms landing ({:.3} ms a frame)",
+        "texture read-back (VICTORY_TEXTURE_BACK), last 10 s: {} textures taken so far; {} copies recorded ({} not: \
+         host format differs), {} landed ({} unchanged), {} stale, {} failed (memory unreadable, not mapped or not \
+         tiled); {} KiB written ({:.1} KiB a frame begun over {frames} frames begun); CPU {:.2} ms recording, \
+         {:.2} ms landing ({:.3} ms a frame begun)",
         TEXTURES.load(Ordering::Relaxed),
         d[RECORDED],
+        d[OTHER_FORMAT],
         d[LANDED],
         d[UNCHANGED],
         d[STALE],
+        d[FAILED],
         d[BYTES] >> 10,
         d[BYTES] as f64 / 1024.0 / frames as f64,
         d[RECORD_US] as f64 / 1e3,
@@ -702,7 +727,7 @@ mod tests {
                                 },
                                 ..Default::default()
                             }]);
-                            *back.borrow_mut() = record_texture(&device, list, &texture, plane.layout.clone(), ticket.clone());
+                            *back.borrow_mut() = record_texture(&device, list, &texture, plane.layout.clone(), format, ticket.clone());
                         });
                         let back = back.into_inner().unwrap_or_else(|| panic!("{what}: nothing recorded"));
                         assert_eq!(back.range(), (at, at + size));

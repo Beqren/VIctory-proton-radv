@@ -230,17 +230,15 @@ const RETIRE_MS_MOST: u64 = 10_000;
 fn grave_step(at: u64, held: bool, since: (u64, u64), now: (u64, u64), started: u64, finished: u64, frames: u64) -> Option<(u64, bool)> {
     let (frame0, ms0) = since;
     let (frame, ms) = now;
-    let (mut at, mut held) = (at, held);
     if !held {
         let waited = ms.saturating_sub(ms0);
         if (frame.saturating_sub(frame0) >= frames && waited >= RETIRE_MS) || waited >= RETIRE_MS_MOST {
             // Every list recorded when it was let go has been submitted by
-            // now: wait for what was started up to here.
-            at = started;
-            held = true;
-        } else {
-            return Some((at, held));
+            // now: wait for what was started up to here (read after the
+            // frame and the time). Never dropped in the same look.
+            return Some((started, true));
         }
+        return Some((at, held));
     }
     if at <= finished { None } else { Some((at, held)) }
 }
@@ -267,7 +265,8 @@ mod grave_tests {
         assert_eq!(grave_step(12, true, since, (40, 60_000), 20, 12, 4), None);
         // No frames at all (a loading screen): the time bound passes them.
         assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST - 1), 7, 7, 4), Some((5, false)));
-        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST), 7, 7, 4), None);
+        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST), 7, 7, 4), Some((7, true)));
+        assert_eq!(grave_step(7, true, since, (10, RETIRE_MS_MOST), 8, 7, 4), None);
         // With the rule off (held from the start): the submissions running
         // when it was retired, as before.
         assert_eq!(grave_step(5, true, since, (10, 0), 6, 4, 0), Some((5, true)));
@@ -283,7 +282,8 @@ fn bury(finished: u64) {
         if retired.is_empty() {
             return;
         }
-        let (started, now, frames) = (STARTED.load(Ordering::Acquire), (crate::frame::current(), now_ms()), retire_frames());
+        let (now, frames) = ((crate::frame::current(), now_ms()), retire_frames());
+        let started = STARTED.load(Ordering::Acquire);
         let mut done = Vec::new();
         let mut keep = Vec::with_capacity(retired.len());
         for mut g in std::mem::take(&mut *retired) {
@@ -3610,6 +3610,9 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        // Review finding (with the mark off): the fence may complete on a
+        // lost device; nothing fetched is merged then.
+        self.alive_or_fail("after the relay's fetch of what shaders wrote to the card's memory");
         if let Some(mark) = mark {
             // SAFETY: the mapping holds `need` bytes; the fence was waited for.
             let seen = unsafe { std::ptr::read_volatile((data + mark as usize) as *const u32) };
@@ -4430,6 +4433,7 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.alive_or_fail("before the read-backs of a submission waited for");
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.

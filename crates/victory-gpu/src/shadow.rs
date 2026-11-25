@@ -2111,6 +2111,28 @@ fn sample_read(held: *const u8, from: usize, len: usize) {
     READS[6].fetch_add(differ, Ordering::Relaxed);
 }
 
+/// [`Shadow::refresh_check`]: blocks looked at and found differing since
+/// the last line, blocks found stale three refreshes in a row since the
+/// start, and of those since the last line.
+static REFRESH_CHECKED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// With the frame line: what [`Shadow::refresh_check`] found, if it is on.
+pub(crate) fn refresh_check_line(frames: f64) {
+    let [looked, differed] = [0, 1].map(|i| REFRESH_CHECKED[i].swap(0, Ordering::Relaxed));
+    if looked == 0 {
+        return;
+    }
+    let stale = REFRESH_CHECKED[3].swap(0, Ordering::Relaxed);
+    tracing::info!(
+        "refreshes checked per frame (VICTORY_REFRESH_CHECK=1): {:.0} blocks looked at, {:.1} differed once; stale three \
+         refreshes in a row: {:.1} a frame, {} since the start (must be 0)",
+        looked as f64 / frames,
+        differed as f64 / frames,
+        stale as f64 / frames,
+        REFRESH_CHECKED[2].load(Ordering::Relaxed)
+    );
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -3651,6 +3673,7 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
                     READS[0].fetch_add(1, Ordering::Relaxed);
@@ -3674,6 +3697,67 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Check mode (`VICTORY_REFRESH_CHECK=1`; off by default): after a
+    /// refresh of `[from, to)` that trusted the write watch or the guards,
+    /// the first 256 bytes of every 64 KiB block of it are read from title
+    /// memory and compared with the copy. A block that differs on three
+    /// refreshes in a row was changed with nothing to tell of it, and the
+    /// card reads old bytes there: counted ([`REFRESH_CHECKED`]) and said
+    /// with the copy and the address. One that differs once is a write of
+    /// the title's that came between the refresh and the look. The
+    /// instrument for every change to how writes are found: it must stay at
+    /// 0. Taken from VIctory-7900XTX (`Shadow::refresh_check`, from their
+    /// 8dd30ab), with the counts added. It costs about 100 ms a frame there.
+    fn refresh_check(&self, from: usize, to: usize) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+            return;
+        }
+        const SAMPLE: usize = 256;
+        // Blocks found differing: how many refreshes in a row.
+        static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+        let start = self.start as usize;
+        let mut title = [0u8; SAMPLE];
+        let mut at = from;
+        while at < to {
+            let n = SAMPLE.min(to - at);
+            if crate::host::read_into(at as *const u8, &mut title[..n]) {
+                REFRESH_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+                // SAFETY: `[from, to)` lies inside the buffer (`update`),
+                // so these bytes are inside the copy's mapping.
+                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
+                let map = map.get_or_insert_with(Default::default);
+                if copy == &title[..n] {
+                    map.remove(&at);
+                } else {
+                    REFRESH_CHECKED[1].fetch_add(1, Ordering::Relaxed);
+                    let times = map.entry(at).or_insert(0);
+                    *times += 1;
+                    if *times == 3 {
+                        let said = REFRESH_CHECKED[2].fetch_add(1, Ordering::Relaxed) + 1;
+                        REFRESH_CHECKED[3].fetch_add(1, Ordering::Relaxed);
+                        if said <= 64 || said.is_power_of_two() {
+                            tracing::warn!(
+                                said,
+                                copy = self.id,
+                                copy_start = format_args!("{start:#x}"),
+                                copy_bytes = self.len,
+                                address = format_args!("{at:#x}"),
+                                refreshed = format_args!("{from:#x}..{to:#x}"),
+                                on_the_card = self.card.is_some(),
+                                "a host copy of title memory is stale after its refresh, three times in a row: \
+                                 the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
+                            );
+                        }
+                    }
+                }
+            }
+            // The first bytes of the next 64 KiB block.
+            at = (at / PAGE + 1) * PAGE;
+        }
     }
 
     /// Copies the pages of `[from, to)` written after their last copy

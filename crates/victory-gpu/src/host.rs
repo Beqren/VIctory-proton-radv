@@ -6679,6 +6679,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::plaincopy::line(frames);
+        crate::shadow::refresh_check_line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::marks_line(frames);
         {

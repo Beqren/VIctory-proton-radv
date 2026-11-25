@@ -190,17 +190,20 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(size: u64) -> Result<ID3D12Resource, Refused> {
     if !cards() {
-        return None;
+        return Err(Refused::Off);
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
-        return None;
+    if size < least {
+        return Err(Refused::Floor);
     }
-    let host = host()?;
+    if size >= 1 << 30 {
+        return Err(Refused::Huge);
+    }
+    let host = host().ok_or(Refused::NotReady)?;
     if !host.card_ready() {
-        return None;
+        return Err(Refused::NotReady);
     }
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
@@ -211,18 +214,63 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
-        return None;
+        return Err(Refused::Room { budget, used });
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+        let alive = CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed) - size;
+        return Err(Refused::Cap { alive });
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    buffer.ok_or(Refused::NoBuffer)
 }
+
+/// Why [`card_for`] gave a copy no card side.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // the fields are for the diagnostics' log
+pub(crate) enum Refused {
+    /// `VICTORY_CARD_BUFFERS=0`.
+    Off,
+    /// Under `VICTORY_CARD_BUFFERS_MIN_MB`.
+    Floor,
+    /// 1 GiB or more (the compare counts in 32 bits).
+    Huge,
+    /// No host yet, or the compare could not be made.
+    NotReady,
+    /// The card past four fifths of its budget with the copy on it.
+    Room { budget: u64, used: u64 },
+    /// Card copies' bytes alive would pass `VICTORY_CARD_BUFFERS_MB`.
+    Cap { alive: u64 },
+    /// The buffer could not be made.
+    NoBuffer,
+}
+
+impl Refused {
+    #[cfg(feature = "diagnostics")]
+    fn index(self) -> usize {
+        match self {
+            Refused::Off => 0,
+            Refused::Floor => 1,
+            Refused::Huge => 2,
+            Refused::NotReady => 3,
+            Refused::Room { .. } => 4,
+            Refused::Cap { .. } => 5,
+            Refused::NoBuffer => 6,
+        }
+    }
+}
+
+/// Diagnostics: copies of title buffers without a card side, by their start:
+/// their bytes and why ([`Refused::index`]; 7: on the card).
+#[cfg(feature = "diagnostics")]
+static CARD_REFUSED: Mutex<BTreeMap<u64, (u64, usize)>> = Mutex::new(BTreeMap::new());
+
+/// Diagnostics: copies of title buffers whose declared ranges were looked
+/// through on the CPU since the last line, by start.
+#[cfg(feature = "diagnostics")]
+static CPU_LOOKED: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
 
 /// The most bytes of windows outside buffers whose copies go to the card's
 /// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
@@ -1495,6 +1543,42 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    // Which of those copies could have had the card look, and why they did
+    // not get a card side when they were made.
+    #[cfg(feature = "diagnostics")]
+    {
+        let looked = std::mem::take(&mut *CPU_LOOKED.lock().unwrap_or_else(|e| e.into_inner()));
+        let refused = CARD_REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        const WHY: [&str; 8] = ["off", "floor", "1 GiB or more", "not ready", "room (4/5 of the budget)", "cap", "no buffer", "on the card"];
+        let mut by = [(0u64, 0u64, 0u64); 8];
+        let mut biggest: Vec<u64> = Vec::new();
+        for start in &looked {
+            let Some(&(len, why)) = refused.get(start) else {
+                continue;
+            };
+            let small = len < 1 << 20;
+            by[why].0 += 1;
+            by[why].1 += len;
+            if small {
+                by[why].2 += 1;
+            } else {
+                biggest.push(len);
+            }
+        }
+        biggest.sort_unstable_by(|a, b| b.cmp(a));
+        let parts: Vec<String> = by
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.0 > 0)
+            .map(|(i, b)| format!("{}: {} copies {:.1} MB ({} under 1 MiB)", WHY[i], b.0, mb(b.1 as f64), b.2))
+            .collect();
+        let sizes: Vec<String> = biggest.iter().take(24).map(|&b| format!("{:.1}", mb(b as f64))).collect();
+        tracing::info!(
+            "copies looked through on the CPU since the last line, by why they have no card side: {}; of 1 MiB or more, MB: [{}]",
+            parts.join(", "),
+            sizes.join(" "),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2248,7 +2332,12 @@ impl Shadow {
     /// the frame line's counts.
     fn compared(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+        {
+            crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+            if !self.window {
+                CPU_LOOKED.lock().unwrap_or_else(|e| e.into_inner()).insert(self.start);
+            }
+        }
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
@@ -3068,7 +3157,24 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let refused = card_for(size);
+        #[cfg(feature = "diagnostics")]
+        {
+            let why = match &refused {
+                Ok(_) => 7,
+                Err(why) => why.index(),
+            };
+            CARD_REFUSED.lock().unwrap_or_else(|e| e.into_inner()).insert(key.0, (len, why));
+            if len >= 1 << 20 {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "a buffer's host copy: card side {:?}",
+                    refused.as_ref().map(|_| "made"),
+                );
+            }
+        }
+        let (buffer, card) = match refused.ok() {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(

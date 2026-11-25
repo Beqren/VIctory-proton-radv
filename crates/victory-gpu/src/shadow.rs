@@ -1076,6 +1076,12 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
 /// (warned once: [`BACK_DROPPED`]). No lock is held across the write: the
 /// title's threads already wait 40-45 ms a frame in the fault handler for
 /// the guards' lock, and the kernel's writes take ~21 ms a frame.
+///
+/// shortcut: a page of more than `crate::watch::MANY_VIEWS` views (or
+/// `VICTORY_VIEW_GUARD=0`) is guarded at each view by itself, so a refresh
+/// at another view does not make this one read-only, the write lands, and
+/// that view can stay clean with the bytes from before (review finding;
+/// as before the fix, and as for every write of ours with one view opened).
 pub(crate) fn back_retry() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_RETRY").is_none_or(|v| v != "0"))
@@ -1118,37 +1124,46 @@ fn back_left_out(at: usize, n: usize, why: &str) {
 /// after `crate::watch::writing_from_card` opened the guards there.
 fn write_back(at: usize, bytes: &[u8]) {
     if back_user() && crate::watch::as_card_write(|| write_user(at, bytes)) {
+        told_after(at, bytes.len());
         return;
     }
     let mut failed = crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
-    if failed.is_empty() || !back_retry() {
+    if !back_retry() {
         return;
     }
-    let mut raced = false;
     for _ in 0..BACK_TRIES {
-        let mut again = Vec::new();
-        for (a, n) in failed {
-            if crate::watch::reopen_for_card(a, n) {
-                raced = true;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::BackRaced, 1);
-                again.extend(crate::host::write_mapped(a as *mut u8, bytes[a - at..].as_ptr(), n));
-            } else {
-                back_left_out(a, n, "refused (not guarded by us)");
-            }
-        }
-        failed = again;
         if failed.is_empty() {
             break;
         }
+        let mut again = Vec::new();
+        for (a, n) in failed {
+            if crate::watch::reopen_for_card(a, n) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackRaced, 1);
+            } else if !crate::watch::writable(a) {
+                back_left_out(a, n, "refused (not guarded by us)");
+                continue;
+            }
+            // Ours again and now opened, or opened meanwhile by a title
+            // write's fault (which noted it written; review finding):
+            // written again.
+            again.extend(crate::host::write_mapped(a as *mut u8, bytes[a - at..].as_ptr(), n));
+        }
+        failed = again;
     }
     for (a, n) in failed {
         back_left_out(a, n, "still refused after it was opened again 8 times");
     }
-    // The texture side was told before the first write; a pass between
-    // then and now took the bytes from before.
-    if raced {
-        crate::descriptor::host::remapped(at, bytes.len());
+    told_after(at, bytes.len());
+}
+
+/// With [`back_retry`]: the texture side is told of the write after it as
+/// well as before (`crate::watch::writing_from_card`): a texture pass
+/// between the two took the bytes from before (review finding on the race
+/// fix: a raced write that lands by a fault told nobody).
+fn told_after(at: usize, len: usize) {
+    if back_retry() {
+        crate::descriptor::host::remapped(at, len);
     }
 }
 

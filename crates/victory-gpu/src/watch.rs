@@ -1608,7 +1608,7 @@ fn fault_round_trip() {
 }
 
 /// Whether `at` is committed read-write memory now.
-fn writable(at: usize) -> bool {
+pub(crate) fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };

@@ -1140,6 +1140,33 @@ fn f16_nearest_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_none_or(|v| v != "0"))
 }
 
+/// Whether compute programs that write and read buffers or images between
+/// group barriers get globally coherent UAVs (`VICTORY_COHERENT_UAVS=0`
+/// turns it off). On the console a thread group's waves share one CU's
+/// vector cache, so a load after `s_barrier` sees what another wave stored
+/// before it; on the host they may run on both halves of a WGP, whose
+/// caches are not kept coherent for them. The face network's Formula
+/// program (0aa7934094794dbf, an interpreter whose 1,024 threads pass
+/// values through a register file in a UAV, a barrier between its 12
+/// stages) read values other waves had overwritten in an earlier stage
+/// (run dump3, 2026-11-25: a register its stage 2 wrote read at stage 3 as
+/// its stage-0 value); the face controls it computes came out wrong in 108
+/// of 440 places.
+fn coherent_uavs_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COHERENT_UAVS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT_UAVS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`coherent_uavs_on`], for its thread only.
+    pub(super) static TEST_COHERENT_UAVS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
@@ -1401,6 +1428,10 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        s.coherent_uavs = coherent_uavs_on()
+            && writes_uavs
+            && insts().any(|i| i.name() == "s_barrier")
+            && insts().any(|i| matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. }) && i.name().contains("load"));
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;

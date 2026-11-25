@@ -965,6 +965,24 @@ mod tests {
         assert_eq!(default, on, "packed results are not rounded to nearest by default");
     }
 
+    /// A program whose waves pass values through a UAV between group
+    /// barriers (a load after `s_barrier` of what other waves stored) gets
+    /// globally coherent UAVs by default; one without a barrier does not.
+    #[test]
+    fn uavs_read_after_a_group_barrier_are_globally_coherent() {
+        // s_barrier; buffer_load_dword v1, v0, s[8:11], 0 offen; s_waitcnt vmcnt(0)
+        let with = [0xBF8A_0000u32, 0xE030_1000, 0x8002_0100, 0xBF8C_3F70];
+        let without = [0xE030_1000u32, 0x8002_0100, 0xBF8C_3F70];
+        let lowered = |body: &[u32], on: Option<bool>| {
+            let was = super::lower::TEST_COHERENT_UAVS.replace(on);
+            let r = stores_v1_dxil(body);
+            super::lower::TEST_COHERENT_UAVS.set(was);
+            r.unwrap()
+        };
+        assert_ne!(lowered(&with, None), lowered(&with, Some(false)), "not coherent by default");
+        assert_eq!(lowered(&without, None), lowered(&without, Some(false)), "coherent without a barrier");
+    }
+
     /// [`stores_v1`]'s translation.
     fn stores_v1_dxil(body: &[u32]) -> Result<Vec<u8>, ShaderError> {
         use crate::native::RootParam;

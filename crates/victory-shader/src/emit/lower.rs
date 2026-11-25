@@ -202,6 +202,9 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
+    /// The immediate sampler an image instruction whose sampler is chosen
+    /// by control flow is being lowered with ([`Self::image_each_sampler`]).
+    sampler_alt: Option<u32>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -1485,6 +1488,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            sampler_alt: None,
             descriptors: x
                 .res
                 .descriptors
@@ -4773,7 +4777,7 @@ impl<'a> Lower<'a> {
                     .bvh(inst, b, i)
                     .map_err(|why| unsupported(offset, why));
             }
-            Fields::Image { .. } => self.image(inst, b, i),
+            Fields::Image { .. } => self.image_each_sampler(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
@@ -6147,23 +6151,8 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
+                let n = self.static_sampler(words)?;
+                Ok(self.static_sampler_handle(n, props))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
@@ -6231,6 +6220,139 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// The immediate sampler of these words: its number among the program's
+    /// static samplers.
+    fn static_sampler(&mut self, words: &[u32]) -> Result<u32, Why> {
+        let words: [u32; 4] = words
+            .get(..4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or("a sampler constant")?;
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        Ok(n as u32)
+    }
+
+    /// A handle for immediate sampler `n`, in the current block.
+    fn static_sampler_handle(&mut self, n: u32, props: (u32, u32)) -> V {
+        if props.0 & 0x8000 != 0 {
+            // shortcut: one sampler used with and without comparison
+            // would need two static samplers; it becomes a comparison one.
+            self.s.cmp_samplers |= 1 << n;
+        }
+        self.s.sampler_handle(self.cur, n)
+    }
+
+    /// An image instruction, once per sampler its sampler may be when a
+    /// join picks it between immediate samplers. The title's
+    /// `PS_TexturedDeferred` family (40 programs of the pack, e.g.
+    /// #91321f9948435001) picks wrap or clamp by a constant-buffer flag:
+    /// `s_movk_i32 s0, 0x92` on one path, `s_mov_b32 s0, 0` on the other,
+    /// the sampler's other dwords after the join. Static samplers are
+    /// bindings and a handle cannot be joined: each choice is sampled in the
+    /// current block and the results are picked by the edge the join was
+    /// entered by (uniform: a scalar join). A join of an immediate sampler
+    /// with a heap one is still refused (none of the pack's; sampling the
+    /// heap's at a made-up index where the immediate one is chosen could
+    /// read a slot the host never wrote).
+    // shortcut: the samplers not chosen are sampled too and their results
+    // dropped.
+    fn image_each_sampler(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let src = match self.descriptors.get(&((b, i), true)) {
+            Some(&src @ Source::Phi { .. })
+                if src
+                    .leaves()
+                    .iter()
+                    .all(|l| matches!(l, Source::Constant(_))) =>
+            {
+                src
+            }
+            _ => return self.image(inst, b, i),
+        };
+        let Source::Phi { block, args } = src else {
+            unreachable!()
+        };
+        let mut statics = Vec::new();
+        let pick = self.sampler_choice(*block, args, 8, &mut statics)?;
+        let mut picked: Option<Vec<V>> = None;
+        for n in statics {
+            self.sampler_alt = Some(n);
+            let r = self.image(inst, b, i);
+            self.sampler_alt = None;
+            r?;
+            let vals = inst
+                .writes
+                .iter()
+                .map(|&(_, v)| match self.vals.get(&v) {
+                    Some(&Val::I32(x)) => Ok(x),
+                    _ => Err(WHY),
+                })
+                .collect::<Result<Vec<V>, Why>>()?;
+            picked = Some(match picked {
+                None => vals,
+                Some(before) => {
+                    let c = self.cur;
+                    let n = self.s.m.i32(n);
+                    let this = self.s.m.cmp(c, pred::EQ, pick, n);
+                    vals.into_iter()
+                        .zip(before)
+                        .map(|(x, y)| self.s.m.select(c, this, x, y))
+                        .collect()
+                }
+            });
+        }
+        for (&(_, v), x) in inst.writes.iter().zip(picked.ok_or(WHY)?) {
+            self.vals.insert(v, Val::I32(x));
+        }
+        Ok(())
+    }
+
+    /// [`Self::descriptor_phi`] for a sampler every edge gives an immediate
+    /// sampler: the number of the one the join picks (each listed in
+    /// `statics`).
+    fn sampler_choice(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        depth: u32,
+        statics: &mut Vec<u32>,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let pick = match arg {
+                Source::Constant(words) => {
+                    let n = self.static_sampler(words)?;
+                    if !statics.contains(&n) {
+                        statics.push(n);
+                    }
+                    self.s.m.i32(n)
+                }
+                Source::Phi {
+                    block: inner,
+                    args: inner_args,
+                } if depth > 0 => self.sampler_choice(*inner, inner_args, depth - 1, statics)?,
+                _ => return Err(WHY),
+            };
+            incoming.push((pick, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let pick = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(pick, incoming);
+        Ok(pick)
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -9486,7 +9608,11 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let sprops = (14 | if cmp { 0x8000 } else { 0 }, 0);
+            let sh = match self.sampler_alt {
+                Some(n) => self.static_sampler_handle(n, sprops),
+                None => self.handle(site, ss, true, sprops)?,
+            };
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -11754,5 +11880,86 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn a_sampler_joined_from_an_immediate_and_a_table_one_is_refused() {
+        // One path moves an immediate sampler into s[8:11], the other loads
+        // one from the sampler table at s1; the join samples with it.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xBF06_8001, // 0x20: s_cmp_eq_u32 s1, 0
+            0xBF85_0008, // s_cbranch_scc1 -> 0x48
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92
+            0xBE89_03FF,
+            0x00C0_0000, // s_mov_b32 s9, 0xc00000
+            0xBE8A_03FF,
+            0x1850_0000, // s_mov_b32 s10, 0x18500000
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xBF82_0002, // 0x44: s_branch -> 0x50
+            0xF408_0203,
+            0xFA00_0000, // 0x48: s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xBF8C_0070, // 0x50: s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        // (Where the immediate one is chosen there is no heap index.)
+        let Err(e) = lower_with(&words, layout, used) else {
+            panic!("lowered");
+        };
+        assert!(e.to_string().contains("chosen by control flow"), "{e}");
+    }
+
+    #[test]
+    fn a_sampler_joined_from_two_immediate_ones_samples_with_each() {
+        // `PS_TexturedDeferred` (#91321f9948435001): wrap or clamp, picked
+        // by a flag; the sampler's first dword differs by path.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xBF06_8001, // 0x18: s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x28
+            0xB008_0092, // s_movk_i32 s8, 0x92
+            0xBF82_0001, // 0x24: s_branch -> 0x2c
+            0xBE88_0380, // 0x28: s_mov_b32 s8, 0
+            0xBE89_03FF,
+            0x00C0_0000, // 0x2c: s_mov_b32 s9, 0xc00000
+            0xBE8A_03FF,
+            0x1850_0000, // s_mov_b32 s10, 0x18500000
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        let l = lower_with(&words, layout, used).unwrap();
+        let mut samplers = l.samplers.clone();
+        samplers.sort_unstable();
+        assert_eq!(
+            samplers,
+            vec![[0, 0xC0_0000, 0x1850_0000, 0], [0x92, 0xC0_0000, 0x1850_0000, 0]]
+        );
+        assert_eq!(l.nonuniform_handles, 0);
     }
 }

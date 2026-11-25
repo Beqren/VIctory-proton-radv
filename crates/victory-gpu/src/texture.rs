@@ -440,17 +440,21 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
-        if !keep {
+    let gone: Vec<_> = map
+        .iter()
+        .filter(|(_, s)| Arc::strong_count(s) == 1 && crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES))
+        .map(|(k, _)| *k)
+        .collect();
+    for k in gone {
+        if let Some(s) = map.remove(&k) {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
             bytes += s.bytes;
+            // A list being recorded may name it without holding it.
+            crate::host::retire(s);
         }
-        keep
-    });
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -481,8 +485,10 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if let Some(map) = map.as_mut()
+        && let Some(staging) = map.remove(&resource)
+    {
+        crate::host::retire(staging);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {

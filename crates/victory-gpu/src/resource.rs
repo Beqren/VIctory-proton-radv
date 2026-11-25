@@ -1502,7 +1502,7 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some((host, twin)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -1512,6 +1512,10 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+            // The twin too: dropped here, a list may still read it.
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
+            }
         }
     }
     if went > 0 {

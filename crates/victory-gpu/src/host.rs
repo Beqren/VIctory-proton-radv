@@ -71,7 +71,21 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+static RETIRED: Mutex<Vec<Grave>> = Mutex::new(Vec::new());
+
+/// An object in [`RETIRED`]: the submission count it waits for, and the
+/// frame and moment (ms) it was retired at, until its hold is over
+/// ([`grave_step`]).
+struct Grave {
+    at: u64,
+    frame: u64,
+    ms: u64,
+    /// The hold of frames is over and `at` was set again to the
+    /// submissions started then.
+    held: bool,
+    #[allow(dead_code)] // held to be dropped
+    object: Retired,
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -145,37 +159,143 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    // Graves whose frames have passed move on even when no submission
+    // finishes (`retire`).
+    bury(FINISHED.load(Ordering::Acquire));
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// The one way to let go of a host object (a texture, a buffer, a staging
+/// buffer, a slot's old resource) that a command list may name: instead of
+/// dropping it, hand it here. It is dropped once
+/// 1. [`RETIRE_FRAMES`] frames have begun since and at least
+///    [`RETIRE_MS`] passed (so every list the title had recorded or was
+///    recording when it was let go, which may name it through a descriptor
+///    and holds no reference, has been submitted), and then
+/// 2. every submission started by that moment has finished on the card
+///    (flights sent ahead and the relay's included: `FINISHED` moves only
+///    as they land).
+///
+/// `VICTORY_RETIRE_FRAMES=0` is the rule before: only (2), counted from
+/// the call, and at once when nothing runs.
+///
+/// Why: every device loss of 2026-11-25 (runs tail-1, tail-2, pairoff-1,
+/// bcb-1, race/run2, blend-4, tex-off) was a GPU page fault on a READ by
+/// the texture unit, in the submission begun just after a texture sweep
+/// (`resource::let_go_idle`) had dropped hundreds of host textures at once
+/// (no submission running, so nothing waited). With the sweep off
+/// (`VICTORY_TEXTURE_SWEEP=0`) no run of six lost the device, against 4 of
+/// 14 with it. The sweep's "no list, no slot" test counts references, and
+/// a list being recorded on a title thread names textures through
+/// descriptors without holding them. shortcut: the hold is counted in
+/// frames and time, not proven against every recording thread.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    if retire_frames() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    let grave = Grave {
+        at: started,
+        frame: crate::frame::current(),
+        ms: now_ms(),
+        held: retire_frames() == 0,
+        object: Retired(Box::new(object)),
+    };
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(grave);
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// Frames a retired object is held before its submissions are counted
+/// ([`retire`]; `VICTORY_RETIRE_FRAMES`, default 4: the title records a
+/// frame's lists within the frame and submits them by the next).
+pub(crate) fn retire_frames() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_RETIRE_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
+/// The least time a retired object is held with its frames ([`retire`]).
+const RETIRE_MS: u64 = 1_000;
+/// Held this long, its frames are taken as passed even if the title waits
+/// for no frame (a loading screen): memory let go is not kept for ever.
+const RETIRE_MS_MOST: u64 = 10_000;
+
+/// What happens to a grave now: `None` dropped, else kept (with `at` and
+/// `held` as they now are). `started` and `finished` are the submission
+/// counts, `frame` and `ms` the present ones; `frames` is
+/// [`retire_frames`].
+fn grave_step(at: u64, held: bool, since: (u64, u64), now: (u64, u64), started: u64, finished: u64, frames: u64) -> Option<(u64, bool)> {
+    let (frame0, ms0) = since;
+    let (frame, ms) = now;
+    let (mut at, mut held) = (at, held);
+    if !held {
+        let waited = ms.saturating_sub(ms0);
+        if (frame.saturating_sub(frame0) >= frames && waited >= RETIRE_MS) || waited >= RETIRE_MS_MOST {
+            // Every list recorded when it was let go has been submitted by
+            // now: wait for what was started up to here.
+            at = started;
+            held = true;
+        } else {
+            return Some((at, held));
+        }
+    }
+    if at <= finished { None } else { Some((at, held)) }
+}
+
+#[cfg(test)]
+mod grave_tests {
+    use super::{RETIRE_MS, RETIRE_MS_MOST, grave_step};
+
+    #[test]
+    fn a_retired_object_waits_for_its_frames_then_for_the_submissions_begun_by_then() {
+        // Retired at frame 10, 0 ms, with submissions 1..=5 started and 5
+        // finished (nothing running): not dropped at once.
+        let since = (10, 0);
+        assert_eq!(grave_step(5, false, since, (10, 0), 5, 5, 4), Some((5, false)));
+        // Three frames later, 2 s: still held (four frames).
+        assert_eq!(grave_step(5, false, since, (13, 2000), 9, 9, 4), Some((5, false)));
+        // Four frames, but under a second: held.
+        assert_eq!(grave_step(5, false, since, (14, RETIRE_MS - 1), 9, 9, 4), Some((5, false)));
+        // Four frames and a second: it now waits for submission 12, the
+        // last started, which the card has not finished.
+        assert_eq!(grave_step(5, false, since, (14, RETIRE_MS), 12, 9, 4), Some((12, true)));
+        // Not before 12 has finished, whatever the frame.
+        assert_eq!(grave_step(12, true, since, (40, 60_000), 20, 11, 4), Some((12, true)));
+        assert_eq!(grave_step(12, true, since, (40, 60_000), 20, 12, 4), None);
+        // No frames at all (a loading screen): the time bound passes them.
+        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST - 1), 7, 7, 4), Some((5, false)));
+        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST), 7, 7, 4), None);
+        // With the rule off (held from the start): the submissions running
+        // when it was retired, as before.
+        assert_eq!(grave_step(5, true, since, (10, 0), 6, 4, 0), Some((5, true)));
+        assert_eq!(grave_step(5, true, since, (10, 0), 6, 5, 0), None);
+    }
+}
+
+/// Drops what [`grave_step`] says is done with, `finished` being the
+/// submissions finished.
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
+    let done: Vec<Grave> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
+        let (started, now, frames) = (STARTED.load(Ordering::Acquire), (crate::frame::current(), now_ms()), retire_frames());
+        let mut done = Vec::new();
+        let mut keep = Vec::with_capacity(retired.len());
+        for mut g in std::mem::take(&mut *retired) {
+            match grave_step(g.at, g.held, (g.frame, g.ms), now, started, finished, frames) {
+                Some((at, held)) => {
+                    g.at = at;
+                    g.held = held;
+                    keep.push(g);
+                }
+                None => done.push(g),
+            }
+        }
         *retired = keep;
         done
     };
@@ -3359,6 +3479,22 @@ impl Host {
         }
     }
 
+    /// Ends the run if the host device is gone: a query of the removal
+    /// reason, and the host fence, which a lost device completes with
+    /// `u64::MAX`. Before anything that came back from the card reaches
+    /// title memory or the title's fences: run bcb-1 (2026-11-25) lost the
+    /// device and a title thread crashed on a null pointer 150 ms after
+    /// vkd3d-proton marked the device removed, before our checks had
+    /// looked again.
+    fn alive_or_fail(&self, at: &str) {
+        // SAFETY: plain queries.
+        let (removed, completed) =
+            unsafe { (self.device.GetDeviceRemovedReason().is_err(), self.fence.GetCompletedValue()) };
+        if removed || completed == u64::MAX {
+            fail(format_args!("host GPU device removed ({at})"));
+        }
+    }
+
     /// [`relay`], on the thread that lands flights: for the plans of the
     /// flights being landed (the card has run them), the pieces their
     /// compares flagged are fetched, once each, with a list and a wait of
@@ -3568,6 +3704,10 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
+        // The device may have been lost while this landing ran (the fence
+        // completes on a lost device before anything reports it): nothing
+        // read back, written or signalled may reach the title from it.
+        self.alive_or_fail("before the read-backs and signals of flights (VICTORY_RELAY=1)");
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
@@ -3703,6 +3843,7 @@ impl Host {
             if let Err(e) = ran {
                 fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})"));
             }
+            self.alive_or_fail("after the fetch of what shaders wrote to the card's memory");
             {
                 use crate::shadow::CARD_STATS;
                 CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -3968,6 +4109,7 @@ impl Host {
                 hand_back(&back);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            self.alive_or_fail("before the read-backs and signals of flights settled together");
             // In the order given: what tells the title the card is done.
             let mut last = 0;
             let mut landed = Vec::new();

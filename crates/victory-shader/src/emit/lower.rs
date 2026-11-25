@@ -6552,6 +6552,16 @@ impl<'a> Lower<'a> {
     /// offset is one the host makes and sees for the draw (`draw.rs`,
     /// `tables`).
     fn read_by_index(&self, src: &Source) -> bool {
+        // `VICTORY_READ_MARKS=all`: every texture read through the heaps,
+        // tables at fixed offsets too (upstream 52d14b1 before 2d6c0df). Run
+        // onread-8's slot listing of the skin programs (94d281151ca58b4f,
+        // a402e650d0acbc92): the material record's colour map was made and
+        // never marked in 366 of 366 listings, and 45% of the asked record
+        // words never marked, so those programs reach their slots in a way
+        // this test takes for a fixed table entry.
+        if super::read_marks_all() {
+            return true;
+        }
         src.leaves().iter().any(|l| match l {
             Source::Loaded { load, .. } | Source::Fetched { load, .. } => {
                 let Some(a) = self.scalar.get(load) else {

@@ -141,6 +141,13 @@ pub fn read_marks() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_READ_MARKS").is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
+/// `VICTORY_READ_MARKS=all`: [`read_marks`], and every texture read through
+/// the heaps is marked, through tables at fixed offsets too.
+pub fn read_marks_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_READ_MARKS").is_ok_and(|v| v.trim() == "all"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Tests: [`read_marks`] for this thread, whatever the environment says.

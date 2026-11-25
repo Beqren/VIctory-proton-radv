@@ -43,6 +43,11 @@ pub(crate) struct Pending {
     died: AtomicBool,
     /// A dispatch's wait for it, or its drop, has been logged ([`ready`]).
     noted: AtomicBool,
+    /// When the title created it: how long before its first use the
+    /// record's early start had ([`ready`]).
+    created: Instant,
+    /// Started early from the record ([`early`]).
+    warmed: AtomicBool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -116,6 +121,8 @@ impl Pending {
             begun: OnceLock::new(),
             died: AtomicBool::new(false),
             noted: AtomicBool::new(false),
+            created: Instant::now(),
+            warmed: AtomicBool::new(false),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -124,9 +131,29 @@ impl Pending {
     }
 
     fn make(&self) {
-        let _ = self.begun.set(Instant::now());
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let begun = Instant::now();
+        let _ = self.begun.set(begun);
+        let mut translating = Duration::ZERO;
+        self.made.get_or_init(|| {
+            // The translation first, timed apart from the host's compile
+            // (vkd3d-proton's DXIL to SPIR-V and the driver's).
+            for s in &self.shaders {
+                let at = Instant::now();
+                let _ = s.translated();
+                translating += at.elapsed();
+            }
+            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+        });
+        let host = begun.elapsed().saturating_sub(translating);
+        let early = self.warmed.load(Ordering::Relaxed) && !self.used.load(Ordering::Relaxed);
+        MADE_TIMES[usize::from(early)].add(translating, host);
+        tracing::info!(
+            shaders = %shader_set(&self.shaders),
+            translate_ms = translating.as_secs_f64() * 1e3,
+            host_ms = host.as_secs_f64() * 1e3,
+            early,
+            "host pipeline made"
+        );
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -162,6 +189,57 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
+/// Time spent making pipelines: how many, microseconds translating and in
+/// the host's compile, the longest of each.
+pub(crate) struct MadeTimes([AtomicU64; 5]);
+
+impl MadeTimes {
+    const fn new() -> Self {
+        MadeTimes([const { AtomicU64::new(0) }; 5])
+    }
+
+    fn add(&self, translating: Duration, host: Duration) {
+        let (t, h) = (translating.as_micros() as u64, host.as_micros() as u64);
+        self.0[0].fetch_add(1, Ordering::Relaxed);
+        self.0[1].fetch_add(t, Ordering::Relaxed);
+        self.0[2].fetch_add(h, Ordering::Relaxed);
+        self.0[3].fetch_max(t, Ordering::Relaxed);
+        self.0[4].fetch_max(h, Ordering::Relaxed);
+    }
+
+    /// Pipelines; ms translating and in the host; the longest of each (ms).
+    pub(crate) fn get(&self) -> (u64, f64, f64, f64, f64) {
+        let ms = |i: usize| self.0[i].load(Ordering::Relaxed) as f64 / 1e3;
+        (self.0[0].load(Ordering::Relaxed), ms(1), ms(2), ms(3), ms(4))
+    }
+}
+
+/// `[0]`: pipelines a draw or dispatch asked for before they were made;
+/// `[1]`: started early from the record and made before any asked.
+pub(crate) static MADE_TIMES: [MadeTimes; 2] = [const { MadeTimes::new() }; 2];
+
+/// Microseconds the title's threads have waited for pipelines since the
+/// start ([`wait`], [`wait_long`], [`now`]), in every build: the frame
+/// meter takes each frame's share of it.
+pub(crate) static WAITED_US: AtomicU64 = AtomicU64::new(0);
+
+/// First uses of title pipelines by how long after the title created them:
+/// under 1 s, 1 to 10 s, over 10 s (what an early start from the record had
+/// to make them); then how many of all were made already.
+pub(crate) static FIRST_USES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether the title has presented a world frame (500 draws or more): until
+/// then a frame may wait [`LOADING_FRAME`] for graphics pipelines.
+static IN_WORLD: AtomicBool = AtomicBool::new(false);
+
+/// A frame of `draws` draws was presented; whether the world has begun.
+pub(crate) fn frame_drew(draws: u64) -> bool {
+    if draws >= 500 && !IN_WORLD.swap(true, Ordering::Relaxed) {
+        tracing::info!(draws, "a world frame: from here on draws wait for their pipelines within the frame's budget only");
+    }
+    IN_WORLD.load(Ordering::Relaxed)
+}
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -227,6 +305,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        let age = p.created.elapsed();
+        let bucket = if age < Duration::from_secs(1) { 0 } else if age < Duration::from_secs(10) { 1 } else { 2 };
+        FIRST_USES[bucket].fetch_add(1, Ordering::Relaxed);
+        if p.made.get().is_some() {
+            FIRST_USES[3].fetch_add(1, Ordering::Relaxed);
+        }
     }
     if p.made.get().is_none() {
         if p.died.load(Ordering::Relaxed) {
@@ -329,6 +413,7 @@ fn wait_until(p: &Pending, started: Instant, most: Duration) {
             .0;
     }
     drop(held);
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::PipelineWaitUs, started.elapsed().as_micros() as u64);
 }
@@ -347,6 +432,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     }
     if p.made.get().is_none() && !p.died.load(Ordering::Relaxed) {
         start(p, REQUESTED);
+        let started = Instant::now();
         let (lock, done) = &DONE;
         let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
         while p.made.get().is_none() && !p.died.load(Ordering::Relaxed) {
@@ -355,6 +441,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+        WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -371,9 +458,32 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
+///
+/// This is the warm-up from the record (`VICTORY_PIPELINE_WARM`, on by
+/// default; `0` turns it off). The title creates its pipelines during its
+/// own load (some 60,000 in its first 20 s, see the module `pipeline`),
+/// before the scene that first draws with them, and a host pipeline
+/// depends on nothing but what the creation hands over (the shader
+/// containers and the graphics state, `HostPipeline::new`). So the key
+/// known at creation finds a pipeline of the record, and the workers make
+/// it at the lowest priority, below draws' requests; a draw that asks for
+/// it first joins it (the same `Pending`, promoted in the queue).
+/// `VICTORY_PIPELINE_WARM_MAX` caps how many are started (default 8192).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+    static ON: OnceLock<(bool, u64)> = OnceLock::new();
+    let (on, most) = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIPELINE_WARM").is_none_or(|v| v != "0");
+        let most = std::env::var("VICTORY_PIPELINE_WARM_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8192);
+        tracing::info!(on, most, "pipeline warm-up from the record (VICTORY_PIPELINE_WARM, VICTORY_PIPELINE_WARM_MAX)");
+        (on, most)
+    });
+    if on
+        && p.left_out.is_none()
+        && !p.shaders.is_empty()
+        && super::library::wanted_early(&p.key)
+        && super::library::EARLY.fetch_add(1, Ordering::Relaxed) < most
+    {
+        p.warmed.store(true, Ordering::Relaxed);
         start(p, EARLY);
     }
 }
@@ -500,7 +610,29 @@ fn wait(p: &Pending, frame: u64) {
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
-    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
+    // A loading frame's longer wait is for graphics pipelines only until
+    // the world's first frame. In the world it let every frame that met new
+    // pipelines wait up to 4 s, one pipeline after the other: a recording
+    // thread queues a pipeline only when it records its draw, then waits
+    // for it, so the workers made them one at a time. In the owner's
+    // session (loss-1808) a scene cut brought about 50 mesh pipelines in
+    // frames 1400-1401, each made in 20 to 300 ms, and the frame took
+    // 3,557 ms. The run's total bound never closed: it counts only each
+    // wait's part past the half second. `VICTORY_PIPELINE_WORLD_WAIT=1`:
+    // in the world too, as before.
+    // shortcut: a pass the title draws once at a scene cut can now be lost
+    // (a draw is otherwise there again in the next frame).
+    static WORLD_WAIT: OnceLock<bool> = OnceLock::new();
+    let world_wait =
+        *WORLD_WAIT.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WORLD_WAIT").is_some_and(|v| v == "1"));
+    let loading_frame = if compute {
+        LOADING_FRAME_COMPUTE
+    } else if world_wait || !IN_WORLD.load(Ordering::Relaxed) {
+        LOADING_FRAME
+    } else {
+        Duration::ZERO
+    };
+    let budget = budget.max(loading_frame.min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static SPENTS: [Mutex<FrameBudget>; 2] = [const { Mutex::new(FrameBudget::new()) }; 2];
@@ -530,6 +662,7 @@ fn wait(p: &Pending, frame: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .end(mode, frame, left, waited, Instant::now());
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -777,10 +910,19 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+        let (asked, asked_tr, asked_host, _, _) = MADE_TIMES[0].get();
+        let (early, early_tr, early_host, _, _) = MADE_TIMES[1].get();
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            made_early_before_asked = early,
+            early_translate_ms = early_tr,
+            early_host_ms = early_host,
+            made_when_asked = asked,
+            asked_translate_ms = asked_tr,
+            asked_host_ms = asked_host,
+            card_mb_in_use = crate::host::host().and_then(|h| h.video_memory()).map_or(0, |m| m[1] >> 20),
             "host pipelines all made"
         );
     }
@@ -853,6 +995,32 @@ mod tests {
         assert!(b.begin(Sharing::Take, 7, budget, t0 + ms(100)).is_zero());
         b.end(Sharing::Take, 7, first, ms(300), t0 + ms(300));
         assert_eq!(b.begin(Sharing::Take, 7, budget, t0 + ms(300)), ms(200));
+    }
+
+    /// A pipeline of the record is started when the title creates it, and
+    /// a draw that asks for it later joins that start: it is made once.
+    #[test]
+    fn a_draw_joins_a_pipeline_started_from_the_record() {
+        let shader = super::super::shader("compute", b"a container of the join test, which does not translate");
+        let mut p = Pending::new(vec![shader], None);
+        p.key = "join-test-key".to_owned();
+        let p = Arc::new(p);
+        super::super::library::note_used(&p.key);
+        early(&p);
+        assert!(p.warmed.load(Ordering::Relaxed), "started from the record");
+        assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        let started = Instant::now();
+        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        let begun = *p.begun.get().expect("a worker made it");
+        assert!(ready(&p).is_none(), "no host pipeline for a shader that does not translate");
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), MAKING, "not queued again");
+        assert_eq!(*p.begun.get().unwrap(), begun, "made once");
+        // One not in the record is not started at creation.
+        let other = Arc::new(Pending::new(vec![super::super::shader("compute", b"another one")], None));
+        early(&other);
+        assert_eq!(other.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
     }
 
     #[test]

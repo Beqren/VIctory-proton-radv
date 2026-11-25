@@ -6239,6 +6239,96 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Each frame's own time ([`FrameTimes`]).
+    times: FrameTimes,
+}
+
+/// Each presented frame's time from the present before, and what of it the
+/// title's threads waited for pipelines (`pipeline::waited_us`), in every
+/// build: the per-second line averages hide a frame of seconds among
+/// frames of 200 ms (the owner's session loss-1808: one second of 0.3 fps,
+/// 3,557 ms a frame, three seconds in no meter's count).
+struct FrameTimes {
+    last: std::time::Instant,
+    waited: u64,
+    drawn: u64,
+    /// Since the last line: the longest frame and the most a frame waited
+    /// for pipelines (ms), and all it waited (us).
+    longest: f64,
+    wait_most: f64,
+    wait_all: u64,
+}
+
+/// Since the world's first frame: the longest frame (us), and the frames of
+/// more than 1 s.
+static LONGEST_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAMES_OVER_1S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl FrameTimes {
+    fn new() -> Self {
+        FrameTimes {
+            last: std::time::Instant::now(),
+            waited: crate::pipeline::waited_us(),
+            drawn: crate::draw::drawn(),
+            longest: 0.0,
+            wait_most: 0.0,
+            wait_all: 0,
+        }
+    }
+
+    /// At a present.
+    fn frame(&mut self) {
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.last).as_secs_f64() * 1e3;
+        self.last = now;
+        let waited = crate::pipeline::waited_us();
+        let wait = waited.saturating_sub(self.waited);
+        self.waited = waited;
+        let drawn = crate::draw::drawn();
+        let draws = drawn.saturating_sub(self.drawn);
+        self.drawn = drawn;
+        let world = crate::pipeline::frame_drew(draws);
+        self.longest = self.longest.max(ms);
+        self.wait_most = self.wait_most.max(wait as f64 / 1e3);
+        self.wait_all += wait;
+        if !world {
+            return;
+        }
+        LONGEST_FRAME.fetch_max((ms * 1e3) as u64, Ordering::Relaxed);
+        if ms > 1000.0 {
+            FRAMES_OVER_1S.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                frame = crate::frame::current(),
+                ms,
+                waiting_for_pipelines_ms = wait as f64 / 1e3,
+                draws,
+                being_made = crate::pipeline::making(),
+                "a frame of more than a second"
+            );
+        }
+    }
+
+    /// The line for the last `frames` frames.
+    fn line(&mut self, frames: f64) {
+        let first = crate::pipeline::first_uses();
+        tracing::info!(
+            "frame times: the longest {:.0} ms; the title's threads waited for pipelines {:.1} ms a frame, at most {:.0} ms \
+             in one frame; in the world since its first frame: the longest frame {:.0} ms, {} frames of more than 1 s; \
+             title pipelines first asked for under 1 s after their creation {}, 1 to 10 s {}, later {}, of them made \
+             already {}",
+            self.longest,
+            self.wait_all as f64 / 1e3 / frames,
+            self.wait_most,
+            LONGEST_FRAME.load(Ordering::Relaxed) as f64 / 1e3,
+            FRAMES_OVER_1S.load(Ordering::Relaxed),
+            first[0],
+            first[1],
+            first[2],
+            first[3],
+        );
+        (self.longest, self.wait_most, self.wait_all) = (0.0, 0.0, 0);
+        crate::pipeline::save_record();
+    }
 }
 
 impl Meter {
@@ -6252,11 +6342,13 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            times: FrameTimes::new(),
         }
     }
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        self.times.frame();
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -6276,6 +6368,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        self.times.line(frames);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames

@@ -422,6 +422,34 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Microseconds the title's threads have waited for host pipelines since
+/// the start.
+#[cfg(windows)]
+pub(crate) fn waited_us() -> u64 {
+    make::WAITED_US.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// At a present: the frame's draws; whether the world has begun (500 draws
+/// in a frame), after which draws wait for pipelines within the frame's
+/// budget only.
+#[cfg(windows)]
+pub(crate) fn frame_drew(draws: u64) -> bool {
+    make::frame_drew(draws)
+}
+
+/// First uses of title pipelines by the time since their creation
+/// (`make::FIRST_USES`).
+#[cfg(windows)]
+pub(crate) fn first_uses() -> [u64; 4] {
+    make::FIRST_USES.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Writes the record of title pipelines if it changed (at most every 5 s).
+#[cfg(windows)]
+pub(crate) fn save_record() {
+    library::save_record(false);
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -27,6 +27,22 @@ pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
+    // `every:<from s>:<to s>:<period ms>`: samples instead (see `sample`).
+    if let Some(spec) = list.strip_prefix("every:") {
+        let n: Vec<f64> = spec.split(':').filter_map(|t| t.trim().parse().ok()).collect();
+        if let [from, to, period] = n[..] {
+            let start = std::time::Instant::now();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs_f64(from.max(0.0)));
+                let mut last = std::collections::HashMap::new();
+                while start.elapsed().as_secs_f64() < to {
+                    sample(start, &mut last);
+                    std::thread::sleep(std::time::Duration::from_secs_f64(period.max(1.0) / 1e3));
+                }
+            });
+        }
+        return;
+    }
     let mut times: Vec<f64> = list
         .split(',')
         .filter_map(|t| t.trim().parse().ok())
@@ -40,6 +56,110 @@ pub fn dump_stacks_on_schedule() {
             dump_stacks();
         }
     });
+}
+
+/// What says where a frame stands at a sample (the GPU side's frame phase),
+/// set once by the runtime.
+static PHASE: std::sync::OnceLock<fn() -> String> = std::sync::OnceLock::new();
+
+/// Sets what each stack sample prints as the frame's phase.
+pub fn set_stack_phase(phase: fn() -> String) {
+    let _ = PHASE.set(phase);
+}
+
+/// The ids of this process's threads other than the caller.
+fn other_threads() -> Vec<u32> {
+    // SAFETY: plain queries and a snapshot of this process's threads.
+    let (me, process, snapshot) = unsafe {
+        (
+            GetCurrentThreadId(),
+            GetCurrentProcessId(),
+            CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0),
+        )
+    };
+    let mut ids = Vec::new();
+    if snapshot == INVALID_HANDLE_VALUE {
+        return ids;
+    }
+    // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<THREADENTRY32>() as u32;
+    // SAFETY: `snapshot` is open; `entry` is sized.
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == process && entry.th32ThreadID != me {
+            ids.push(entry.th32ThreadID);
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: we opened it.
+    unsafe { CloseHandle(snapshot) };
+    ids
+}
+
+/// A thread's processor time so far, user and kernel, in microseconds.
+fn cpu_of(thread: HANDLE) -> (u64, u64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetThreadTimes;
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut a, mut b, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: a thread handle with query rights and four out pointers.
+    unsafe { GetThreadTimes(thread, &mut a, &mut b, &mut kernel, &mut user) };
+    let us = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10;
+    (us(user), us(kernel))
+}
+
+/// One sample of every thread (`VICTORY_STACKS=every:<from>:<to>:<ms>`):
+/// a line with the time and the frame's phase, then a line per thread with
+/// its processor time since the last sample and its innermost frames; a
+/// thread that neither ran nor moved since the last sample prints only its
+/// id. Printed in one write, to disturb the threads that log the least.
+fn sample(start: std::time::Instant, last: &mut std::collections::HashMap<u32, (u64, u64, u64)>) {
+    use std::fmt::Write;
+    const FRAMES: usize = 14;
+    let ids = other_threads();
+    let mut text = String::with_capacity(16 << 10);
+    let _ = writeln!(
+        text,
+        "VIctory: sample at {} ms of {} threads; {}",
+        start.elapsed().as_millis(),
+        ids.len(),
+        PHASE.get().map(|f| f()).unwrap_or_default()
+    );
+    let mut seen = std::collections::HashMap::with_capacity(ids.len());
+    for id in ids {
+        // SAFETY: opens a thread of our own process.
+        let thread = unsafe {
+            OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, id)
+        };
+        if thread.is_null() {
+            continue;
+        }
+        let (user, kernel) = cpu_of(thread);
+        let (mut frames, _) = frames_of(thread);
+        frames.truncate(FRAMES);
+        let hash = frames.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &f| (h ^ f).wrapping_mul(0x100_0000_01b3));
+        let (u0, k0, h0) = last.get(&id).copied().unwrap_or((user, kernel, 0));
+        seen.insert(id, (user, kernel, hash));
+        if hash == h0 && user == u0 && kernel == k0 {
+            let _ = writeln!(text, "  = {id}");
+        } else {
+            let names: Vec<String> = frames.iter().map(|&pc| locate(pc as usize)).collect();
+            let _ = writeln!(
+                text,
+                "  t {id} \"{}\" ran {}+{} us: {}",
+                name_of(thread),
+                user - u0.min(user),
+                kernel - k0.min(kernel),
+                names.join(" < ")
+            );
+        }
+        // SAFETY: we opened it.
+        unsafe { CloseHandle(thread) };
+    }
+    *last = seen;
+    eprint!("{text}");
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).

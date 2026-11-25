@@ -127,8 +127,42 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// `GetWriteWatch` itself, every call (`Watches` counts only those that
+    /// succeed, and `WatchUs` includes the guards): calls, microseconds and
+    /// bytes passed; of them the calls that failed (not write-watched
+    /// memory), their microseconds and bytes.
+    KernelCalls,
+    KernelUs,
+    KernelBytes,
+    KernelFailed,
+    KernelFailedUs,
+    KernelFailedBytes,
+    /// Waiting for the journal's lock and for the guards' lock (all
+    /// threads), microseconds.
+    JournalWaitUs,
+    GuardLockUs,
+    /// `VirtualProtect` calls of the guards and their microseconds.
+    ProtectCalls,
+    ProtectUs,
+    /// Microseconds inside our handler of guard faults.
+    FaultUs,
+    /// `VirtualQuery` asked by the guards (`is_view`, `uncommitted_end`)
+    /// and their microseconds.
+    GuardQueries,
+    GuardQueryUs,
+    /// Waiting for the submission lock alone (the `lock` of the thread
+    /// lines adds settles and the sweep), microseconds.
+    SubmitLockUs,
+    /// From a present to the first list call after it: the process's
+    /// processor time (user + kernel, all threads), microseconds.
+    UntilRecordCpuUs,
+    /// Of that window, our own code's time on all threads that we can see:
+    /// in submissions and in list calls are counted elsewhere; these are
+    /// the title's frame waits that fall in it.
+    UntilRecordPaceUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
+const _: () = assert!((C::UntilRecordPaceUs as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -948,6 +982,35 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
+/// The process's processor time (user + kernel, microseconds) at the last
+/// present; the thread that presented and the one that made the first list
+/// call after it (for the stack samples, `VICTORY_STACKS=every:...`).
+static PRESENT_CPU: AtomicU64 = AtomicU64::new(0);
+static PRESENTER: AtomicU64 = AtomicU64::new(0);
+static FIRST_RECORDER: AtomicU64 = AtomicU64::new(0);
+/// Threads inside a submission now.
+static SUBMITTING_NOW: AtomicU64 = AtomicU64::new(0);
+
+/// Whether no list call has followed the last present yet.
+pub(crate) fn before_recording() -> bool {
+    !RECORDED_SINCE.load(Relaxed)
+}
+
+/// Where the frame stands, for a stack sample: milliseconds since the last
+/// present, whether a list call and a submission followed it, the threads
+/// that presented and that recorded first, and the threads in a submission.
+pub fn phase() -> String {
+    format!(
+        "since present {} ms, recorded {}, submitted {}, presenter {}, first recorder {}, in submissions {}",
+        now_us().saturating_sub(PRESENTED_AT.load(Relaxed)) / 1000,
+        RECORDED_SINCE.load(Relaxed),
+        SUBMITTED_SINCE.load(Relaxed),
+        PRESENTER.load(Relaxed),
+        FIRST_RECORDER.load(Relaxed),
+        SUBMITTING_NOW.load(Relaxed),
+    )
+}
+
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
@@ -956,6 +1019,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
+        let (user, kernel) = process_times();
+        add(C::UntilRecordCpuUs, (user + kernel).saturating_sub(PRESENT_CPU.load(Relaxed)));
+        FIRST_RECORDER.store(u64::from(thread_id()), Relaxed);
     }
     OURS.with(|o| o.set(o.get() + ns));
     let (unsent, calls) = UNSENT.with(|u| u.get());
@@ -977,6 +1043,7 @@ pub(crate) fn recorded(started: std::time::Instant) {
 /// A submission is called on this thread (before it waits for the
 /// submission lock).
 pub(crate) fn submission_begins() {
+    SUBMITTING_NOW.fetch_add(1, Relaxed);
     let now = now_us();
     if !SUBMITTED_SINCE.load(Relaxed) && !SUBMITTED_SINCE.swap(true, Relaxed) {
         add(C::UntilSubmitUs, now.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -997,6 +1064,7 @@ pub(crate) fn submission_begins() {
 /// The submission returns; it waited `lock` microseconds for the
 /// submission lock.
 pub(crate) fn submission_ends(lock: u64) {
+    SUBMITTING_NOW.fetch_sub(1, Relaxed);
     let now = now_us();
     SUBMITTED_AT.store(now, Relaxed);
     let (user, kernel) = thread_times();
@@ -1019,6 +1087,9 @@ pub(crate) fn present_begins() {
 /// A frame was presented.
 pub(crate) fn presented() {
     add(C::Frames, 1);
+    let (user, kernel) = process_times();
+    PRESENT_CPU.store(user + kernel, Relaxed);
+    PRESENTER.store(u64::from(thread_id()), Relaxed);
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
     SUBMITTED_SINCE.store(false, Relaxed);
@@ -1153,6 +1224,31 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    // The write watch and the guards taken apart, and the locks around
+    // them; and what the process did from a present to the first list call.
+    tracing::info!(
+        "watch account per frame: GetWriteWatch {:.0} calls {:.2} ms {:.1} MB passed, of them {:.0} failed \
+         {:.2} ms {:.1} MB; journal lock waited {:.2} ms; guards: {:.0} VirtualProtect {:.2} ms, {:.0} \
+         queries {:.2} ms, lock waited {:.2} ms, {:.2} ms in the fault handler; submission lock waited \
+         {:.2} ms; from a present to the first list call the process ran {:.1} ms (all threads), \
+         {:.1} ms of the title's frame waits fell in it",
+        c[C::KernelCalls as usize],
+        ms(c[C::KernelUs as usize]),
+        mb(c[C::KernelBytes as usize]),
+        c[C::KernelFailed as usize],
+        ms(c[C::KernelFailedUs as usize]),
+        mb(c[C::KernelFailedBytes as usize]),
+        ms(c[C::JournalWaitUs as usize]),
+        c[C::ProtectCalls as usize],
+        ms(c[C::ProtectUs as usize]),
+        c[C::GuardQueries as usize],
+        ms(c[C::GuardQueryUs as usize]),
+        ms(c[C::GuardLockUs as usize]),
+        ms(c[C::FaultUs as usize]),
+        ms(c[C::SubmitLockUs as usize]),
+        ms(c[C::UntilRecordCpuUs as usize]),
+        ms(c[C::UntilRecordPaceUs as usize]),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

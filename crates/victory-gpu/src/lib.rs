@@ -56,6 +56,8 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::phase as frame_phase;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

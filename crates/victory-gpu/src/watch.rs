@@ -60,6 +60,53 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// The journal, its lock waited for (timed in diagnostics builds).
+fn journal() -> std::sync::MutexGuard<'static, Journal> {
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::JournalWaitUs, waiting.elapsed().as_micros() as u64);
+    j
+}
+
+/// `GetWriteWatch` with reset over pages `[first, last)` into `found`
+/// (`count` entries of room, then of answer); false if it failed. Timed,
+/// and its bytes counted, in diagnostics builds.
+fn kernel_writes(first: usize, last: usize, found: &mut [usize], count: &mut usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    debug_assert!(*count <= found.len());
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            found.as_mut_ptr().cast(),
+            count,
+            &mut granularity,
+        )
+    } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let (us, bytes) = (started.elapsed().as_micros() as u64, ((last - first) * PAGE) as u64);
+        add(C::KernelCalls, 1);
+        add(C::KernelUs, us);
+        add(C::KernelBytes, bytes);
+        if failed {
+            add(C::KernelFailed, 1);
+            add(C::KernelFailedUs, us);
+            add(C::KernelFailedBytes, bytes);
+        }
+    }
+    !failed
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -84,7 +131,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -138,7 +185,7 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept {
         j.ahead.clear();
     }
@@ -177,7 +224,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -204,7 +251,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -215,7 +262,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     if !j.kept || len == 0 {
         return;
     }
@@ -248,25 +295,11 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    if failed {
+    if !kernel_writes(first, last, &mut j.found, &mut count) {
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -291,7 +324,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = journal();
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
@@ -304,10 +337,8 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal();
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
@@ -321,20 +352,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = !kernel_writes(first, last, &mut j.found, &mut count);
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -396,7 +416,46 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
+    let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardLockUs, waiting.elapsed().as_micros() as u64);
+    g
+}
+
+/// `VirtualProtect` of the guards; timed in diagnostics builds.
+fn reprotect(at: usize, len: usize, protection: u32) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let mut old = 0;
+    // SAFETY: title view memory; only its protection changes.
+    let done = unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at as *const _, len, protection, &mut old) } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::ProtectCalls, 1);
+        add(C::ProtectUs, started.elapsed().as_micros() as u64);
+    }
+    done
+}
+
+/// `VirtualQuery` of the guards; timed in diagnostics builds.
+fn query(at: usize) -> Option<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::GuardQueries, 1);
+        add(C::GuardQueryUs, started.elapsed().as_micros() as u64);
+    }
+    (n != 0).then_some(info)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -483,20 +542,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// copied a frame for them, 255 copies a frame reading around holes).
 /// `VICTORY_GUARD_HOLES=0` looks at the first address only, as before.
 fn is_view(start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED};
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;
     loop {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 {
+        let Some(info) = query(at) else {
             return false;
-        }
+        };
         if info.Type == MEM_MAPPED {
             return true;
         }
@@ -574,32 +627,19 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// clean). A block that is clean stays so: had the pages been written since
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     if g.protected.contains(&block) {
         return;
     }
-    let mut old = 0;
-    // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    if reprotect(block * BLOCK, BLOCK, PAGE_READONLY) {
         g.protected.insert(block);
     }
 }
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    let set = |from: usize, to: usize| {
-        let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
-    };
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    let set = |from: usize, to: usize| reprotect(from * BLOCK, (to - from) * BLOCK, PAGE_READONLY);
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
@@ -619,17 +659,12 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
-    if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
-    } else {
-        block
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEM_RESERVE};
+    match query(block * BLOCK) {
+        Some(info) if matches!(info.State, MEM_RESERVE | MEM_FREE) => {
+            (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        }
+        _ => block,
     }
 }
 
@@ -659,7 +694,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
@@ -668,9 +703,8 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // A block we made read-only.
+        reprotect(block * BLOCK, BLOCK, PAGE_READWRITE);
     }
     !blocks.is_empty()
 }
@@ -804,13 +838,19 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            {
+                use crate::copystat::{C, add};
+                add(C::GuardFaults, 1);
+                add(C::FaultUs, started.elapsed().as_micros() as u64);
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -823,7 +863,42 @@ fn install() {
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
+        #[cfg(feature = "diagnostics")]
+        fault_round_trip();
     });
+}
+
+/// Diagnostics: what one guard fault costs from the faulting write back to
+/// it (the system's dispatch of the exception, our handler, the opening),
+/// logged once: the handler's own time is counted per frame, the rest only
+/// this measure shows.
+#[cfg(feature = "diagnostics")]
+fn fault_round_trip() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const N: usize = 32;
+    // SAFETY: a fresh allocation of ours, freed below.
+    let p = unsafe { VirtualAlloc(std::ptr::null(), N * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+    if p == 0 {
+        return;
+    }
+    let first = p.div_ceil(BLOCK);
+    let blocks = (p + N * BLOCK) / BLOCK - first;
+    for block in first..first + blocks {
+        if reprotect(block * BLOCK, BLOCK, PAGE_READONLY) {
+            guards().protected.insert(block);
+        }
+    }
+    let started = std::time::Instant::now();
+    for block in first..first + blocks {
+        // SAFETY: our allocation; the handler opens the block.
+        unsafe { ((block * BLOCK) as *mut u8).write_volatile(1) };
+    }
+    let us = started.elapsed().as_secs_f64() * 1e6 / blocks.max(1) as f64;
+    tracing::info!("a guard fault costs {us:.1} microseconds from the write back to it ({blocks} measured)");
+    // SAFETY: ours; nothing else refers to it.
+    unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
 }
 
 /// Whether `at` is committed read-write memory now.

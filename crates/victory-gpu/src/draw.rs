@@ -439,6 +439,17 @@ fn starved() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_STARVED").is_none_or(|v| v != "0"))
 }
 
+/// Whether the texture pass makes a slot on a full card when its placed
+/// texture's host copy is there already (another slot or a table read
+/// made it): a view of it takes no memory, and it is kept up to date as
+/// for its other slots. `VICTORY_TEXTURE_ON_CARD=0`: refused as any
+/// other, as before. Run room-2 (2026-11-25, with the eviction on) made
+/// 33,605 slots so; refusals for room fell from 241,684 to 188,773.
+fn on_card_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ON_CARD").is_none_or(|v| v != "0"))
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, that found it changed (uploaded again), since the start; and the
 /// slots that wait for such a look now.
@@ -2104,7 +2115,7 @@ impl State {
             // object's: not known here).
             let mut slot_bytes = 4 << 20;
             // Its host copy is on the card already: making the slot takes
-            // no memory (`VICTORY_TEXTURE_EVICT`).
+            // no memory ([`on_card_slots`]).
             let mut on_card = false;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -2131,7 +2142,7 @@ impl State {
                     partly = Some(mapped);
                 }
                 slot_bytes = len;
-                on_card = evict
+                on_card = on_card_slots()
                     && crate::resource::texture_at_made(address, &resource).is_some_and(crate::resource::host_copy_made);
             }
             // A texture object the host renders to or writes holds the

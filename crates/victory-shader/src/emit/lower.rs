@@ -167,6 +167,106 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// Whether [`norm_quotient`] converts codes of `w` bits: every width to 16
+/// but 11 and 12, whose smallest codes need more bits than it keeps
+/// (upstream da82e44 rounds those fully in integers).
+// shortcut: 11- and 12-bit normalized channels still divide on the host;
+// the pack has none (its normalized buffer formats are 8_8_8_8_UNORM,
+// 2_10_10_10_UNORM and 16_16_SNORM).
+fn norm_exact(w: u32) -> bool {
+    w <= 16 && !matches!(w, 11 | 12)
+}
+
+/// The integer and bit operations [`norm_quotient`] is written in: DXIL
+/// instructions in the lowering, plain arithmetic in the tests (which so
+/// check the emitted sequence for every code).
+trait NormOps {
+    type V: Copy;
+    fn k(&mut self, x: u32) -> Self::V;
+    /// An integer operation of `Add`, `Sub`, `Mul`, `UDiv`, `Shl`, `LShr`,
+    /// `And`.
+    fn int(&mut self, op: Bin, a: Self::V, b: Self::V) -> Self::V;
+    fn ult(&mut self, a: Self::V, b: Self::V) -> Self::V;
+    fn select(&mut self, c: Self::V, a: Self::V, b: Self::V) -> Self::V;
+    /// The f32 bits of the unsigned integer `a`.
+    fn to_float(&mut self, a: Self::V) -> Self::V;
+    /// The bits of the f32 product of f32 bits `a` and `b`.
+    fn fmul(&mut self, a: Self::V, b: Self::V) -> Self::V;
+}
+
+impl NormOps for Lower<'_> {
+    type V = V;
+    fn k(&mut self, x: u32) -> V {
+        self.s.m.i32(x)
+    }
+    fn int(&mut self, op: Bin, a: V, b: V) -> V {
+        self.s.m.bin(self.cur, op, a, b)
+    }
+    fn ult(&mut self, a: V, b: V) -> V {
+        self.s.m.cmp(self.cur, pred::IULT, a, b)
+    }
+    fn select(&mut self, c: V, a: V, b: V) -> V {
+        self.s.m.select(self.cur, c, a, b)
+    }
+    fn to_float(&mut self, a: V) -> V {
+        let f = self.s.m.cast(self.cur, Cast::UiToFp, a, self.s.t.f32);
+        self.as_int(f)
+    }
+    fn fmul(&mut self, a: V, b: V) -> V {
+        let (a, b) = (self.as_float(a), self.as_float(b));
+        let p = self.s.m.bin(self.cur, Bin::Mul, a, b);
+        self.as_int(p)
+    }
+}
+
+/// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for codes
+/// `0 <= a < d` and [`norm_exact`] widths: what the console's buffer unit
+/// gives for a normalized code. After upstream da82e44:
+///
+/// `Q = floor(a * 2^32 / d) = a * K + floor(a * r / d)` with `K =
+/// floor(2^32 / d)` and `r = 2^32 mod d` (no division when `r` is 1:
+/// widths dividing 32). `a / d` is never exact for `0 < a < d`, so `Q`
+/// rounds to 24 bits up exactly when its highest dropped bit is set, and the
+/// result is that integer (at most 2^24, so its conversion is exact on any
+/// host) scaled by a power of two.
+fn norm_quotient<O: NormOps>(o: &mut O, a: O::V, w: u32) -> O::V {
+    debug_assert!(norm_exact(w), "{w}-bit normalized code");
+    let d = (1u64 << w) - 1;
+    let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+    let (one, kv) = (o.k(1), o.k(kk as u32));
+    let mut q = o.int(Bin::Mul, a, kv);
+    if r != 1 {
+        let (rv, dv) = (o.k(r as u32), o.k(d as u32));
+        let t = o.int(Bin::Mul, a, rv);
+        let more = o.int(Bin::UDiv, t, dv);
+        q = o.int(Bin::Add, q, more);
+    }
+    // The bits to drop (1 to 8) from the exponent of `q >> 8`, which
+    // converts exactly (fewer than 25 bits); none when `q` fits.
+    let k8 = o.k(8);
+    let top = o.int(Bin::LShr, q, k8);
+    let top = o.to_float(top);
+    let k23 = o.k(23);
+    let e = o.int(Bin::LShr, top, k23);
+    let bias = o.k(127 + 15);
+    let shift = o.int(Bin::Sub, e, bias);
+    let (zero, b24) = (o.k(0), o.k(1 << 24));
+    let fits = o.ult(q, b24);
+    let shift = o.select(fits, zero, shift);
+    // Rounded up when the highest dropped bit is set: never a tie.
+    let up = o.int(Bin::Shl, q, one);
+    let up = o.int(Bin::LShr, up, shift);
+    let up = o.int(Bin::And, up, one);
+    let m = o.int(Bin::LShr, q, shift);
+    let m = o.int(Bin::Add, m, up);
+    // At most 2^24: exact as a float, and so its scale by 2^(shift - 32).
+    let f = o.to_float(m);
+    let b95 = o.k(127 - 32);
+    let scale = o.int(Bin::Add, shift, b95);
+    let scale = o.int(Bin::Shl, scale, k23);
+    o.fmul(f, scale)
+}
+
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
@@ -6030,6 +6130,38 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first (an
+    /// odd last high half 0). Integer formats keep their low 16 bits (the
+    /// pack's d16 loads of integer data are read by WORD_0 and WORD_1, e.g.
+    /// 0aa7934094794dbf); the others become f16.
+    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+                let m = self.s.m.i32(0xFFFF);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                let (f, i32t) = (self.as_float(x), self.s.t.i32);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            });
+        }
+        let k16 = self.s.m.i32(16);
+        Ok(halves
+            .chunks(2)
+            .map(|p| match *p {
+                [lo, hi] => {
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                _ => p[0],
+            })
+            .collect())
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -6097,19 +6229,56 @@ impl<'a> Lower<'a> {
             };
             let f32t = self.s.t.f32;
             let x = match numeric {
+                // The console's buffer unit gives the float nearest the exact
+                // quotient; the host's division does not (a division by a
+                // constant may become a multiply by its reciprocal), and the
+                // pack's mesh programs truncate `x * 255.0` back to a code
+                // (0066320cb6da26b0 at 0x1a40: `v_mul_legacy_f32` by 255.0,
+                // then `v_cvt_u32_f32`). After upstream da82e44: the quotient
+                // from integers ([`norm_quotient`]), the ends exact.
                 Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                    let top = (1u64 << w) - 1;
+                    let q = if norm_exact(w) {
+                        let q = norm_quotient(self, field, w);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
+                    let (high, one) = (self.s.m.i32(top as u32), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::EQ, field, high);
+                    let q = self.s.m.select(c, at_top, one, q);
                     float(self, q)
                 }
                 Numeric::Snorm => {
                     let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    let lo = self.s.m.f32((-1.0f32).to_bits());
-                    let q = self.binary(35, q, lo);
+                    let top = (1u32 << (w - 1)) - 1;
+                    let q = if norm_exact(w - 1) {
+                        // The magnitude's quotient, signed (codes at and
+                        // below -top are -1.0 below).
+                        let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
+                        let neg = self.s.m.cmp(c, pred::SLT, s, zero);
+                        let minus = self.s.m.bin(c, Bin::Sub, zero, s);
+                        let m = self.s.m.select(c, neg, minus, s);
+                        let q = norm_quotient(self, m, w - 1);
+                        let sign = self.s.m.select(c, neg, sign, zero);
+                        let q = self.s.m.bin(c, Bin::Or, q, sign);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
+                    // The top code is 1.0; the lowest is -1.0 too, as is the
+                    // one above it.
+                    let (high, one) = (self.s.m.i32(top), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::SGE, s, high);
+                    let q = self.s.m.select(c, at_top, one, q);
+                    let low = self.s.m.i32(top.wrapping_neg());
+                    let minus_one = self.s.m.f32((-1.0f32).to_bits());
+                    let at_bottom = self.s.m.cmp(c, pred::SLE, s, low);
+                    let q = self.s.m.select(c, at_bottom, minus_one, q);
                     float(self, q)
                 }
                 Numeric::Uscaled => {
@@ -6529,12 +6698,22 @@ impl<'a> Lower<'a> {
         if !heap {
             return Ok(None);
         }
-        let key = (self.cur, *load, *first);
+        let word = self.slot_word(*load, *first)?;
+        let bits = self.s.m.i32(super::shader::SLOT_STRIDE_BITS);
+        Ok(Some(self.s.m.bin(self.cur, Bin::And, word, bits)))
+    }
+
+    /// Dword `slot` of the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]) for the descriptor loaded at `load`
+    /// from dword `first` on, read in the current block: the stride and the
+    /// view's format kind.
+    fn slot_word(&mut self, load: Site, first: u8) -> Result<V, Why> {
+        let key = (self.cur, load, first);
         if let Some(&v) = self.strides.get(&key) {
-            return Ok(Some(v));
+            return Ok(v);
         }
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        let slot = self.heap_index(load, first, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -6558,7 +6737,26 @@ impl<'a> Lower<'a> {
         let f = self.s.m.extract(c, r, 0);
         let v = self.as_int(f);
         self.strides.insert(key, v);
-        Ok(Some(v))
+        Ok(v)
+    }
+
+    /// Whether the typed buffer view the descriptor `src` names has an
+    /// integer format, and whether a signed one, from the host's table by
+    /// heap slot ([`super::shader::SLOT_INTEGER`]); `None` for a descriptor
+    /// not loaded from the view heap.
+    fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
+        let Source::Loaded { load, first } = *src else {
+            return Ok(None);
+        };
+        let word = self.slot_word(load, first)?;
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let [int, signed] = [super::shader::SLOT_INTEGER, super::shader::SLOT_SIGNED].map(|bit| {
+            let bit = self.s.m.i32(bit);
+            let x = self.s.m.bin(c, Bin::And, word, bit);
+            self.s.m.cmp(c, pred::NE, x, zero)
+        });
+        Ok(Some((int, signed)))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -10270,8 +10468,10 @@ impl<'a> Lower<'a> {
             "buffer_load_sshort" => Some((16, true)),
             _ => None,
         };
-        // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // d16: two 16-bit channels per VGPR, low half first, buffer and
+        // tbuffer formats alike (upstream c430b1d, also Belobug a103937: tbuffer d16 loads took
+        // the 32-bit path, a channel a VGPR).
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -10529,8 +10729,12 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // d16 data is f16 for float and normalized formats, widened
+                // for the 32-bit float store; for integer formats (the view's
+                // kind, from the host's table by heap slot) the 16-bit
+                // integer, zero- or sign-extended (stored through the
+                // float-typed handle as loads read: see there).
+                let integer = if typed { self.integer_view(src)? } else { None };
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
@@ -10542,7 +10746,16 @@ impl<'a> Lower<'a> {
                     let f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
+                    let mut w = self.as_int(f);
+                    if let Some((int, signed)) = integer {
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
+                        let n = self.s.m.select(c, signed, sign_ext, zero_ext);
+                        w = self.s.m.select(c, int, n, w);
+                    }
+                    wide.push(w);
                 }
                 vals = wide;
             }
@@ -10602,7 +10815,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let mut xs = self.format_load(h, off, f, count)?;
+            if d16 {
+                xs = self.d16_channels(f, xs)?;
+            }
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -10673,16 +10890,34 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two 16-bit channels per VGPR (an odd last high half 0): f16 for
+            // float and normalized formats; for integer formats (the view's
+            // kind, from the host's table by heap slot) the integer's low 16
+            // bits. The pack's d16 users are its compute graph (the
+            // compute_graph_ops programs, e.g. 0aa7934094794dbf, which adds
+            // and divides the 16-bit channels as integers); through a UINT
+            // view the f16 conversion made their integers denormals, then 0.
+            // After upstream 4243a96.
+            // shortcut: an integer view is read and written through the
+            // float-typed handle, so its channels' bits travel as the driver
+            // passes a mismatched component type.
+            let integer = if typed { self.integer_view(src)? } else { None };
+            let c = self.cur;
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
+                    let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    if let Some((int, _)) = integer {
+                        let bits = self.as_int(f);
+                        let low = self.s.m.i32(0xFFFF);
+                        let low = self.s.m.bin(c, Bin::And, bits, low);
+                        h = self.s.m.select(c, int, low, h);
+                    }
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
@@ -11904,6 +12139,152 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// `tbuffer_load_format_d16_*` packs two 16-bit channels a VGPR, low half
+    /// first, as `buffer_load_format_d16_*` does (the pack's
+    /// 0aa7934094794dbf loads d16_xyzw into v[1:2] and reads v1's WORD_0 and
+    /// WORD_1, v2's WORD_0). Four channels at the top of the register file
+    /// fill v254 and v255; taken as a channel a VGPR they ran past v255.
+    #[test]
+    fn a_d16_typed_buffer_load_packs_two_channels_a_register() {
+        // MTBUF `op vdata, off, s[8:11], 0 format:format`.
+        let mtbuf = |op: u32, vdata: u32, format: u32| {
+            [
+                0x3A << 26 | format << 19 | (op & 7) << 16,
+                0x80 << 24 | (op >> 3 & 1) << 21 | 2 << 16 | vdata << 8,
+            ]
+        };
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        // tbuffer_load_format_d16_xyzw (11) in 16_16_16_16_FLOAT (71) and
+        // _UINT (69).
+        for format in [71, 69] {
+            let load = mtbuf(11, 254, format);
+            let words = [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                load[0],
+                load[1], // tbuffer_load_format_d16_xyzw v[254:255], off, s[8:11], 0
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xD834_0000,
+                0x0000_FE00, // ds_write_b32 v0, v254
+                0xD834_0004,
+                0x0000_FF00, // ds_write_b32 v0, v255 offset:4
+                S_ENDPGM,
+            ];
+            lower_with(&words, layout.clone(), used.clone()).unwrap();
+        }
+    }
+
+    /// A d16 typed buffer load through a table asks the host's table by heap
+    /// slot for its view's format kind: through an integer view the 16-bit
+    /// channels are the integers' bits, not halves (the pack's
+    /// compute_graph_ops programs, e.g. 0aa7934094794dbf, load
+    /// R16G16B16A16_UINT data this way and compute with it as integers).
+    #[test]
+    fn a_d16_typed_buffer_load_reads_its_views_format_kind() {
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = |d16: bool| {
+            // buffer_load_format(_d16)_xyzw v[1:..], v0, s[8:11], 0 idxen
+            let op: u32 = if d16 { 0x83 } else { 0x03 };
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x38 << 26 | op << 18 | 1 << 13,
+                0x8002_0100,
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let table = |d16| {
+            let l = lower_with(&words(d16), layout.clone(), used.clone()).unwrap();
+            l.root_srvs.contains(&super::super::shader::SLOT_STRIDES)
+        };
+        assert!(table(true), "d16");
+        assert!(!table(false), "32-bit");
+    }
+
+    /// Plain arithmetic for [`super::norm_quotient`]'s operations.
+    struct Eval;
+
+    impl super::NormOps for Eval {
+        type V = u32;
+        fn k(&mut self, x: u32) -> u32 {
+            x
+        }
+        fn int(&mut self, op: super::Bin, a: u32, b: u32) -> u32 {
+            use super::Bin::*;
+            match op {
+                Add => a.wrapping_add(b),
+                Sub => a.wrapping_sub(b),
+                Mul => a.wrapping_mul(b),
+                UDiv => a / b,
+                Shl => a << (b & 31),
+                LShr => a >> (b & 31),
+                And => a & b,
+                _ => unreachable!("{op:?}"),
+            }
+        }
+        fn ult(&mut self, a: u32, b: u32) -> u32 {
+            u32::from(a < b)
+        }
+        fn select(&mut self, c: u32, a: u32, b: u32) -> u32 {
+            if c != 0 { a } else { b }
+        }
+        fn to_float(&mut self, a: u32) -> u32 {
+            (a as f32).to_bits()
+        }
+        fn fmul(&mut self, a: u32, b: u32) -> u32 {
+            (f32::from_bits(a) * f32::from_bits(b)).to_bits()
+        }
+    }
+
+    /// The sequence `norm_quotient` emits gives every code below the top of
+    /// every width it takes (the pack's normalized formats have 8, 10 and 2
+    /// bits, and 15 for 16_16_SNORM's magnitude) the float nearest the exact
+    /// quotient, as the console's buffer unit does; so 255 times an 8-bit
+    /// code's float truncates back to the code (0066320cb6da26b0 at 0x1a40).
+    #[test]
+    fn normalized_codes_convert_to_the_nearest_float() {
+        for w in (2..=16).filter(|&w| super::norm_exact(w)) {
+            let d = (1u64 << w) - 1;
+            for a in 0..d as u32 {
+                let got = super::norm_quotient(&mut Eval, a, w);
+                let want = (f64::from(a) / d as f64) as f32;
+                assert_eq!(got, want.to_bits(), "{w}-bit code {a}: {}, want {want}", f32::from_bits(got));
+                if w == 8 {
+                    assert_eq!((f32::from_bits(got) * 255.0) as u32, a, "8-bit code {a} back");
+                }
+            }
+        }
     }
 
     #[test]

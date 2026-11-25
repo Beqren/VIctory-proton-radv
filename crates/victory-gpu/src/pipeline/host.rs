@@ -202,6 +202,36 @@ impl GraphicsState {
         )
     }
 
+    /// The blend state as the host takes it: no blending on integer
+    /// targets. The console's colour blocks pass integer values through
+    /// unblended whatever the blend state says; D3D12 refuses the pipeline
+    /// (vkd3d-proton: "Enabling blending on RT 2 with format
+    /// DXGI_FORMAT_R8_UINT, but using integer format is not supported",
+    /// E_INVALIDARG). The title's mesh pipeline [mesh f5e50eb2108c425b,
+    /// pixel ce3f0432a08f1d35] blends its targets with MAX, the third of
+    /// them R8_UINT, and was refused in every run (about a draw a frame).
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |n: usize| integer_format(self.targets.RTFormats[n].0 as u32);
+        let blended = |blend: &D3D12_BLEND_DESC, n: usize| {
+            let i = if blend.IndependentBlendEnable.as_bool() { n } else { 0 };
+            blend.RenderTarget[i].BlendEnable.as_bool()
+        };
+        if !(0..count).any(|n| integer(n) && blended(&blend, n)) {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            // Target 0's state stood for all of them: each gets its own.
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for n in (0..count).filter(|&n| integer(n)) {
+            blend.RenderTarget[n].BlendEnable = false.into();
+        }
+        blend
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -233,6 +263,14 @@ impl GraphicsState {
             })
             .collect()
     }
+}
+
+/// Whether a colour target of this format holds integers (`_UINT`, `_SINT`).
+fn integer_format(format: u32) -> bool {
+    matches!(
+        format,
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
+    )
 }
 
 /// One input element: vertex buffer slot, byte offset, format.
@@ -560,7 +598,9 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    // The state too: the shaders alone make a pipeline
+                    // (`victory translate` with `VICTORY_PAIRS`).
+                    tracing::warn!(error = %e, ?shaders, %state, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -605,7 +645,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -764,7 +804,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -851,7 +891,7 @@ fn bounds_pipeline(
             add(s, kind, code);
         }
     }
-    add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend);
+    add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend());
     add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask);
     add(s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer);
     let d = &g.depth;
@@ -1044,6 +1084,76 @@ mod tests {
         let name = super::super::library::name("bounds test", &root_blob, &[&code_bytes(&vs)], &g.describe());
         for _ in 0..2 {
             bounds_pipeline(&host.device, &root, [vs, none(), none(), none()], &g, &name).expect("made");
+        }
+    }
+
+    /// The state of the title's refused mesh pipeline [mesh
+    /// f5e50eb2108c425b, pixel ce3f0432a08f1d35]: three targets blended
+    /// with MAX, the third R8_UINT. The host refuses it as the title gives
+    /// it and takes it without blending on the integer target.
+    #[test]
+    fn blending_on_an_integer_target_is_left_out() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let compile = |source: &[u8], profile: PCSTR| {
+            let mut blob: Option<ID3DBlob> = None;
+            // SAFETY: the arguments are live and `blob` is the out pointer.
+            unsafe { D3DCompile(source.as_ptr().cast(), source.len(), PCSTR::null(), None, None, s!("main"), profile, 0, 0, &mut blob, None) }
+                .expect("compiles");
+            blob.expect("code")
+        };
+        let vs = compile(b"float4 main(uint id : SV_VertexID) : SV_Position { return float4(id, id, 0.5, 1); }", s!("vs_5_1"));
+        let ps = compile(
+            b"struct O { float a : SV_Target0; float4 b : SV_Target1; uint c : SV_Target2; };
+              O main() { O o; o.a = 1; o.b = 1; o.c = 1; return o; }",
+            s!("ps_5_1"),
+        );
+        // SAFETY: live blobs.
+        let (vs, ps) = unsafe {
+            (
+                D3D12_SHADER_BYTECODE { pShaderBytecode: vs.GetBufferPointer(), BytecodeLength: vs.GetBufferSize() },
+                D3D12_SHADER_BYTECODE { pShaderBytecode: ps.GetBufferPointer(), BytecodeLength: ps.GetBufferSize() },
+            )
+        };
+        let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..3].copy_from_slice(&[DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]);
+        for independent in [true, false] {
+            g.blend.IndependentBlendEnable = independent.into();
+            for rt in &mut g.blend.RenderTarget[..3] {
+                rt.BlendEnable = true.into();
+                rt.BlendOp = D3D12_BLEND_OP_MAX;
+            }
+            let desc = |blend| D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                // SAFETY: a borrowed pointer the description never releases.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                VS: vs,
+                PS: ps,
+                BlendState: blend,
+                SampleMask: g.sample_mask,
+                RasterizerState: g.rasterizer,
+                DepthStencilState: g.depth,
+                PrimitiveTopologyType: g.topology,
+                NumRenderTargets: 3,
+                RTVFormats: g.targets.RTFormats,
+                SampleDesc: g.samples,
+                ..Default::default()
+            };
+            // SAFETY: the descriptions point at live data.
+            unsafe {
+                assert!(host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc(g.blend)).is_err(), "refused as the title gives it");
+                host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc(g.host_blend())).expect("made without blending on R8_UINT");
+            }
+            let b = g.host_blend();
+            assert!(b.IndependentBlendEnable.as_bool());
+            assert!(b.RenderTarget[0].BlendEnable.as_bool() && b.RenderTarget[1].BlendEnable.as_bool());
+            assert!(!b.RenderTarget[2].BlendEnable.as_bool());
         }
     }
 

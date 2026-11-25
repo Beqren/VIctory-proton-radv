@@ -3895,7 +3895,6 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3908,10 +3907,129 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             },
         },
     };
+    null_srv(&desc, at);
+}
+
+/// Whether views that read nothing are views of real resources of zeros
+/// (a 1x1 1D, 1x1x6 2D array and 1x1x1 3D texture, a buffer of zeros), not
+/// null descriptors (`VICTORY_NULL_REAL=1`; off).
+///
+/// A test: runs and play sessions of 2026-11-25 lost the device on
+/// texture-unit reads at GPU address 0 and a few pages above. Every host
+/// heap slot starts null and every slot without a view is made null, so a
+/// read through such a slot would have to find vkd3d-proton's null
+/// descriptor (descriptor heaps) read as something that addresses memory.
+/// With real resources there is no null descriptor left to read.
+fn null_real() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_REAL").is_some_and(|v| v == "1"))
+}
+
+/// The real resources of [`null_real`]: 1D, 2D array of 6, 3D, buffer.
+fn null_resources() -> Option<&'static [ID3D12Resource; 4]> {
+    static MADE: std::sync::OnceLock<Option<[ID3D12Resource; 4]>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let make = |dimension, width: u64, depth: u16, format| -> Option<ID3D12Resource> {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: dimension,
+                Width: width,
+                Height: 1,
+                DepthOrArraySize: depth,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: if dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                } else {
+                    D3D12_TEXTURE_LAYOUT_UNKNOWN
+                },
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation; committed resources start zeroed.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
+                    .ok()?;
+            }
+            r
+        };
+        let made = [
+            make(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM)?,
+            make(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 6, DXGI_FORMAT_R8G8B8A8_UNORM)?,
+            make(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM)?,
+            make(D3D12_RESOURCE_DIMENSION_BUFFER, 64 << 10, 1, DXGI_FORMAT_UNKNOWN)?,
+        ];
+        tracing::info!("views that read nothing are views of real resources of zeros (VICTORY_NULL_REAL)");
+        Some(made)
+    })
+    .as_ref()
+}
+
+/// Writes a view that reads zeros at `at` for `desc` (a null resource's
+/// view, or with [`null_real`] the same view of a real resource of zeros,
+/// cut to its one mip and its slices).
+fn null_srv(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    if null_real()
+        && let Some(r) = null_resources()
+    {
+        let mut d = *desc;
+        // Union writes: the member the dimension names.
+        let resource = {
+            match d.ViewDimension {
+                D3D12_SRV_DIMENSION_BUFFER => {
+                    d.Format = DXGI_FORMAT_R32_TYPELESS;
+                    d.Anonymous.Buffer = D3D12_BUFFER_SRV { FirstElement: 0, NumElements: 1, StructureByteStride: 0, Flags: D3D12_BUFFER_SRV_FLAG_RAW };
+                    Some(&r[3])
+                }
+                D3D12_SRV_DIMENSION_TEXTURE1D => {
+                    d.Anonymous.Texture1D = D3D12_TEX1D_SRV { MostDetailedMip: 0, MipLevels: 1, ResourceMinLODClamp: 0.0 };
+                    Some(&r[0])
+                }
+                D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                    d.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: 1, FirstArraySlice: 0, ArraySize: 1, ResourceMinLODClamp: 0.0 };
+                    Some(&r[0])
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2D => {
+                    d.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 };
+                    Some(&r[1])
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                    d.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: 1, FirstArraySlice: 0, ArraySize: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 };
+                    Some(&r[1])
+                }
+                D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                    d.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: 0, MipLevels: 1, ResourceMinLODClamp: 0.0 };
+                    Some(&r[1])
+                }
+                D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                    d.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: 0, MipLevels: 1, First2DArrayFace: 0, NumCubes: 1, ResourceMinLODClamp: 0.0 };
+                    Some(&r[1])
+                }
+                D3D12_SRV_DIMENSION_TEXTURE3D => {
+                    d.Anonymous.Texture3D = D3D12_TEX3D_SRV { MostDetailedMip: 0, MipLevels: 1, ResourceMinLODClamp: 0.0 };
+                    Some(&r[2])
+                }
+                _ => None,
+            }
+        };
+        if let Some(resource) = resource {
+            if d.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+                d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            }
+            // SAFETY: a slot of our heap; a live resource of ours, which
+            // lives as long as the process.
+            unsafe { host.device.CreateShaderResourceView(resource, Some(&d), at) };
+            return;
+        }
+    }
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(desc), at)
     };
 }
 
@@ -3935,11 +4053,8 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let mut desc = srv_desc(&w);
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    let _ = &host;
+    null_srv(&desc, at);
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -3959,11 +4074,8 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             },
         },
     };
-    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    let _ = &host;
+    null_srv(&desc, at);
 }
 
 #[cfg(test)]

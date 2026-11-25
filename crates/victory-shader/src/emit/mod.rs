@@ -967,7 +967,8 @@ mod tests {
 
     /// A program whose waves pass values through a UAV between group
     /// barriers (a load after `s_barrier` of what other waves stored) gets
-    /// globally coherent UAVs by default; one without a barrier does not.
+    /// globally coherent UAVs with `VICTORY_COHERENT_UAVS=1`; one without a
+    /// barrier does not.
     #[test]
     fn uavs_read_after_a_group_barrier_are_globally_coherent() {
         // s_barrier; buffer_load_dword v1, v0, s[8:11], 0 offen; s_waitcnt vmcnt(0)
@@ -979,8 +980,8 @@ mod tests {
             super::lower::TEST_COHERENT_UAVS.set(was);
             r.unwrap()
         };
-        assert_ne!(lowered(&with, None), lowered(&with, Some(false)), "not coherent by default");
-        assert_eq!(lowered(&without, None), lowered(&without, Some(false)), "coherent without a barrier");
+        assert_ne!(lowered(&with, Some(true)), lowered(&with, Some(false)), "the switch changes nothing");
+        assert_eq!(lowered(&without, Some(true)), lowered(&without, Some(false)), "coherent without a barrier");
     }
 
     /// [`stores_v1`]'s translation.

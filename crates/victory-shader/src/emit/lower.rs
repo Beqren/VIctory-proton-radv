@@ -1141,24 +1141,23 @@ fn f16_nearest_on() -> bool {
 }
 
 /// Whether compute programs that write and read buffers or images between
-/// group barriers get globally coherent UAVs (`VICTORY_COHERENT_UAVS=0`
-/// turns it off). On the console a thread group's waves share one CU's
-/// vector cache, so a load after `s_barrier` sees what another wave stored
-/// before it; on the host they may run on both halves of a WGP, whose
-/// caches are not kept coherent for them. The face network's Formula
-/// program (0aa7934094794dbf, an interpreter whose 1,024 threads pass
-/// values through a register file in a UAV, a barrier between its 12
-/// stages) read values other waves had overwritten in an earlier stage
-/// (run dump3, 2026-11-25: a register its stage 2 wrote read at stage 3 as
-/// its stage-0 value); the face controls it computes came out wrong in 108
-/// of 440 places.
+/// group barriers get globally coherent UAVs (`VICTORY_COHERENT_UAVS=1`;
+/// off by default). The face network's Formula program (0aa7934094794dbf,
+/// an interpreter whose 1,024 threads pass values through a register file
+/// in a UAV, a barrier between its 12 stages) disagreed with a CPU model of
+/// its console code in 108 of the 440 face controls it computes (dump run
+/// dump3, 2026-11-25); the model's trace points at a stage-3 read that saw
+/// a register before another wave's stage-2 write, as a stale vector cache
+/// would (the host may spread a group over both halves of a WGP).
+/// Unverified: with this on (run confirm2) the faces stayed torn, and the
+/// model itself is unconfirmed, so it stays off.
 fn coherent_uavs_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_COHERENT_UAVS.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT_UAVS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT_UAVS").is_some_and(|v| v == "1"))
 }
 
 #[cfg(test)]

@@ -459,6 +459,43 @@ extract's, mapping's and skinning's views before and after; scripts and dumps in
   Next: a dump window that starts at a frame's first network dispatch, without
   the skinning's copies, to check those.
 
+Second round (same branch; dump by network pass, `VICTORY_GRAPH_DUMP=1020,1,<dir>`,
+`VICTORY_GRAPH_DUMP_LIGHT`; run dump3 for pass 0, 851 dispatches, 4 heads; run
+watch for who writes the controls):
+
+- Every op after Formula matches a CPU model of its console code, pass 0: Gather
+  and GatherAligned (32-bit indices from two halves: exact), Scatter (exact),
+  Place/PlaceAdd (aligned or not), Mult, Add, SmallMatMul (aligned or not),
+  TransposeVecMatMulAligned (the `v_readlane 32` wave sum and its single-precision
+  shortcut: within 0.07%), and the five final Gathers into the output buffer
+  (exact, all 5 x 15,462 halves). Not modelled: SliceCopy, Concat(Aligned), one
+  VecMatMul.
+- The controls come in right. The Formula's input (three buffers in turn, 27 KB)
+  holds the same bytes on the card as in title memory at each pass. Of its 43
+  blocks of 160 halves, the 4 of the heads in view change every frame, smoothly,
+  as speech (values 0-0.75). The other blocks stay the same per buffer, and the
+  title writes nothing there (run watch: no copies, no other dispatch touches
+  them, only 21-24 of 429 pieces change between presents). They are probably
+  characters not animated. So the bug is not upstream of the network.
+- Formula (0aa7934094794dbf, the face controls) is the one op that disagrees. It
+  is an interpreter: 1,024 threads, 12 stages with a barrier between them,
+  registers in the arena (an R16 view), and ops copy, add, sub, mul, div, abs,
+  neg, min, max, sin, cos, tan and sqrt. A CPU model of its console code
+  reproduces the register file's set-up exactly and stages 0-2 exactly. From
+  stage 3 on it differs: 108 of the 440 controls the next op (Clamp) reads, and
+  148 registers. The first disagreement is a stage-3 read that saw a register's
+  stage-0 value where another wave's stage-2 write should have landed. That
+  fits a missed barrier, or a stale vector cache across the WGP. Making UAVs
+  globally coherent for such programs (`VICTORY_COHERENT_UAVS=1`, 926cc9b, off
+  by default) left the faces torn (run confirm2, captures
+  /tmp/victory-faceref/cap2, frame 948). Either the CPU model is wrong somewhere,
+  or the cause is not cache coherence (the barrier itself, or an instruction in
+  the interpreter's decode).
+- Next: replay Formula alone on the GPU, from the dumped program, input and
+  arena, with the stage count in its header (half 43) cut to 1, 2, 3... That
+  gives the card's register file after each stage, to compare with the model.
+  Then check the barrier's lowering, and dxil-spirv's semantics for typed UAVs.
+
 Quad reads through quad reads in pixel programs (upstream 4015a18, the same lowering
 as 8487caf; branch d16-pack-quad) made skin plastic and glossy again: not merged.
 

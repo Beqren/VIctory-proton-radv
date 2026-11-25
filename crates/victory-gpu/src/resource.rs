@@ -1477,6 +1477,63 @@ pub(crate) fn reserve_room(asked: bool) -> bool {
     }
 }
 
+/// The last host textures the sweep let go: when, the title texture, and a
+/// weak handle that says whether the graveyard still holds it
+/// ([`swept_report`], in the removal report).
+static SWEPT: std::sync::Mutex<std::collections::VecDeque<(u64, usize, std::sync::Weak<HostTexture>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Notes a host texture the sweep lets go ([`SWEPT`]: the last 4,096).
+#[cfg(windows)]
+fn note_swept(title: usize, host: &std::sync::Arc<HostTexture>) {
+    let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if swept.len() >= 4096 {
+        swept.pop_front();
+    }
+    swept.push_back((crate::host::now_ms(), title, std::sync::Arc::downgrade(host)));
+}
+
+/// For the removal report: of the textures the sweep let go lately, by how
+/// long ago (under 1 s, 1-3 s, 3-10 s, older), how many are still held
+/// (in the graveyard) and how many are freed; and the last ten.
+#[cfg(windows)]
+pub(crate) fn swept_report() -> String {
+    let swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::now_ms();
+    let mut by = [[0u64; 2]; 4];
+    for (at, _, weak) in swept.iter() {
+        let age = now.saturating_sub(*at);
+        let i = match age {
+            0..1000 => 0,
+            1000..3000 => 1,
+            3000..10000 => 2,
+            _ => 3,
+        };
+        by[i][usize::from(weak.strong_count() == 0)] += 1;
+    }
+    let last: Vec<String> = swept
+        .iter()
+        .rev()
+        .take(10)
+        .map(|(at, title, weak)| {
+            format!("{title:#x} {} ms ago {}", now.saturating_sub(*at), if weak.strong_count() > 0 { "held" } else { "freed" })
+        })
+        .collect();
+    format!(
+        "{} noted; held/freed under 1 s {}/{}, 1-3 s {}/{}, 3-10 s {}/{}, older {}/{}; the last: {}",
+        swept.len(),
+        by[0][0],
+        by[0][1],
+        by[1][0],
+        by[1][1],
+        by[2][0],
+        by[2][1],
+        by[3][0],
+        by[3][1],
+        last.join(", ")
+    )
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1570,6 +1627,7 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some(((host, twin), chosen)) = gone {
+            note_swept(at, &host);
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);

@@ -377,6 +377,21 @@ time (f8016e0); first halves of interpolations evaluated as pairs only in a prog
 refused for one, with the second translation made in `emit` so that the offline
 tools get it too (8dfd60d, a22290d). With these the scan reaches the counts above.
 
+Ports from upstream (branch d16-pack, 2026-11-25): 16-bit typed buffer data through
+integer views passes as bits (after 4243a96: the 63 compute_graph_ops programs, the
+face network; the host's table by heap slot carries the view's format kind), the same
+packing for tbuffer d16 loads (c430b1d; no program of the pack has one), and
+normalized buffer codes converted from integers (da82e44; on this card the host's
+division gave 16-bit code 257 back as 256, a test under Proton showed it). In the
+title neither changed the pictures visibly. The waitress's red face (and red streaks
+on the heroine's neck) is intermittent in every build tried: absent in one run with
+the d16 fixes, present in one with d16 and the normalized fix, absent in one with both
+plus the quad change; none of these is shown to affect it. The eyes still glow: their
+lighting program reads no d16 data. Unverified: the integer path relies on vkd3d-proton
+passing UINT bits through the float-typed handle (upstream checked Windows AMD and WARP).
+Quad reads through quad reads in pixel programs (upstream 4015a18, the same lowering
+as 8487caf; branch d16-pack-quad) made skin plastic and glossy again: not merged.
+
 ## What was tried for the frame time
 
 Frames were slow because of the view list (see "The patched Proton"). Before that
@@ -405,6 +420,18 @@ Tried on stock Proton and what came of it (`<data>/notes/`):
 - Known ranges in view memory go to the guards without a failing `GetWriteWatch`
   call (`VICTORY_VIEWS_KNOWN`, on by default): failed calls fell from 4,536-7,852 a
   frame to 536-687; frame time unchanged within noise.
+- Page marks (`VICTORY_PAGE_MARKS=1`, off by default; port of upstream cd94d35 and
+  940d32f, branch `page-marks`): translated shaders mark the 64 KiB pages they write
+  through heap views, and copies in the PC's memory are compared only there. Two check
+  runs (`VICTORY_PAGE_MARKS=check`) found 0 unmarked pieces that differed, out of about
+  160 to 210 differing pieces judged a second. Every program of the pack still
+  translates, and its pipeline builds with marks on. The gain depends on how much is
+  compared on the CPU, and that depends on which copies get a card side, which varies
+  from run to run. The only run with a full card was a run without marks: 720 MB
+  compared a frame, in 40 to 54 ms. In the marks runs every copy of 1 MiB or more
+  was on the card, and 13 MB were compared against about 27 MB without marks.
+  Snapshots are still taken. Upstream drops them, but that needs a save on the
+  title's first write.
 - Also without gain: `VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
   `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`,
   `VICTORY_LATE_WAIT_LISTS=256`.

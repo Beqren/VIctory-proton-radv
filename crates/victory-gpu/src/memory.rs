@@ -245,6 +245,7 @@ pub(crate) fn ready(
     addresses: &[u64],
     constants: &[u32],
     writes: bool,
+    marking: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -288,6 +289,8 @@ pub(crate) fn ready(
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        // Page marks: the view begins at the copy's first byte.
+        heap.set_mark(base + 1 + n as u32, shadow.mark_entry_at(0, 4));
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
@@ -297,14 +300,18 @@ pub(crate) fn ready(
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
+    // Page marks: a writer that does not mark declares again under a key of
+    // its own, so that a marking writer before it in the list does not hide
+    // it (the copies are then compared whole).
+    const WRITE_UNMARKED: usize = usize::MAX - 0x70;
+    let first_write = writes && list.first_use(if marking { WRITE } else { WRITE_UNMARKED });
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }
         if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+            shadow.gpu_writes(list, start, len, marking);
         }
     }
     if first_read {

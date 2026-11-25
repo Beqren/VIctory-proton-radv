@@ -82,6 +82,8 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_ONE_LATCH",
+            // Page marks: their code is in every program writing through views.
+            "VICTORY_PAGE_MARKS",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");

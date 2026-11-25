@@ -349,12 +349,19 @@ Fixes, helped by the faster frames of the patched wineserver:
   reads (6.3-7.3 GB without), and of 7.3 GB shown only 1.15 GB was read in the
   last frames. `VICTORY_TEXTURE_ON_READ=1` makes slots only once read;
   `VICTORY_TEXTURE_EVICT=1` with marks evicts after 120 s/300 frames unread and
-  past 90% of the budget down to 85%. Runs onread-3 to -7 (155-158 s of world, no
-  fault with the merge of world-start-crash): the card settles at 72-86% instead of
-  96-98%, slot makings refused for room 12-75 thousand instead of 281 thousand; but
-  16-53 thousand textures are made again within 10 s of their eviction (most in the
-  world's first minute), and a bake reads what was evicted (skin baked plastic until
-  evicted slots go back before a bake). Off until the thrash is near zero.
+  past 90% of the budget down to 85%. Runs onread-3, -5, -6, -7 (155-159 s of
+  world each, no fault; onread-2, before the merge of world-start-crash, lost the
+  device 13 s into the world right after 12,000 evictions): the card settles at
+  72-86% instead of 96-98%; slot makings refused for room by 70 s of world about
+  23,000 in onread-7 against 108,000 (marks only) and 163,000 (base15). But
+  16-53 thousand textures are made again within 10 s of their eviction, most in the
+  world's first seconds, and street signs pop in later than without eviction. With
+  the eviction alone the heroine's skin was plastic in one run (onread-3); with
+  evicted slots put back before bake draws it was textured in three (consistent with
+  a bake reading evicted sources, not proven: the put-off publication of new
+  textures can still leave the bake a null slot). Null writes of the eviction go
+  straight into the heap, not through the put-off rule. Off until the thrash is near
+  zero.
 - `tools/face_time.py` measures the result: from the per-frame log line of character
   textures asked for and missing on the card, it prints the frames and seconds after
   the world's first frame until none is missing.

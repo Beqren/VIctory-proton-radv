@@ -420,6 +420,45 @@ dispatch in a window of frames), the mapping pass's delta indices (an index off
 by one gives each vertex a neighbour's delta of the right size), and what the
 network's inputs (face controls) hold.
 
+Checked offline on real data (branch face-ref, 2026-11-25; dump run with
+`VICTORY_GRAPH_DUMP=1020,1,<folder>`, which copies the network's 24 MB arena on
+the card before each of its dispatches, every other view at first sight, and the
+extract's, mapping's and skinning's views before and after; scripts and dumps in
+/tmp/victory-faceref):
+
+- The deltas land on the right vertices. For each of the six heads the extract
+  ran in frame 1020, map, base positions (24/24/16-bit packed, mode 0) and the
+  network output as the extract read them: the deltas as indexed (`3 * (map >>
+  16) + constant word 15`) form a smooth field (median distance to the mean of
+  the 8 nearest vertices' deltas 0.06-0.21 of the median delta), every
+  re-indexing is rougher (delta index -1/+1: 0.6-1.3; a half off: 0.19-0.72;
+  4 or 6 halves a vertex: 1.2-5.3), and the field is anatomical: zero on the
+  skull, largest on lips and jaw, brows, eyelids. So the network computes the
+  wrong expression; the indexing is not it. Head seq 55: jaw and lips moved 5 cm.
+- Ops matched against CPU models of their console code, dispatch by dispatch:
+  VecMatMulAligned (40 dispatches), AddBroadcastAligned, Silu, MatMulAligned,
+  and the copies (Gather, SliceCopy, ConcatAligned, Zero) write values of their
+  inputs where expected. Every result is the exact value rounded to 16 bits, but
+  rounded toward zero: all 6,400 results of an AddBroadcastAligned dispatch equal
+  the toward-zero rounding of the exact sum, 41% of them a last place below the
+  nearest; matrix products came out 0.6% small (fitted gain 0.9937, the error
+  correlated -0.92 with the value). The host's `f32tof16` rounds toward zero on
+  RADV as on NVIDIA; the programs set MODE's f16 rounding to nearest. Fixed
+  (6bb83c5): every 16-bit float result is rounded to nearest even
+  (`f16_nearest`; `VICTORY_F16_NEAREST=0` gives the host's conversion back),
+  packed `v_pk_*` results included, which the switch never reached.
+- That was not the cause: with it (run confirm1, captures
+  /tmp/victory-faceref/cap1, `VICTORY_TABLE_SLOT_WORDS=1`) mouths are still
+  agape and teeth float under the nose (frame 938); eyes are normal. Not
+  checked: everything after the first ~225 dispatches of the network (frame
+  1020's recording began mid-network and the skinning's 32 MB views used the
+  copy room in frame 1021): Formula (the face controls, its output is read
+  only after it is overwritten), Gather/GatherAligned with 32-bit indices made of
+  two halves, TransposeVecMatMulAligned (a wave64 f16 sum the translator lowers
+  in single precision, `half_sum_here`), SmallMatMul, Scatter, Place, Mult, Add.
+  Next: a dump window that starts at a frame's first network dispatch, without
+  the skinning's copies, to check those.
+
 Quad reads through quad reads in pixel programs (upstream 4015a18, the same lowering
 as 8487caf; branch d16-pack-quad) made skin plastic and glossy again: not merged.
 

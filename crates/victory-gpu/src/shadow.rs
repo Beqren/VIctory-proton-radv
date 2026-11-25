@@ -1022,6 +1022,13 @@ fn back_probe() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_PROBE").is_some_and(|v| v == "1"))
 }
 
+/// Title memory as read before a merge, for [`put_back`]: kept only when
+/// [`back_exact`] or [`back_probe`] looks at it (a copy of every piece,
+/// 63-77 MB a frame, otherwise).
+fn kept_read(title: &[u8]) -> Vec<u8> {
+    if back_exact() || back_probe() { title.to_vec() } else { Vec::new() }
+}
+
 /// The word size of [`exact_runs`]: the title's own stores of pointers and
 /// counters are 8-byte aligned words, so a word the card left alone is
 /// never written, and a word it changed is written whole.
@@ -2305,7 +2312,7 @@ impl Shadow {
                 if !read_title(start + at, title) {
                     continue;
                 }
-                let read = title.to_vec();
+                let read = kept_read(title);
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
                 // Without a branch, so the loop runs many bytes at a time:
@@ -2406,7 +2413,7 @@ impl Shadow {
         if !read_title(start + at, title) {
             return 0;
         }
-        let read = title.to_vec();
+        let read = kept_read(title);
         let runs = merged_runs(start + at, n, |lo, hi| merge_piece(&now[lo..hi], &mut held[lo..hi], &mut title[lo..hi]));
         put_back(start + at, title, &read, &runs)
     }
@@ -2923,7 +2930,7 @@ impl Shadow {
         title.resize(n, 0);
         let mut written = 0;
         if read_title(start + at, title) {
-            let read = title.to_vec();
+            let read = kept_read(title);
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let runs = merged_runs(start + at, n, |lo, hi| {
@@ -2999,7 +3006,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = read_title(start + at, title);
-        let read = if mapped { title.to_vec() } else { Vec::new() };
+        let read = if mapped { kept_read(title) } else { Vec::new() };
         let mut runs = Vec::new();
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);

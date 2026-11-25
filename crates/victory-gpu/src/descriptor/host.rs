@@ -3094,7 +3094,8 @@ fn view_fits(texture: &ID3D12Resource, view: &mut ViewRange) -> bool {
     let (mips, slices) = (u32::from(d.MipLevels.max(1)), u32::from(d.DepthOrArraySize.max(1)));
     let dim = d.Dimension;
     let before = view_summary(view);
-    let result = fit_range(dim, mips, slices, view);
+    let planes = format_planes(d.Format.0 as u32);
+    let result = fit_range(dim, mips, slices, view).filter(|_| plane_fits(view, planes));
     match result {
         Some(false) => {}
         Some(true) => {
@@ -3130,7 +3131,7 @@ fn view_summary(view: &ViewRange) -> String {
             ViewRange::Shader(v) => match v.ViewDimension {
                 D3D12_SRV_DIMENSION_TEXTURE1D => format!("1d mips {}+{}", v.Anonymous.Texture1D.MostDetailedMip, v.Anonymous.Texture1D.MipLevels as i32),
                 D3D12_SRV_DIMENSION_TEXTURE1DARRAY => { let t = v.Anonymous.Texture1DArray; format!("1d array mips {}+{} slices {}+{}", t.MostDetailedMip, t.MipLevels as i32, t.FirstArraySlice, t.ArraySize) }
-                D3D12_SRV_DIMENSION_TEXTURE2D => format!("2d mips {}+{}", v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels as i32),
+                D3D12_SRV_DIMENSION_TEXTURE2D => format!("2d mips {}+{} plane {} format {}", v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels as i32, v.Anonymous.Texture2D.PlaneSlice, v.Format.0),
                 D3D12_SRV_DIMENSION_TEXTURE2DARRAY => { let t = v.Anonymous.Texture2DArray; format!("2d array mips {}+{} slices {}+{}", t.MostDetailedMip, t.MipLevels as i32, t.FirstArraySlice, t.ArraySize) }
                 D3D12_SRV_DIMENSION_TEXTURE3D => format!("3d mips {}+{}", v.Anonymous.Texture3D.MostDetailedMip, v.Anonymous.Texture3D.MipLevels as i32),
                 D3D12_SRV_DIMENSION_TEXTURECUBE => format!("cube mips {}+{}", v.Anonymous.TextureCube.MostDetailedMip, v.Anonymous.TextureCube.MipLevels as i32),
@@ -3147,6 +3148,36 @@ fn view_summary(view: &ViewRange) -> String {
             },
         }
     }
+}
+
+/// Planes of a host texture format: 2 for the depth-stencil families (the
+/// stencil plane is plane 1), else 1.
+fn format_planes(format: u32) -> u32 {
+    if matches!(format, 19..=22 | 44..=47 | 118..=121) { 2 } else { 1 }
+}
+
+/// Whether a shader view's plane lies in the texture: a view of plane 1
+/// (the stencil) of a texture without one is refused. Run play-fault5
+/// (2026-11-25) lost the device on a texture-unit read at GPU address 0
+/// while a button prompt drawn with FTexTGCxformEAlphaDepthStencilOccluded
+/// (91cbe89832eb575b) appeared: that program loads the scene's depth and
+/// stencil by `image_load` at screen coordinates; a view of a plane the
+/// image does not have has no memory behind it.
+fn plane_fits(view: &ViewRange, planes: u32) -> bool {
+    // Union reads: the member the dimension names.
+    let plane = match view {
+        ViewRange::Shader(v) => match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => unsafe { v.Anonymous.Texture2D.PlaneSlice },
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => unsafe { v.Anonymous.Texture2DArray.PlaneSlice },
+            _ => 0,
+        },
+        ViewRange::Unordered(v) => match v.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => unsafe { v.Anonymous.Texture2D.PlaneSlice },
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => unsafe { v.Anonymous.Texture2DArray.PlaneSlice },
+            _ => 0,
+        },
+    };
+    plane < planes
 }
 
 /// Mips `most`, `levels` (`u32::MAX`: all) against a texture of `mips`:

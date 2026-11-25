@@ -623,6 +623,50 @@ pub(crate) fn texture_made(resource: usize) {
         .push(resource);
 }
 
+/// Slot writes put off while submissions were in the air
+/// (`host::publish_later`), by handle.
+#[cfg(windows)]
+static DEFERRED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// Puts off the write of the host slot for `handle`.
+#[cfg(windows)]
+pub(crate) fn defer_publish(handle: u64) {
+    let mut d = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+    if !d.contains(&handle) {
+        d.push(handle);
+        host::PUBLISH[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Makes the host slots whose writes were put off: called with nothing in
+/// the air (`crate::host::Host::submit`, where the sweep runs). The write
+/// is made from what the title's slot holds now.
+#[cfg(windows)]
+pub(crate) fn publish_deferred() {
+    let handles = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let n = handles.len() as u64;
+    for handle in handles {
+        let Some((heap, index)) = shader_slot(handle) else {
+            continue;
+        };
+        if let Some(Some(host)) = heap.host.get() {
+            host.mirror(index, handle, true);
+        }
+    }
+    host::PUBLISH[1].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    static LINE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    let now = crate::host::now_ms();
+    let mut last = LINE.lock().unwrap_or_else(|e| e.into_inner());
+    if now >= *last + 10_000 {
+        *last = now;
+        tracing::info!(
+            put_off = host::PUBLISH[0].load(std::sync::atomic::Ordering::Relaxed),
+            published = host::PUBLISH[1].load(std::sync::atomic::Ordering::Relaxed),
+            "slot writes of new textures put off while submissions were in the air, and made with none (VICTORY_PUBLISH_SAFE), since the start"
+        );
+    }
+}
+
 /// The slot at `handle` was written with a view of texture `resource`,
 /// which has no host copy: it waits for one.
 #[cfg(windows)]

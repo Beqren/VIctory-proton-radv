@@ -707,6 +707,9 @@ pub(crate) fn null_roots_on() -> bool {
 /// (4 MiB: a root view has no size, and reads past its start by offsets
 /// the title computes).
 pub(crate) fn zero_root() -> Option<u64> {
+    if let Some(gpu) = crate::descriptor::host::zero_buffer_gpu() {
+        return Some(gpu);
+    }
     // A failure is not kept: the next call tries again (review finding).
     static ZERO: std::sync::OnceLock<(ID3D12Resource, u64)> = std::sync::OnceLock::new();
     if let Some(z) = ZERO.get() {

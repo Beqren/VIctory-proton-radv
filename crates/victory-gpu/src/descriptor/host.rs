@@ -2526,6 +2526,14 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            if !later && !self.sampler && publish_later(&view) {
+                // Not now: a submission in the air may read this slot, and
+                // the texture's memory is newer than it ([`publish_later`]).
+                // The slot keeps what it shows; the write comes again with
+                // nothing in the air (`super::publish_deferred`).
+                super::defer_publish(handle);
+                return Some(view);
+            }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -3060,6 +3068,50 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
+/// Whether a slot write that shows texture `view` waits for a moment with
+/// no submission in the air (`VICTORY_PUBLISH_SAFE`, on): it does while
+/// submissions are in the air and the texture's host copy was made less
+/// than [`FRESH_MS`] ago (or is made now, for this view).
+///
+/// Why: run play-va1 (2026-11-25, `VICTORY_TEXTURE_VA=1`) lost the device
+/// on texture-unit reads inside a LIVE host texture (a 4096x4096 BC1, at
+/// +0x21000 to +0x26000 of mip 0, permission fault: page table entry not
+/// valid) made 2,084 ms before the removal was detected, the moment the hung
+/// job began. Shaders read descriptors from the heap when they run, so a
+/// slot written while a submission is in the air changes what that running
+/// submission reads; a texture whose memory is newer than the submission is
+/// one the kernel may not have made valid for it. Every device loss of the
+/// day came a few seconds after new content (new textures) arrived.
+/// shortcut: "fresh" is counted in time, not against each submission's
+/// send.
+fn publish_later(view: &View) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PUBLISH_SAFE").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let texture = match view {
+        View::Shader(r, _) if !view.is_buffer() => *r,
+        View::Placed(false, ..) => match placed_texture(view) {
+            Some(View::Shader(r, _)) => r,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if !crate::host::flying() {
+        return false;
+    }
+    match crate::resource::host_age_ms(texture as crate::object::This) {
+        Some(age) => age < FRESH_MS,
+        None => false,
+    }
+}
+
+/// How new a texture's host copy is for [`publish_later`] (ms).
+const FRESH_MS: u64 = 3_000;
+
+/// Slot writes [`publish_later`] put off, and published since the start.
+pub(crate) static PUBLISH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// A texture view's description, for [`view_fits`].
 enum ViewRange<'a> {
     Shader(&'a mut D3D12_SHADER_RESOURCE_VIEW_DESC),
@@ -3875,7 +3927,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // location a null view that reads nothing is not checked here.
             static ZEROS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let on = *ZEROS.get_or_init(|| std::env::var_os("VICTORY_NULL_CBV_ZEROS").is_some_and(|v| v == "1"));
-            let zeros = on.then(crate::draw::zero_root).flatten();
+            let zeros = if null_buffer_zeros() { zero_buffer_gpu() } else { on.then(crate::draw::zero_root).flatten() };
             let desc = match zeros {
                 Some(gpu) => D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu, SizeInBytes: 64 << 10 },
                 None => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
@@ -3886,6 +3938,26 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
+    if buffer
+        && null_buffer_zeros()
+        && let Some(z) = zero_buffers()
+    {
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: (ZERO_BYTES / 4) as u32,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a live buffer of ours (writes land
+        // there and are never read back).
+        unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&desc), at) };
+        return;
+    }
     let desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
@@ -3946,9 +4018,90 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// Whether views of buffers that read nothing are views of real buffers of
+/// zeros (`VICTORY_NULL_BUFFER_ZEROS`, on): 64 MiB to read, and another 64
+/// MiB for unordered views to write into, never read.
+///
+/// Why: run play-va2 (2026-11-25) lost the device on scalar data reads
+/// (SQC) at GPU addresses 0x0, 0x10000, 0x3f000 ... 0xc4000: a buffer read
+/// through a view whose base address is 0, at the offsets the shader
+/// computed. A null buffer view gives no memory and, on vkd3d-proton's path
+/// for such views, no bound the load is held to; a view of real zeros reads
+/// zeros at any offset within its size.
+fn null_buffer_zeros() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_BUFFER_ZEROS").is_none_or(|v| v != "0"))
+}
+
+/// The bytes of each buffer of [`null_buffer_zeros`].
+const ZERO_BYTES: u64 = 64 << 20;
+
+/// The buffers of [`null_buffer_zeros`]: to read (0) and to write (1).
+fn zero_buffers() -> Option<&'static [ID3D12Resource; 2]> {
+    static MADE: std::sync::OnceLock<Option<[ID3D12Resource; 2]>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let make = || -> Option<ID3D12Resource> {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: ZERO_BYTES,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation; committed resources start zeroed.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
+                    .ok()?;
+            }
+            r
+        };
+        let made = [make()?, make()?];
+        tracing::info!(mb = ZERO_BYTES >> 20, "views of buffers that read nothing read real zeros (VICTORY_NULL_BUFFER_ZEROS)");
+        Some(made)
+    })
+    .as_ref()
+}
+
+/// The GPU address of the buffer of zeros to read ([`null_buffer_zeros`]).
+pub(crate) fn zero_buffer_gpu() -> Option<u64> {
+    if !null_buffer_zeros() {
+        return None;
+    }
+    // SAFETY: a live buffer.
+    zero_buffers().map(|b| unsafe { b[0].GetGPUVirtualAddress() })
+}
+
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if null_buffer_zeros()
+        && let (Some(z), Some(host)) = (zero_buffers(), host())
+    {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: (ZERO_BYTES / 4) as u32,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a live buffer of ours.
+        unsafe { host.device.CreateShaderResourceView(&z[0], Some(&desc), at) };
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,

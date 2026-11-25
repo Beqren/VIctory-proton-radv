@@ -887,8 +887,11 @@ impl Staging {
 /// anew.
 pub(crate) fn unstage(resource: This) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
+    if let Some(map) = map.as_mut()
+        && let Some(staging) = map.remove(&(resource as usize))
+    {
+        // Through the graveyard, as every release that a list may name.
+        crate::host::retire(staging);
     }
 }
 

@@ -12,14 +12,14 @@ Every frame in which the title's character shaders (the ones that take their tex
 slots from a material record, `State::note_asked` in crates/victory-gpu/src/draw.rs) drew
 logs one line, in any build:
 
-    character textures the frame's draws asked for, and of them missing on the card frame=F asked=A missing=M missing_long=L wide=W
+    character textures the frame's draws asked for, and of them missing on the card frame=F asked=A missing=M missing_long=L every_slot=true
 
 M counts the distinct slots those draws named whose host slot was null (nothing on the card);
-L those of them missing at every ask for 30 frames or more (never arriving); W says whether the
-draws named every slot their pixel program may take a texture from (VICTORY_TEXTURE_ASKED_WIDE,
-on) or only the first 16 words of the material record (older builds, or =0). Those 16 words
-alone missed the slot whose empty texture made the skin program discard the heads in the diner
-shots (2026-11-25, runs skin-1 to skin-5): M said 0 while every head was absent.
+L those of them missing at every ask for 30 frames or more (never arriving). Builds that write
+every_slot=true count every slot the pixel program may take a texture from (the material
+record's both parts, the global record, the small buffers and textures of the draw's tables);
+older builds counted only the first 16 words of the material record, and a run they called
+whole (fast.log, 2026-11-25: median 0 missing) had no heads in the diner shots.
 In the opening cutscene the main character's head is drawn with three such maps (1024x1024
 BC5 and BC7, 512x512 BC7) that were null for tens of frames while the card was full
 (2026-11-25, runs D and E); a frame with M = 0 drew every character texture it asked for.
@@ -36,7 +36,7 @@ import sys
 from datetime import datetime
 
 LINE = re.compile(r'^(\S+)\s.*character textures the frame\'s draws asked for.*frame=(\d+) asked=(\d+) missing=(\d+)'
-                  r'(?: missing_long=(\d+))?(?: wide=(\w+))?')
+                  r'(?: missing_long=(\d+))?(?: every_slot=(\w+))?')
 WORLD = re.compile(r'^(\S+)\s.*the first frame of 500 draws or more.*frame=(\d+)')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
@@ -82,10 +82,9 @@ def one(path):
     missing = [f[3] for f in after]
     print(f'  missing per frame: median {statistics.median(missing)}, largest {max(missing)}; '
           f'asked per frame: median {statistics.median(f[2] for f in after)}')
-    wide = {f[5] for f in after}
-    if wide != {'true'}:
-        print('  WARNING: not every slot the character programs read was counted '
-              f'(wide={sorted(str(w) for w in wide)}): a 0 here does not mean the characters are whole')
+    if any(f[5] != 'true' for f in after):
+        print('  WARNING: an older build: only the first 16 words of the material record were counted, '
+              'so 0 missing does not mean the characters are whole')
     long = [f[4] for f in after if f[4] is not None]
     if long:
         bad = sum(1 for n in long if n > 0)

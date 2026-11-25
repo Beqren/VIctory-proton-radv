@@ -377,7 +377,7 @@ fn asked_census(frame: u64, index: u32, made: bool) {
                 asked = c.1.len(),
                 missing = c.2,
                 missing_long = c.3,
-                wide = asked_wide(),
+                every_slot = true,
                 "character textures the frame's draws asked for, and of them missing on the card"
             );
         }
@@ -400,13 +400,16 @@ fn asked_census(frame: u64, index: u32, made: bool) {
     }
 }
 
-/// Whether character draws ask for every slot their pixel program may take
-/// a texture from, not only the first 16 words of the material record
-/// (`State::asked_wide_words`); `VICTORY_TEXTURE_ASKED_WIDE=0`: those 16
-/// words alone, as before.
+/// Whether character draws ask for (serve first on a full card) every
+/// slot their pixel program may take a texture from
+/// (`State::asked_wide_words`), not only the first 16 words of the
+/// material record; `VICTORY_TEXTURE_ASKED_WIDE=1`. Off by default: in run
+/// skin-6 (2026-11-25, with the requeue too) 218 slots a frame were asked
+/// for instead of 30 and the heads were still missing. The per-frame line
+/// counts all of them either way (`asked_census`).
 fn asked_wide() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_WIDE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_WIDE").is_some_and(|v| v == "1"))
 }
 
 /// Since the start: slots draws asked for (`State::note_asked`), and
@@ -1736,29 +1739,36 @@ impl State {
             return;
         };
         let frame = crate::frame::current();
-        let mut words: Vec<u32> =
+        let first: Vec<u32> =
             record.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
-        if asked_wide() {
-            self.asked_wide_words(&t, heap, (base, len, at), &mut words);
-        }
-        words.sort_unstable();
-        words.dedup();
-        for index in words {
-            if index != 0
+        // The other slots the program may read: counted in the frame's
+        // line always (the measure), asked for only with the switch.
+        let mut more = Vec::new();
+        self.asked_wide_words(t, heap, (base, len, at), &mut more);
+        more.retain(|w| !first.contains(w));
+        more.sort_unstable();
+        more.dedup();
+        let texture = |index: u32| {
+            index != 0
                 && heap
                     .handle(index)
                     .and_then(crate::descriptor::view)
                     .as_ref()
                     .is_some_and(crate::descriptor::host::is_texture_view)
-            {
+        };
+        for (index, primary) in first.into_iter().map(|w| (w, true)).chain(more.into_iter().map(|w| (w, false))) {
+            if !texture(index) {
+                continue;
+            }
+            let made = host.texture_slot_made(index);
+            if primary || asked_wide() {
                 host.texture_slot_asked(index, frame);
                 HEAP_TEXTURES_ASKED[0].fetch_add(1, Ordering::Relaxed);
-                let made = host.texture_slot_made(index);
                 if !made {
                     host.texture_slot_requeue(index, frame);
                 }
-                asked_census(frame, index, made);
             }
+            asked_census(frame, index, made);
         }
     }
 
@@ -1769,14 +1779,16 @@ impl State {
     /// second part (512 bytes at 0x790), the record the second root
     /// constant names in the buffer at table 0, dword 688, every word of
     /// the small buffers and constants of the draw's tables, and the
-    /// textures its tables hold. The 16 words alone missed the slot whose
-    /// texture, empty, made the skin program discard every pixel of the
-    /// heads in the opening (diner shots, runs skin-1 to skin-3 of
-    /// 2026-11-25: eyes, teeth and hair drawn, head and neck not; with
-    /// `VICTORY_NULL_MAGENTA_ALL=1` the heads came back as solid shapes),
-    /// while the per-frame line said none was missing.
+    /// textures its tables hold. In the opening's diner shots (runs skin-1
+    /// to skin-5 of 2026-11-25) the heads were missing (eyes, teeth and
+    /// hair drawn, head and neck not); with `VICTORY_NULL_MAGENTA_ALL=1`
+    /// some came back as solid shapes, so an empty texture makes the skin
+    /// program discard them. The listing of skin-5 found null slots in
+    /// these places too (the record's second part, the small buffers at
+    /// table 1), which the 16 words did not count: a run the per-frame
+    /// line called whole had no heads. Which slot clips is not proven.
     /// shortcut: a word that is a small number by chance and names a
-    /// texture view is asked for too.
+    /// texture view is taken for a slot too.
     fn asked_wide_words(
         &self,
         t: &crate::pipeline::Translated,

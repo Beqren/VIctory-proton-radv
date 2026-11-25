@@ -1068,10 +1068,15 @@ impl HostHeap {
     /// character pixel programs named were out of the queue, among them
     /// the first word of a drawn material record (a 512x512 BC1 map), and
     /// the skin program discarded every pixel of the heads.
-    /// `VICTORY_TEXTURE_ASKED_REQUEUE=0`: left out, as before.
+    /// `VICTORY_TEXTURE_ASKED_REQUEUE=1`; off by default: in run skin-6
+    /// (with `VICTORY_TEXTURE_ASKED_WIDE` on) 7,929 slots went back but
+    /// only 927 asked slots were made on the full card, slots stayed
+    /// missing for 30 frames or more in 258 of 334 frames, the heads were
+    /// still missing and the teeth turned black (a stale view made again
+    /// shows the newer texture in its memory).
     pub(crate) fn texture_slot_requeue(&self, index: u32, frame: u64) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_REQUEUE").is_none_or(|v| v != "0")) {
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_REQUEUE").is_some_and(|v| v == "1")) {
             return false;
         }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());

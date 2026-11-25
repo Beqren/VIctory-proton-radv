@@ -467,6 +467,8 @@ pub(crate) const P_GUARD_US: usize = 34;
 pub(crate) const P_GUARD_BLOCKS: usize = 35;
 /// Clean blocks [`guard_bits`] passed over by words.
 pub(crate) const P_GUARD_BITS: usize = 36;
+/// Written blocks left open for their rest ([`rest`]).
+pub(crate) const P_RESTED: usize = 37;
 
 /// Why a guarded block was opened (diagnostics).
 #[derive(Clone, Copy)]
@@ -519,6 +521,8 @@ struct Guards {
     /// opened ([`Why`]).
     #[cfg(feature = "diagnostics")]
     why: BTreeMap<usize, u8>,
+    /// Blocks a write fault opened, and when ([`rest`]).
+    opened: BTreeMap<usize, std::time::Instant>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -532,9 +536,29 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     copies: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
     why: BTreeMap::new(),
+    opened: BTreeMap::new(),
 });
 
 impl Guards {
+    /// Whether `block` is left open for now: a write fault opened it less
+    /// than `rest` ago ([`rest`]).
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write fault opened `block` ([`rest`]). The record is kept small:
+    /// what is older than any rest goes when it grows.
+    fn note_opened(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            if self.opened.len() >= MANY {
+                self.opened.clear();
+            }
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
+
     /// Whether the guards hold `block` (read-only by our hand, or noted
     /// absent): it is view memory, which the write watch refuses.
     fn known(&self, block: usize) -> bool {
@@ -649,6 +673,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let mut uncommitted_until = first;
+    let rest = rest();
     if guard_bits() {
         // The range's blocks that are not clean, off the bits a word at a
         // time; nothing else of the range is looked at.
@@ -666,7 +691,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 protect_run(&mut g, from, to);
                 run = None;
             }
-            match take_block(&mut g, block, &mut uncommitted_until, &mut written) {
+            match take_block(&mut g, block, &mut uncommitted_until, &mut written, rest) {
                 Taken::Run => run = Some((run.map_or(block, |r| r.0), block + 1)),
                 Taken::Done => {
                     if let Some((from, to)) = run.take() {
@@ -698,7 +723,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        if block < last && !is_clean && matches!(take_block(&mut g, block, &mut uncommitted_until, &mut written), Taken::Run) {
+        if block < last && !is_clean && matches!(take_block(&mut g, block, &mut uncommitted_until, &mut written, rest), Taken::Run) {
             run.get_or_insert(block);
             continue;
         }
@@ -722,7 +747,7 @@ enum Taken {
 /// `uncommitted_until`), it is written: its pages go into `written`, and it
 /// is guarded again here if it still is read-only (written through the
 /// runtime) or left to the caller's run.
-fn take_block(g: &mut Guards, block: usize, uncommitted_until: &mut usize, written: &mut Vec<usize>) -> Taken {
+fn take_block(g: &mut Guards, block: usize, uncommitted_until: &mut usize, written: &mut Vec<usize>, rest: std::time::Duration) -> Taken {
     if g.absent.contains(&block) {
         // Ordinary commits need no runtime mapping notification. Reuse
         // this asking's query for the following blocks in the same region.
@@ -742,6 +767,12 @@ fn take_block(g: &mut Guards, block: usize, uncommitted_until: &mut usize, writt
         prep(P_WRITTEN_WHY + why, 1);
     }
     if !g.protected.contains(&block) {
+        // Written by the title a moment ago and likely to be again: told as
+        // written, left open, not clean (so told again at the next asking).
+        if g.rests(block, rest) {
+            prep(P_RESTED, 1);
+            return Taken::Done;
+        }
         return Taken::Run;
     }
     // Written through the runtime, still read-only. With [`one_view`]
@@ -763,14 +794,66 @@ fn protect_run(g: &mut Guards, from: usize, to: usize) {
     prep(P_GUARD_PROTECT_US, protecting.elapsed().as_micros() as u64);
 }
 
+/// How long a block the title's write fault opened is left open by the
+/// askings that follow (`VICTORY_GUARD_REST=<microseconds>`; off, 0, by
+/// default until measured; `1` takes 3,000).
+///
+/// After the sibling fork VIctory-7900XTX 7bc7c07: there 220 of a frame's
+/// 586 faults came within 3 ms after a refresh had guarded the block again
+/// while the title was still writing it, and what one refresh takes the next
+/// asks about again within a millisecond: guarded, written, faulted, opened,
+/// up to a dozen times a frame, each a change of protection under the
+/// guards' lock with the title's faulting threads waiting (here 26-66 ms a
+/// frame of the title's threads in the fault handler waiting for the lock,
+/// and 2,600-3,000 changes of protection a frame each way, run d-off). A
+/// block that rests is told as written at every asking, so nothing is
+/// missed; the first asking after its rest guards it, as before. The
+/// counter `P_RESTED` is the blocks left open so.
+fn rest() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        REST_IN_TEST.with(|r| r.get())
+    }
+    #[cfg(not(test))]
+    {
+        static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let us = *US.get_or_init(|| {
+            std::env::var("VICTORY_GUARD_REST")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(0, |us| if us == 1 { 3000 } else { us })
+        });
+        std::time::Duration::from_micros(us)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`rest`], for what this thread asks and opens.
+    static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
 /// Whether [`guard`] finds a range's blocks that are not clean off the
 /// clean blocks' bits (`VICTORY_GUARD_BITS=1`; off by default until
 /// measured), instead of collecting the range's clean blocks out of a tree
 /// to learn which are missing. The answers are the same; the counter
 /// `P_GUARD_BITS` is the clean blocks it passed over by words.
 fn guard_bits() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_some_and(|v| v == "1"))
+    #[cfg(test)]
+    {
+        BITS_IN_TEST.with(|b| b.get())
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_some_and(|v| v == "1"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`guard_bits`], for what this thread asks.
+    static BITS_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The guards' clean blocks, as a tree and as bits ([`blocks::Blocks`]),
@@ -1031,6 +1114,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize, why: Why, alias: bool) ->
         reprotect(block * BLOCK, BLOCK, PAGE_READWRITE, P_VP_OPEN);
         #[cfg(feature = "diagnostics")]
         g.why.insert(block, why as u8);
+        if matches!(why, Why::Fault) && !rest().is_zero() {
+            g.note_opened(block);
+        }
     }
     prep(if alias { P_OPENED_ALIAS } else { P_OPENED } + why as usize, blocks.len() as u64);
     !blocks.is_empty()
@@ -2141,6 +2227,77 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// With the clean blocks read off their bits ([`super::guard_bits`]):
+    /// the same answers. A write between two askings is told once; a write
+    /// through another view of the pages is told at the guarded one; the
+    /// blocks around a written one stay clean and are not told.
+    #[test]
+    fn askings_by_bits_tell_what_askings_by_tree_tell() {
+        const SIZE: usize = 5 * BLOCK;
+        for bits in [false, true] {
+            BITS_IN_TEST.with(|b| b.set(bits));
+            let (section, guarded, other) = two_views(SIZE);
+            let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+            assert_eq!(guard(guarded, guarded + SIZE), Some((0..5).map(pages).collect()), "bits {bits}");
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "bits {bits}");
+            // SAFETY: the guarded view; the handler opens the block.
+            unsafe { ((guarded + 2 * BLOCK + 8) as *mut u8).write(1) };
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(2)]), "bits {bits}");
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "told once, bits {bits}");
+            // Two blocks apart, one through the other view.
+            // SAFETY: both views of the section, opened by the handler.
+            unsafe {
+                ((guarded + 8) as *mut u8).write(2);
+                ((other + 4 * BLOCK + 8) as *mut u8).write(3);
+            }
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(4)]), "bits {bits}");
+            // A part of the range.
+            // SAFETY: as above.
+            unsafe { ((guarded + 3 * BLOCK) as *mut u8).write(4) };
+            assert_eq!(guard(guarded + BLOCK, guarded + 3 * BLOCK), Some(Vec::new()), "outside, bits {bits}");
+            assert_eq!(guard(guarded + 3 * BLOCK, guarded + 4 * BLOCK), Some(vec![pages(3)]), "bits {bits}");
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "bits {bits}");
+            drop_views(section, &[guarded, other], SIZE);
+        }
+        BITS_IN_TEST.with(|b| b.set(false));
+    }
+
+    /// A block a write fault opened rests ([`super::rest`]): told as written
+    /// at every asking while it rests, writes meanwhile included (no fault
+    /// tells them), and guarded by the first asking after, which a later
+    /// write is seen by.
+    #[test]
+    fn a_block_just_written_rests() {
+        const SIZE: usize = 2 * BLOCK;
+        for bits in [false, true] {
+            BITS_IN_TEST.with(|b| b.set(bits));
+            let rests = |on: bool| REST_IN_TEST.with(|r| r.set(std::time::Duration::from_secs(if on { 3600 } else { 0 })));
+            let (section, guarded, other) = two_views(SIZE);
+            let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
+            rests(true);
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+            // SAFETY: the guarded view; the handler opens the block.
+            unsafe { ((guarded + BLOCK + 8) as *mut u8).write(1) };
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "bits {bits}");
+            // Open: this write faults no more, and is told all the same.
+            // SAFETY: open since the fault.
+            unsafe { ((guarded + BLOCK + 16) as *mut u8).write(2) };
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "resting, bits {bits}");
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "still resting, bits {bits}");
+            rests(false);
+            // The rest over: told once more and guarded.
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "bits {bits}");
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "bits {bits}");
+            // SAFETY: guarded again; the handler opens it.
+            unsafe { ((guarded + BLOCK + 24) as *mut u8).write(3) };
+            assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]), "bits {bits}");
+            assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "bits {bits}");
+            drop_views(section, &[guarded, other], SIZE);
+        }
+        BITS_IN_TEST.with(|b| b.set(false));
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

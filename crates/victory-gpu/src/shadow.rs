@@ -881,6 +881,21 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 /// The 4 KiB pages of title memory what shaders wrote is put back by.
 const TITLE_PAGE: usize = 4 << 10;
 
+/// Whether only the 4 KiB pages of title memory whose bytes change are
+/// written back, not everything from the first to the last byte the card
+/// wrote in a 64 KiB piece (`VICTORY_BACK_PAGES=1`; off by default).
+///
+/// Measured on the viewtree Wine (2026-11-25, diagnostics, late world
+/// frames): of 77 MB a frame from the first to the last byte the card wrote
+/// in the 1,780 pieces that differ, 63 MB lie in pages whose bytes change;
+/// written 77 -> 63 MB a frame. Pages left alone are not opened either, so
+/// they are not noted as title writes, and no copy takes them again at its
+/// next refresh. The pieces mostly change all over: a small cut.
+pub(crate) fn back_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_PAGES").is_some_and(|v| v == "1"))
+}
+
 /// Merges `n` bytes that go to title address `address` page by page of
 /// title memory: `merge(lo, hi)` merges offsets `[lo, hi)` and says whether
 /// the result differs from the title's bytes there. The runs of pages that
@@ -926,9 +941,10 @@ fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
         add(C::BackSpanBytes, merged.len() as u64);
         add(C::BackPageBytes, runs.iter().map(|&(lo, hi)| (hi - lo) as u64).sum());
     }
-    let parts = [(0, merged.len())];
+    let whole = [(0, merged.len())];
+    let parts: &[(usize, usize)] = if back_pages() { runs } else { &whole };
     let mut written = 0;
-    for (lo, hi) in parts {
+    for &(lo, hi) in parts {
         let (at, bytes) = (address + lo, &merged[lo..hi]);
         #[cfg(feature = "diagnostics")]
         let opening = std::time::Instant::now();

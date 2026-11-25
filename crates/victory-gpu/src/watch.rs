@@ -880,28 +880,12 @@ pub fn title_memory_reading_now() -> Option<Reading> {
     }
 }
 
-/// The runtime was asked to map `[at, at + len)` as it is mapped already
-/// and left it so: views and protections stay. Its guarded blocks count as
-/// written once more, as a remapping made them (the next check copies them
-/// again, with no protection call: they are still read-only), so no copy
-/// is staler than with the remapping; that matters for a page shown at
-/// more than [`MANY_VIEWS`] views (the constant page the title maps over
-/// many), whose views are guarded one by one and a write through another
-/// view is not seen here. Placed textures there are told as for a
-/// remapping.
-pub fn title_memory_reshown(at: usize, len: usize) {
-    crate::descriptor::host::remapped(at, len);
-    let mut g = guards();
-    let blocks: Vec<usize> = g.clean.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
-    for block in blocks {
-        g.clean.remove(&block);
-    }
-}
-
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(crate::copystat::C::RemappedUs, std::time::Instant::now());
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -909,7 +893,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
     let mut g = guards();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::RemappedGuardWaitUs, waiting.elapsed().as_micros() as u64);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -923,6 +911,18 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+}
+
+/// Diagnostics: adds the time from its start to its drop to a counter.
+#[cfg(feature = "diagnostics")]
+struct Timed(crate::copystat::C, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        let c = std::mem::replace(&mut self.0, crate::copystat::C::RemappedUs);
+        crate::copystat::add(c, self.1.elapsed().as_micros() as u64);
     }
 }
 

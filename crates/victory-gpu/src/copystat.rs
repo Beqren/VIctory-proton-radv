@@ -180,6 +180,19 @@ pub(crate) enum C {
     PhysicalPages,
     PhysicalSame,
     PhysicalUs,
+    /// Inside the remaps: the runtime's memory calls (split, map, unmap of
+    /// views), and our notes of a remapping (`title_memory_remapped`), of
+    /// them waiting for the guards' lock; microseconds.
+    RemapSysCalls,
+    RemapSysUs,
+    RemappedUs,
+    RemappedGuardWaitUs,
+}
+
+/// A memory call of the runtime's remapping took `us`.
+pub fn remap_call(us: u64) {
+    add(C::RemapSysCalls, 1);
+    add(C::RemapSysUs, us);
 }
 
 /// A page mapping of the runtime (`alias`: the GPU's page-mapping copies,
@@ -197,7 +210,7 @@ pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
     add(t, us);
 }
 const COUNTERS: usize = 112;
-const _: () = assert!((C::PhysicalUs as usize) < COUNTERS);
+const _: () = assert!((C::RemappedGuardWaitUs as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1270,7 +1283,8 @@ pub(crate) fn log(frames: f64) {
          {:.1} ms of the title's frame waits fell in it; title memory's mapping lock: {:.0} remaps \
          waited {:.1} ms held {:.1} ms, {:.0} reads in place waited {:.1} ms held {:.1} ms; page \
          mappings: the GPU's {:.0} calls {:.0} pages ({:.0} already so) {:.1} ms, physical {:.0} \
-         calls {:.0} pages ({:.0} already so) {:.1} ms",
+         calls {:.0} pages ({:.0} already so) {:.1} ms; in them {:.0} memory calls {:.1} ms, our notes \
+         {:.1} ms ({:.1} ms waiting for the guards' lock)",
         c[C::KernelCalls as usize],
         ms(c[C::KernelUs as usize]),
         mb(c[C::KernelBytes as usize]),
@@ -1301,6 +1315,10 @@ pub(crate) fn log(frames: f64) {
         c[C::PhysicalPages as usize],
         c[C::PhysicalSame as usize],
         ms(c[C::PhysicalUs as usize]),
+        c[C::RemapSysCalls as usize],
+        ms(c[C::RemapSysUs as usize]),
+        ms(c[C::RemappedUs as usize]),
+        ms(c[C::RemappedGuardWaitUs as usize]),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

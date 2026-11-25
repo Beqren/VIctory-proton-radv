@@ -1028,6 +1028,26 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+impl Drop for HostHeap {
+    /// The title released its heap: what the slots viewed goes through the
+    /// graveyard (`crate::host::retire`), not at once. Lists recorded or in
+    /// flight that bound the heap hold the host heap object (`HostList::keep`)
+    /// but not what its descriptors view, and a shader reading a slot of it
+    /// would read freed memory (a texture-unit page fault).
+    fn drop(&mut self) {
+        let kept = std::mem::take(self.kept.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let mut n = 0u64;
+        for resource in kept.into_iter().flatten() {
+            n += 1;
+            crate::host::retire(resource);
+        }
+        if let Some((strides, ..)) = self.strides.take() {
+            crate::host::retire(strides);
+        }
+        tracing::info!(slots = n, "a host view heap is let go: what its slots viewed is retired");
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;

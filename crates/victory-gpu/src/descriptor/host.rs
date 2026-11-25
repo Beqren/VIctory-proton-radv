@@ -2526,6 +2526,14 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            if !later && !self.sampler && publish_later(&view) {
+                // Not now: a submission in the air may read this slot, and
+                // the texture's memory is newer than it ([`publish_later`]).
+                // The slot keeps what it shows; the write comes again with
+                // nothing in the air (`super::publish_deferred`).
+                super::defer_publish(handle);
+                return Some(view);
+            }
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -3060,6 +3068,50 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
+/// Whether a slot write that shows texture `view` waits for a moment with
+/// no submission in the air (`VICTORY_PUBLISH_SAFE`, on): it does while
+/// submissions are in the air and the texture's host copy was made less
+/// than [`FRESH_MS`] ago (or is made now, for this view).
+///
+/// Why: run play-va1 (2026-11-25, `VICTORY_TEXTURE_VA=1`) lost the device
+/// on texture-unit reads inside a LIVE host texture (a 4096x4096 BC1, at
+/// +0x21000 to +0x26000 of mip 0, permission fault: page table entry not
+/// valid) made 2,084 ms before the removal was detected, the moment the hung
+/// job began. Shaders read descriptors from the heap when they run, so a
+/// slot written while a submission is in the air changes what that running
+/// submission reads; a texture whose memory is newer than the submission is
+/// one the kernel may not have made valid for it. Every device loss of the
+/// day came a few seconds after new content (new textures) arrived.
+/// shortcut: "fresh" is counted in time, not against each submission's
+/// send.
+fn publish_later(view: &View) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PUBLISH_SAFE").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let texture = match view {
+        View::Shader(r, _) if !view.is_buffer() => *r,
+        View::Placed(false, ..) => match placed_texture(view) {
+            Some(View::Shader(r, _)) => r,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if !crate::host::flying() {
+        return false;
+    }
+    match crate::resource::host_age_ms(texture as crate::object::This) {
+        Some(age) => age < FRESH_MS,
+        None => false,
+    }
+}
+
+/// How new a texture's host copy is for [`publish_later`] (ms).
+const FRESH_MS: u64 = 3_000;
+
+/// Slot writes [`publish_later`] put off, and published since the start.
+pub(crate) static PUBLISH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// A texture view's description, for [`view_fits`].
 enum ViewRange<'a> {
     Shader(&'a mut D3D12_SHADER_RESOURCE_VIEW_DESC),

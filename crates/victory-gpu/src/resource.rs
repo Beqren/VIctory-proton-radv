@@ -1121,6 +1121,8 @@ pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     /// Its GPU address with `VICTORY_TEXTURE_VA` (0: not known).
     va: u64,
+    /// When it was made (`crate::host::now_ms`).
+    made_ms: u64,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
@@ -1414,6 +1416,17 @@ pub(crate) fn host_made<'a>(
     let (host, _) = hosted(this, false)?;
     // SAFETY: as in `host_resource`.
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+}
+
+/// How long ago title texture `this`'s host copy was made (ms), making it
+/// if it has none (then 0).
+#[cfg(windows)]
+pub(crate) fn host_age_ms(this: This) -> Option<u64> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, true)?;
+    Some(crate::host::now_ms().saturating_sub(host.made_ms))
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -1896,6 +1909,7 @@ impl HostTexture {
         HostTexture {
             texture,
             va,
+            made_ms: crate::host::now_ms(),
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,

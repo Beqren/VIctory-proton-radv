@@ -4640,12 +4640,14 @@ impl Host {
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
             sweep();
+            crate::descriptor::publish_deferred();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
             sweep();
+            crate::descriptor::publish_deferred();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();

@@ -37,6 +37,10 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// The worker that was making it ended in the middle ([`watch`]): it has
+    /// no host pipeline and never will. Kept apart from `made`, whose
+    /// initialisation that worker left running for ever.
+    died: AtomicBool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -108,6 +112,7 @@ impl Pending {
             graphics,
             left_out,
             begun: OnceLock::new(),
+            died: AtomicBool::new(false),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -131,6 +136,7 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.died.load(Ordering::Relaxed) => Some(format!("its worker ended {:?}", p.shaders)),
         None => Some(p.left_out.map_or_else(
             || format!("being made {:?}", p.shaders),
             str::to_owned,
@@ -211,7 +217,7 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() {
+    if p.left_out.is_some() || p.died.load(Ordering::Relaxed) {
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
@@ -229,7 +235,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    if p.left_out.is_some() {
+    // (Making one whose worker died would wait for that worker for ever.)
+    if p.left_out.is_some() || p.died.load(Ordering::Relaxed) || ends_workers(&p.shaders) {
         return false;
     }
     p.make();
@@ -303,7 +310,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() && !slow(p) {
+    while p.made.get().is_none() && !slow(p) && !p.died.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -388,6 +395,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
     if p.queue_state.load(Ordering::Relaxed) >= priority {
         return;
     }
+    if ends_workers(&p.shaders) {
+        p.died.store(true, Ordering::Relaxed);
+        return;
+    }
     if !workers() {
         if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
             p.make();
@@ -413,35 +424,123 @@ fn next() -> Arc<Pending> {
     }
 }
 
+/// What a worker is making now, for [`watch`].
+type Slot = Arc<Mutex<Option<Arc<Pending>>>>;
+
+/// Hashes of shaders whose host pipeline ended the worker that was making
+/// it: pipelines with one of them are not tried again in this run.
+static ENDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether one of `shaders` ended a worker before.
+fn ends_workers(shaders: &[Arc<Shader>]) -> bool {
+    let ended = ENDED.lock().unwrap_or_else(|e| e.into_inner());
+    !ended.is_empty() && shaders.iter().any(|s| ended.contains(&s.hash))
+}
+
+fn worker(i: usize, slot: Slot) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .spawn(move || {
+            // Below the title's own threads (loading, recording).
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            loop {
+                let p = next();
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
+                p.make();
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        })
+}
+
+/// Whether the thread has ended, by its handle: a thread ended from outside
+/// its own code never reports through the standard library.
+fn ended(thread: &std::thread::JoinHandle<()>) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    // SAFETY: the handle is the join handle's own, open while it lives.
+    unsafe { WaitForSingleObject(HANDLE(thread.as_raw_handle().cast()), 0) == WAIT_OBJECT_0 }
+}
+
+/// Looks for workers that ended while making a pipeline, gives the pipeline
+/// up and starts a worker in the place of each.
+///
+/// A worker never ends by itself, and on Windows a fault in the host's
+/// pipeline creation ends the process. Under Wine a stack that overflows
+/// inside the host call ends only the thread, without a word: vkd3d-proton's
+/// DXIL converter recurses without end on three of the title's compute
+/// programs (559d9f0184e15fe3, a1b20bc47e3c9597, e8c962358d862e3f; Proton
+/// Experimental of 2026-11-12 and GE-Proton11-14; a 64 MiB stack overflowed
+/// as the 2 MiB one did). Their pipelines then stayed "being made" for the
+/// rest of the run with a worker lost for each.
+fn watch(mut threads: Vec<(std::thread::JoinHandle<()>, Slot)>) {
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        for (i, (thread, slot)) in threads.iter_mut().enumerate() {
+            if !ended(thread) {
+                continue;
+            }
+            let making = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(p) = making {
+                let shaders: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+                tracing::warn!(
+                    ?shaders,
+                    worker = i,
+                    "a pipeline worker ended while making a host pipeline (under Wine: a stack overflow in the host's shader converter); the pipeline is given up and its draws or dispatches are dropped"
+                );
+                ENDED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(p.shaders.iter().map(|s| s.hash.clone()));
+                p.died.store(true, Ordering::Relaxed);
+                {
+                    let (lock, done) = &DONE;
+                    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    done.notify_all();
+                }
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                }
+            } else {
+                tracing::warn!(worker = i, "a pipeline worker ended");
+            }
+            match worker(i, slot.clone()) {
+                Ok(new) => *thread = new,
+                Err(e) => tracing::warn!(error = %e, worker = i, "no pipeline worker in its place"),
+            }
+        }
+    }
+}
+
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
-        let mut running = false;
+        let mut threads = Vec::new();
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
+            let slot = Slot::default();
+            match worker(i, slot.clone()) {
+                Ok(thread) => threads.push((thread, slot)),
+                Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
+            }
+        }
+        let running = !threads.is_empty();
+        if running {
+            let watching = std::thread::Builder::new()
+                .name("victory-pipelines-watch".into())
+                .spawn(move || watch(threads));
+            if let Err(e) = watching {
+                tracing::warn!(error = %e, "pipeline workers are not watched");
             }
         }
         running

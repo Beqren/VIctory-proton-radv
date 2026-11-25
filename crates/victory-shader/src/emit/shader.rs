@@ -198,6 +198,13 @@ pub(crate) struct Shader {
     /// A pixel shader the console runs in primitive order: its heap UAVs
     /// are rasterizer-ordered views.
     pub ordered: bool,
+    /// Every UAV handle is globally coherent (`globallycoherent`, property
+    /// bit 14): a compute program whose waves exchange data through memory
+    /// they write between group barriers ([`super::lower`], `coherent_uavs`).
+    pub coherent_uavs: bool,
+    /// 16-bit integer typed UAV loads read through the slot's raw view
+    /// (`super::lower`, `raw_typed_loads_on`).
+    pub raw_typed_loads: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -259,6 +266,8 @@ impl Shader {
             flags: 0,
             nonuniform_handles: 0,
             ordered: false,
+            coherent_uavs: false,
+            raw_typed_loads: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -393,7 +402,8 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let props0 = if self.coherent_uavs { 11 | 0x1000 | 0x4000 } else { 11 | 0x1000 };
+        let h = self.annotate(block, h, props0, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -449,6 +459,12 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        // UAVs globally coherent where the program asks for it.
+        let props = if self.coherent_uavs && props.0 & 0x1000 != 0 {
+            (props.0 | 0x4000, props.1)
+        } else {
+            props
+        };
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)

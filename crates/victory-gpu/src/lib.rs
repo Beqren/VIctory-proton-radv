@@ -26,6 +26,8 @@ pub mod device;
 mod draw;
 #[cfg(windows)]
 mod evict;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod graphdump;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

@@ -87,6 +87,8 @@ mod diff_tests;
 #[cfg(all(test, windows))]
 mod d16_view_tests;
 #[cfg(all(test, windows))]
+mod formula_replay_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -810,6 +812,15 @@ mod tests {
     use super::parse_loop_limit;
 
     #[test]
+    #[ignore]
+    fn translate_file_from_env() {
+        let Some(p) = std::env::var_os("VICTORY_TRANSLATE_FILE") else { return };
+        let bytes = std::fs::read(p).unwrap();
+        let r = super::translate(&bytes);
+        eprintln!("translated: {}", r.is_ok());
+    }
+
+    #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let all = super::bitcode::opt::ALL;
         assert_eq!(parse_shader_opt(None), all);
@@ -935,6 +946,77 @@ mod tests {
 
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
     fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+        stores_v1_dxil(body).map(|_| ())
+    }
+
+    /// Packed 16-bit float results round to nearest even, as the console's do (the
+    /// face network's programs set MODE to it): `v_pk_add_f16` lowered by default as with
+    /// `VICTORY_F16_NEAREST=1`, which adds the rounding steps to the host's `f32tof16`
+    /// (toward zero on RADV and NVIDIA). The packed path used the host's conversion
+    /// whatever the switch, and the switch was off by default.
+    #[test]
+    fn packed_half_results_round_to_nearest_by_default() {
+        // v_pk_add_f16 v1, v0, v0
+        let body = [0xCC0F_4001u32, 0x1802_0100];
+        let p = ir::build(
+            &body.iter().chain(&[0xBF81_0000u32]).flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>(),
+            true,
+            4,
+        )
+        .unwrap();
+        assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "v_pk_add_f16"));
+        let with = |on: Option<bool>| {
+            let was = super::lower::TEST_F16_NEAREST.replace(on);
+            let r = stores_v1_dxil(&body);
+            super::lower::TEST_F16_NEAREST.set(was);
+            r.unwrap()
+        };
+        let (default, on, off) = (with(None), with(Some(true)), with(Some(false)));
+        assert_ne!(on, off, "the packed path ignores the rounding switch");
+        assert_eq!(default, on, "packed results are not rounded to nearest by default");
+    }
+
+    /// A program whose waves pass values through a UAV between group
+    /// barriers (a load after `s_barrier` of what other waves stored) gets
+    /// globally coherent UAVs with `VICTORY_COHERENT_UAVS=1`; one without a
+    /// barrier does not.
+    #[test]
+    fn uavs_read_after_a_group_barrier_are_globally_coherent() {
+        // s_barrier; buffer_load_dword v1, v0, s[8:11], 0 offen; s_waitcnt vmcnt(0)
+        let with = [0xBF8A_0000u32, 0xE030_1000, 0x8002_0100, 0xBF8C_3F70];
+        let without = [0xE030_1000u32, 0x8002_0100, 0xBF8C_3F70];
+        let lowered = |body: &[u32], on: Option<bool>| {
+            let was = super::lower::TEST_COHERENT_UAVS.replace(on);
+            let r = stores_v1_dxil(body);
+            super::lower::TEST_COHERENT_UAVS.set(was);
+            r.unwrap()
+        };
+        assert_ne!(lowered(&with, Some(true)), lowered(&with, Some(false)), "the switch changes nothing");
+        assert_eq!(lowered(&without, Some(true)), lowered(&without, Some(false)), "coherent without a barrier");
+    }
+
+    /// A program that stores to UAVs and synchronises its group reads 16-bit
+    /// typed views through the slot's raw view as well (the face network's
+    /// Formula program read stale registers through its typed view on the
+    /// host); without a barrier it does not.
+    #[test]
+    fn typed_16_bit_loads_after_a_group_barrier_read_the_raw_view_by_default() {
+        // s_barrier; buffer_load_format_d16_x v1, v0, s[8:11], 0 idxen; s_waitcnt vmcnt(0)
+        let with = [0xBF8A_0000u32, 0xE200_2000, 0x8002_0100, 0xBF8C_3F70];
+        let without = [0xE200_2000u32, 0x8002_0100, 0xBF8C_3F70];
+        let lowered = |body: &[u32], on: Option<bool>| {
+            let was = super::lower::TEST_RAW_TYPED_LOADS.replace(on);
+            let r = stores_v1_dxil(body);
+            super::lower::TEST_RAW_TYPED_LOADS.set(was);
+            r.unwrap()
+        };
+        assert_ne!(lowered(&with, None), lowered(&with, Some(false)), "typed loads only by default");
+        assert_eq!(lowered(&with, None), lowered(&with, Some(true)));
+        assert_eq!(lowered(&without, None), lowered(&without, Some(false)), "raw loads without a barrier");
+    }
+
+    /// [`stores_v1`]'s translation.
+    fn stores_v1_dxil(body: &[u32]) -> Result<Vec<u8>, ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -977,7 +1059,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        emit(&c, &native, &p, &st, &io, &res).map(|out| out.dxil)
     }
 
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`

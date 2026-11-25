@@ -420,6 +420,116 @@ dispatch in a window of frames), the mapping pass's delta indices (an index off
 by one gives each vertex a neighbour's delta of the right size), and what the
 network's inputs (face controls) hold.
 
+Checked offline on real data (branch face-ref, 2026-11-25; dump run with
+`VICTORY_GRAPH_DUMP=1020,1,<folder>`, which copies the network's 24 MB arena on
+the card before each of its dispatches, every other view at first sight, and the
+extract's, mapping's and skinning's views before and after; scripts and dumps in
+/tmp/victory-faceref):
+
+- The deltas land on the right vertices. For each of the six heads the extract
+  ran in frame 1020, map, base positions (24/24/16-bit packed, mode 0) and the
+  network output as the extract read them: the deltas as indexed (`3 * (map >>
+  16) + constant word 15`) form a smooth field (median distance to the mean of
+  the 8 nearest vertices' deltas 0.06-0.21 of the median delta), every
+  re-indexing is rougher (delta index -1/+1: 0.6-1.3; a half off: 0.19-0.72;
+  4 or 6 halves a vertex: 1.2-5.3), and the field is anatomical: zero on the
+  skull, largest on lips and jaw, brows, eyelids. So the network computes the
+  wrong expression; the indexing is not it. Head seq 55: jaw and lips moved 5 cm.
+- Ops matched against CPU models of their console code, dispatch by dispatch:
+  VecMatMulAligned (40 dispatches), AddBroadcastAligned, Silu, MatMulAligned,
+  and the copies (Gather, SliceCopy, ConcatAligned, Zero) write values of their
+  inputs where expected. Every result is the exact value rounded to 16 bits, but
+  rounded toward zero: all 6,400 results of an AddBroadcastAligned dispatch equal
+  the toward-zero rounding of the exact sum, 41% of them a last place below the
+  nearest; matrix products came out 0.6% small (fitted gain 0.9937, the error
+  correlated -0.92 with the value). The host's `f32tof16` rounds toward zero on
+  RADV as on NVIDIA; the programs set MODE's f16 rounding to nearest. Fixed
+  (6bb83c5): every 16-bit float result is rounded to nearest even
+  (`f16_nearest`; `VICTORY_F16_NEAREST=0` gives the host's conversion back),
+  packed `v_pk_*` results included, which the switch never reached.
+- That was not the cause: with it (run confirm1, captures
+  /tmp/victory-faceref/cap1, `VICTORY_TABLE_SLOT_WORDS=1`) mouths are still
+  agape and teeth float under the nose (frame 938); eyes are normal. Not
+  checked: everything after the first ~225 dispatches of the network (frame
+  1020's recording began mid-network and the skinning's 32 MB views used the
+  copy room in frame 1021): Formula (the face controls, its output is read
+  only after it is overwritten), Gather/GatherAligned with 32-bit indices made of
+  two halves, TransposeVecMatMulAligned (a wave64 f16 sum the translator lowers
+  in single precision, `half_sum_here`), SmallMatMul, Scatter, Place, Mult, Add.
+  Next: a dump window that starts at a frame's first network dispatch, without
+  the skinning's copies, to check those.
+
+Second round (same branch; dump by network pass, `VICTORY_GRAPH_DUMP=1020,1,<dir>`,
+`VICTORY_GRAPH_DUMP_LIGHT`; run dump3 for pass 0, 851 dispatches, 4 heads; run
+watch for who writes the controls):
+
+- Every op after Formula matches a CPU model of its console code, pass 0: Gather
+  and GatherAligned (32-bit indices from two halves: exact), Scatter (exact),
+  Place/PlaceAdd (aligned or not), Mult, Add, SmallMatMul (aligned or not),
+  TransposeVecMatMulAligned (the `v_readlane 32` wave sum and its single-precision
+  shortcut: within 0.07%), and the five final Gathers into the output buffer
+  (exact, all 5 x 15,462 halves). Not modelled: SliceCopy, Concat(Aligned), one
+  VecMatMul.
+- The controls come in right. The Formula's input (three buffers in turn, 27 KB)
+  holds the same bytes on the card as in title memory at each pass. Of its 43
+  blocks of 160 halves, the 4 of the heads in view change every frame, smoothly,
+  as speech (values 0-0.75). The other blocks stay the same per buffer, and the
+  title writes nothing there (run watch: no copies, no other dispatch touches
+  them, only 21-24 of 429 pieces change between presents). They are probably
+  characters not animated. So the bug is not upstream of the network.
+- Formula (0aa7934094794dbf, the face controls) is the one op that disagrees. It
+  is an interpreter: 1,024 threads, 12 stages with a barrier between them,
+  registers in the arena (an R16 view), and ops copy, add, sub, mul, div, abs,
+  neg, min, max, sin, cos, tan and sqrt. A CPU model of its console code
+  reproduces the register file's set-up exactly and stages 0-2 exactly. From
+  stage 3 on it differs: 108 of the 440 controls the next op (Clamp) reads, and
+  148 registers. The first disagreement is a stage-3 read that saw a register's
+  stage-0 value where another wave's stage-2 write should have landed. That
+  fits a missed barrier, or a stale vector cache across the WGP. Making UAVs
+  globally coherent for such programs (`VICTORY_COHERENT_UAVS=1`, 926cc9b, off
+  by default) left the faces torn (run confirm2, captures
+  /tmp/victory-faceref/cap2, frame 948). Either the CPU model is wrong somewhere,
+  or the cause is not cache coherence (the barrier itself, or an instruction in
+  the interpreter's decode).
+- Next: replay Formula alone on the GPU, from the dumped program, input and
+  arena, with the stage count in its header (half 43) cut to 1, 2, 3... That
+  gives the card's register file after each stage, to compare with the model.
+  Then check the barrier's lowering, and dxil-spirv's semantics for typed UAVs.
+
+Replay (5f74661: `formula_replay`, an ignored Windows test run under Proton with
+`VICTORY_FORMULA_DIR`, from dump3's buffers; scripts in /tmp/victory-faceref,
+`replay_var.sh`, `cmp_replay.py`):
+
+- The replay reproduces the title's result: its registers after 12 stages differ
+  from the title run's card in 2 places, and from the model in 63 to 119.
+  Against the model, stage by stage: stage 0 and stage 1 are identical. After
+  stage 2, 1 register differs; after stage 4, 17; after stage 6, 52.
+- The first difference is register 1524 (q20, lane 4, stage 1, a multiply of
+  registers 196 and 1024). The card multiplied the new value of register 1024
+  by the pre-dispatch value of register 196 (0.00937). Thread 0 overwrote 196
+  with 0.4905 in stage 0, and the card's register file after stage 0 holds
+  0.4905 there. So the read after the barrier returned a value already
+  overwritten before it.
+- The barrier is translated as a group-wide execution barrier (DXIL op 80, mode
+  sync | UAV global fence | group-shared fence; HLSL's
+  `AllMemoryBarrierWithGroupSync`). There is one in this program, and the
+  translation adds none. It does synchronise: with `VICTORY_GROUP_SYNC=0` (no
+  waits), 93 registers differ after stage 2 instead of 1.
+- Changed nothing, all deterministic: globally coherent UAVs
+  (`VICTORY_COHERENT_UAVS=1`), barrier modes 1|4|8 and 1|2|4|8, the translator's
+  clean-up passes off (`VICTORY_SHADER_OPT=0`), RADV's LLVM backend
+  (`RADV_DEBUG=llvm`), and porting upstream c4ee3d2 (`v_fma_f16` rounded once)
+  and f3578e3 (f16 inline constants in the wave-sum simulation).
+  `RADV_PERFTEST=cswave32` changes the result (12 registers after stage 2), so it
+  depends on how lanes form waves.
+- `VICTORY_FORMULA_WARP=1` gave the same numbers as the hardware. Unverified that
+  WARP really ran: vkd3d-proton may not have a WARP adapter.
+- Open: a stale read that no fence or coherence flag changes. Either the CPU model
+  misreads which stage an instruction belongs to, or a wave passes the barrier
+  before another has finished its stores. Next: an exact console emulator of these
+  ~150 instructions on the dump, as the referee, or the per-stage split (one
+  dispatch per stage) the coordinator proposed, as an experiment.
+
 Quad reads through quad reads in pixel programs (upstream 4015a18, the same lowering
 as 8487caf; branch d16-pack-quad) made skin plastic and glossy again: not merged.
 

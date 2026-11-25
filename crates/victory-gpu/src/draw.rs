@@ -355,6 +355,10 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Textures made in the reserve band on a full card (`starved`).
 pub(crate) static HEAP_TEXTURES_RESERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Since the start: slots draws asked for (`State::note_asked`), and
+/// textures made for such slots on a full card.
+pub(crate) static HEAP_TEXTURES_ASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether a pass on a full card serves the slots written longest ago
 /// first and lets those due for some frames take the reserve band
 /// (`crate::resource::reserve_room`); `VICTORY_TEXTURE_STARVED=0`: no, as
@@ -1006,6 +1010,7 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         if !compute {
+            self.note_asked(p);
             self.early_textures(list, p);
         }
         // Heaps first: a root signature with directly indexed heaps must be
@@ -1616,6 +1621,82 @@ impl State {
         }
     }
 
+    /// Notes the texture slots a draw of the title's character shaders
+    /// asks for by index ([`HostHeap::texture_slot_asked`]): those shaders
+    /// take their textures' heap slots from a material record, at the byte
+    /// offset the draw's constants (table 1, dword 56) hold at 0x1c, of the
+    /// buffer at table 0, dword 160 (as fxceless found from their native
+    /// code, victory-fork 310c6eb; `VICTORY_LIST_SLOTS` lists them). The
+    /// first 16 words of the record name the colour, normal and other maps.
+    /// shortcut: only shaders that read those two table entries are seen;
+    /// the slots other shaders pick by index are not known on the host.
+    /// `VICTORY_TEXTURE_ASKED=0`: nothing noted.
+    fn note_asked(&self, p: &HostPipeline) {
+        const MATERIALS: u32 = 160;
+        const DRAW_CONSTANTS: u32 = 56;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED").is_none_or(|v| v != "0")) {
+            return;
+        }
+        let Some(stage) = p.stages.iter().find(|s| s.shader.stage == "pixel") else {
+            return;
+        };
+        let t = stage.translated();
+        let uses = |slot: u8, dwords: u32| {
+            t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == dwords)
+        };
+        if !uses(0, MATERIALS) || !uses(1, DRAW_CONSTANTS) {
+            return;
+        }
+        let entry = |slot: u8, dwords: u32| -> Option<View> {
+            let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(dwords) * 4)
+        };
+        let Some(View::Constant(constants, size)) = entry(1, DRAW_CONSTANTS) else {
+            return;
+        };
+        let mut word = [0u8; 4];
+        if size < 0x20 || !crate::host::read_into((constants + 0x1c) as *const u8, &mut word) {
+            return;
+        }
+        let at = u64::from(u32::from_le_bytes(word));
+        let Some((base, len)) = entry(0, MATERIALS).as_ref().and_then(crate::descriptor::host::buffer_range) else {
+            return;
+        };
+        let mut record = [0u8; 64];
+        if at + 64 > len || !crate::host::read_into((base + at) as *const u8, &mut record) {
+            return;
+        }
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let frame = crate::frame::current();
+        for w in record.chunks_exact(4) {
+            let index = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            if index != 0
+                && heap
+                    .handle(index)
+                    .and_then(crate::descriptor::view)
+                    .as_ref()
+                    .is_some_and(crate::descriptor::host::is_texture_view)
+            {
+                host.texture_slot_asked(index, frame);
+                HEAP_TEXTURES_ASKED[0].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn early_textures(&self, list: &HostList, p: &HostPipeline) {
         let bake = bake_probe(p);
         #[cfg(feature = "diagnostics")]
@@ -1752,7 +1833,9 @@ impl State {
         // due for `STARVED` frames or more may still take the reserve band
         // (`resource::reserve_room`), at most `RESERVE_BYTES` a pass.
         let starving = !room && starved();
-        let reserve = starving && crate::resource::reserve_room();
+        let reserve = starving && crate::resource::reserve_room(false);
+        let mut asked_room: Option<bool> = None;
+        const ASKED_BYTES: u64 = 32 << 20;
         const STARVED: u64 = 8;
         const RESERVE_BYTES: u64 = 64 << 20;
         let (due, census) = if starving {
@@ -1872,11 +1955,19 @@ impl State {
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.
-            // The reserve band: a slot that has waited `STARVED` frames.
-            let admitted = reserve
-                && written.saturating_add(STARVED) <= frame
-                && SPENT.load(Ordering::Relaxed).saturating_sub(spent_before) < RESERVE_BYTES;
-            if admitted {
+            // The reserve band: a slot that has waited `STARVED` frames;
+            // a slot a draw asked for lately up to the edge of the budget
+            // (`resource::reserve_room(true)`), at most `ASKED_BYTES` a pass.
+            let spent = SPENT.load(Ordering::Relaxed).saturating_sub(spent_before);
+            let asked = starving
+                && spent < ASKED_BYTES
+                && host.texture_slot_asked_lately(index, frame, crate::descriptor::host::ASKED_FRAMES)
+                && *asked_room.get_or_insert_with(|| crate::resource::reserve_room(true));
+            let admitted = asked
+                || reserve && written.saturating_add(STARVED) <= frame && spent < RESERVE_BYTES;
+            if asked {
+                HEAP_TEXTURES_ASKED[1].fetch_add(1, Ordering::Relaxed);
+            } else if admitted {
                 HEAP_TEXTURES_RESERVED.fetch_add(1, Ordering::Relaxed);
             }
             if !room && !admitted {

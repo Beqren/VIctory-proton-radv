@@ -1420,8 +1420,12 @@ pub(crate) fn room() -> bool {
 /// due from frame 835, were still waiting at frame 866 among some 9,000
 /// due slots, and her face was black. The band is a share of the same
 /// budget, so the system does not move memory out because of it.
+/// `asked`: for the textures draws asked for lately, the edge of the
+/// budget instead (99%): they are a few MB a frame (the head's three maps
+/// are 3.2 MB), and in run E the card stood at 97% of its budget for
+/// minutes, past the reserve, with the head's normal map still waiting.
 #[cfg(windows)]
-pub(crate) fn reserve_room() -> bool {
+pub(crate) fn reserve_room(asked: bool) -> bool {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let percent = *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_RESERVE_PERCENT")
@@ -1432,6 +1436,7 @@ pub(crate) fn reserve_room() -> bool {
     if percent <= 90 || std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
         return false;
     }
+    let percent = if asked { 99 } else { percent };
     match crate::host::host().and_then(|h| h.video_memory()) {
         Some([budget, used, ..]) => used < budget / 100 * percent,
         None => false,

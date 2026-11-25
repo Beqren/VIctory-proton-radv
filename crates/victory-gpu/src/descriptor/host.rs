@@ -81,6 +81,10 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// Per title slot: 1 + the frame a draw last asked for the texture
+    /// there by index, as far as the host can tell (`draw.rs`,
+    /// `note_asked`); 0: never. The pass on a full card serves these first.
+    asked: Vec<std::sync::atomic::AtomicU32>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -115,6 +119,9 @@ pub(crate) struct Spans {
     sizes: std::collections::HashMap<([u32; 14], u32), Option<u64>>,
 }
 
+/// The frames a draw's asking for a slot counts ([`HostHeap::texture_slot_asked`]).
+pub(crate) const ASKED_FRAMES: u32 = 8;
+
 /// When a view the title writes makes an older view of other memory stale
 /// (from victory-fork 310c6eb, written anew on this fork's spans).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -130,11 +137,11 @@ pub(crate) enum Rule {
     /// every such view took its neighbours out of the queue for good, and
     /// their host slots showed what they had then: here 38,356 slots made
     /// stale in three minutes of the opening, 13,523 of them by a view
-    /// that starts 4 KiB or more away (2026-11-25, run 1). Not shown to
-    /// help: the face that was black stayed black ([`stale_rule`]).
+    /// that starts 4 KiB or more away (2026-11-25, run 1). The default
+    /// ([`stale_rule`]).
     #[default]
     Start,
-    /// Whenever their spans overlap: the default ([`stale_rule`]).
+    /// Whenever their spans overlap. `VICTORY_STALE_TEXTURES=overlap`.
     Overlap,
     /// Never; a view that would be stale under [`Rule::Overlap`] is left
     /// out of the spans instead. `VICTORY_STALE_TEXTURES=0`.
@@ -323,25 +330,24 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 pub(crate) static STALE_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// When a view the title writes makes older views of other memory stale
-/// ([`Rule`]): wherever their spans overlap, by default;
-/// `VICTORY_STALE_TEXTURES=start`: where it starts within 4 KiB of theirs;
-/// `VICTORY_STALE_TEXTURES=0`: never.
+/// ([`Rule`]): where it starts within 4 KiB of theirs, by default;
+/// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, the rule
+/// before; `VICTORY_STALE_TEXTURES=0`: never.
 ///
-/// The main character's face and neck were black in the opening's
-/// close-ups under the overlap rule (2026-11-25, runs f1, on2 and the
-/// owner's capture) and under the 4 KiB rule (run f4: 42,974 slots made
-/// stale, all by a view that starts within 4 KiB). With no view made stale
-/// and `VICTORY_NULL_MAGENTA=1` (run f2) the head was magenta where the
-/// arms beside it were skin: a colour slot of the head's material is null
-/// at its draw whatever this rule says, so the rule is not shown to matter.
-/// (The tests keep the 4 KiB rule: they are about it.)
+/// The slot listing of the main character's head (`VICTORY_LIST_SLOTS`,
+/// 2026-11-25): under the overlap rule its 1024x1024 colour map (slot 40964
+/// of the material record at 0x27600, run D) was made stale and stayed
+/// null; under this rule the same map (slot 98036 of the record at 0xf000,
+/// run E) stayed queued and was made. Slots passed over because their
+/// memory was not mapped, the sign of neighbours taken for one another:
+/// 282 under the overlap rule (run f1), 509 and 860 under this one (runs E
+/// and f4), 36,775 with none made stale (run f2).
 fn stale_rule() -> Rule {
     static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
-        Ok("start") => Rule::Start,
+        Ok("overlap") => Rule::Overlap,
         Ok("0") => Rule::Never,
-        _ if cfg!(test) => Rule::Start,
-        _ => Rule::Overlap,
+        _ => Rule::Start,
     })
 }
 
@@ -564,16 +570,16 @@ impl TextureQueue {
     /// first, with the frame each was written in: the order of a pass while
     /// the card is at its limit (`draw.rs`, `starved`), where what is
     /// admitted at all goes to the slots that have waited longest.
-    fn due_oldest(&self, frame: u64, max: usize) -> Vec<(u32, u64, u64)> {
-        let mut due: Vec<(u64, u64, u32)> = self
+    fn due_oldest(&self, frame: u64, max: usize, asked: impl Fn(u32) -> bool) -> Vec<(u32, u64, u64)> {
+        let mut due: Vec<(bool, u64, u64, u32)> = self
             .slots
             .iter()
             .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (w.written, w.write, index))
+            .map(|(&index, w)| (!asked(index), w.written, w.write, index))
             .collect();
         due.sort_unstable();
         due.truncate(max);
-        due.into_iter().map(|(written, write, index)| (index, write, written)).collect()
+        due.into_iter().map(|(_, written, write, index)| (index, write, written)).collect()
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -877,6 +883,9 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            asked: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             placed: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -1033,11 +1042,28 @@ impl HostHeap {
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
 
+    /// A draw asks for the texture at title slot `index` in `frame`.
+    pub(crate) fn texture_slot_asked(&self, index: u32, frame: u64) {
+        if let Some(stamp) = self.asked.get(index as usize) {
+            stamp.store((frame as u32).wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a draw asked for the texture at title slot `index` within
+    /// the `frames` frames before `frame`.
+    pub(crate) fn texture_slot_asked_lately(&self, index: u32, frame: u64, frames: u32) -> bool {
+        self.asked.get(index as usize).is_some_and(|stamp| {
+            let stamp = stamp.load(std::sync::atomic::Ordering::Relaxed);
+            stamp != 0 && (frame as u32).wrapping_add(1).wrapping_sub(stamp) <= frames
+        })
+    }
+
     /// [`HostHeap::texture_slots_due`] in the order of a pass on a full
     /// card ([`TextureQueue::due_oldest`]): slot, write, frame written.
     pub(crate) fn texture_slots_due_oldest(&self, frame: u64, max: usize) -> (Vec<(u32, u64, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (textures.due_oldest(frame, max), textures.census(frame))
+        let asked = |index: u32| self.texture_slot_asked_lately(index, frame, ASKED_FRAMES);
+        (textures.due_oldest(frame, max, asked), textures.census(frame))
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)

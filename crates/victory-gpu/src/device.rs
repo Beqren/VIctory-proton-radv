@@ -346,16 +346,28 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
-/// pipeline would hand the title whatever its stack held as an object.
+/// Device methods 0x1c8 and 0x218 (`SLOT`): the title's cache of
+/// precompiled pipelines, `(this, description, interface id, out)` for
+/// `ID3D12PipelineState`. A description is the root signature, then
+/// pointer and size pairs: header blobs, then per stage native code already
+/// in graphics memory and its metadata (two stages for 0x1c8, one for
+/// 0x218; no shader container, so nothing our translator can read).
+///
+/// A failure costs nothing (run of 2026-11-24, title of April 2026):
+/// - 0x218 (title+0x24800d5, from title+0x247fe25): on a null result the
+///   title creates the same compute pipeline through 0x1f0.
+/// - 0x1c8 (title+0x2477578): a startup job that fills the cache; a failure
+///   leaves the entry out. The lookup at draw time (title+0x2479f40) then
+///   misses and the title creates the pipeline from a stream (0x2b0). On a
+///   hit it would call 0x1b8 (not written) to make a variant with other
+///   render state, and read its out slot without checking the result, so
+///   0x1c8 must not succeed before 0x1b8 does.
+///
+/// All calls come in the first second of a run (16,384 and 2,048 of them);
+/// that run dropped no draw for want of a pipeline object ("no pipeline
+/// set" never counted).
+/// shortcut: not implemented, on purpose. Answering `S_OK` here without
+/// making the pipeline would hand the title whatever its stack held.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -388,12 +400,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
+        tracing::debug!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            "a precompiled pipeline refused: the title makes it the plain way"
         );
     }
     E_NOTIMPL

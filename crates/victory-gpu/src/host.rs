@@ -3452,7 +3452,7 @@ impl Host {
     /// whatever was sent meanwhile, so it may bring a later flight's
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
-    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>, marks: &MarkView) {
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3472,6 +3472,10 @@ impl Host {
                     .flat_map(|r| {
                         (0..r.span.pieces).map(move |p| {
                             let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                        if r.compared && flagged {
+                            let (lo, _) = r.shadow.card_piece(&r.span, p);
+                            crate::shadow::check_card_piece(&r.shadow, lo, marks.bits.as_deref(), &marks.unmarked);
+                        }
                             (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
                         })
                     })
@@ -3595,13 +3599,15 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
-                let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
-                let mut back: Vec<Declared> = Vec::new();
                 let mut view = MarkView::default();
                 for flight in &flights {
                     view.add(flight.marks.as_ref(), &flight.unmarked, &flight.writers);
                     view.landed = view.landed.max(flight.number);
+                }
+                let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                self.relay_card_back(&plans, fetch, &view);
+                let mut back: Vec<Declared> = Vec::new();
+                for flight in &flights {
                     for (shadow, ranges) in &flight.back {
                         match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                             Some((_, all)) => {

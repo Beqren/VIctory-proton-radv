@@ -3328,8 +3328,11 @@ pub(crate) fn view_writes() -> Option<u64> {
 /// pieces, and compared whole (a writer that does not mark); with `check`,
 /// pieces that differed although unmarked; submissions with and without
 /// their marks taken; with `check`, pieces that differed in copies all of
-/// whose writers marked (marked or not), and in other copies.
-pub(crate) static MARK_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// whose writers marked (marked or not), and in other copies; pieces the
+/// compare on the card flagged in copies in the card's memory all of whose
+/// writers marked, and of them those not marked (no copy-back is cut by
+/// marks there: a check of the marking only).
+pub(crate) static MARK_STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Page marks, with `check`: unmarked pieces that differed, over the run.
 pub(crate) static MARK_MISSES: AtomicU64 = AtomicU64::new(0);
@@ -3344,7 +3347,8 @@ pub(crate) fn marks_line(frames: f64) {
         "page marks per frame: {:.1} MB of declared ranges not compared (unmarked), {:.1} ranges cut to marked pieces, \
          {:.1} compared whole (a writer that does not mark); {:.1} submissions took their marks, {:.1} did not; \
          check: {:.1} unmarked pieces differed ({} in the run) of {:.1} that differed in copies all of whose writers mark, \
-         {:.1} differed in other copies",
+         {:.1} differed in other copies; on the card: {:.1} of {:.1} flagged pieces unmarked (with check, \"not compared\" is \
+         what would not have been)",
         c[0] / (1 << 20) as f64,
         c[1],
         c[2],
@@ -3354,6 +3358,8 @@ pub(crate) fn marks_line(frames: f64) {
         MARK_MISSES.load(Ordering::Relaxed),
         c[6],
         c[7],
+        c[9],
+        c[8],
     );
 }
 
@@ -3371,7 +3377,19 @@ pub(crate) fn cut_to_marks(
     let Some(bits) = bits else {
         return work;
     };
-    if marks_mode() != 1 {
+    if marks_mode() == 0 {
+        return work;
+    }
+    if marks_mode() == 2 {
+        // Check: what would not be compared, counted; everything is.
+        for (shadow, address, end) in &work {
+            if shadow.place.is_some() || !has_marks(shadow) || unmarked.contains(&(Arc::as_ptr(shadow) as usize)) {
+                continue;
+            }
+            let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+            let kept: usize = shadow.marked_parts(bits, from, to).iter().map(|(a, b)| b - a).sum();
+            MARK_STATS[0].fetch_add(((to - from) - kept) as u64, Ordering::Relaxed);
+        }
         return work;
     }
     let mut out = Vec::with_capacity(work.len());
@@ -3408,6 +3426,28 @@ fn mark_miss(shadow: &Shadow, at: usize, n: usize, who: &str) {
             writers = %who,
             "page marks: a piece differs that no shader marked"
         );
+    }
+}
+
+/// Page marks with `check`, for a copy in the card's memory: piece `piece`
+/// (offsets `[lo, hi)`) was flagged by the compare on the card after the
+/// submissions whose marks are `bits`: counted, and counted again if the copy
+/// was written only by marking shaders and the piece is not marked (an
+/// earlier submission's undeclared write can also surface as a flag: read
+/// such counts, do not take them for misses).
+pub(crate) fn check_card_piece(shadow: &Arc<Shadow>, lo: usize, bits: Option<&[u32]>, unmarked: &std::collections::HashSet<usize>) {
+    if marks_mode() != 2 {
+        return;
+    }
+    let Some(bits) = bits else {
+        return;
+    };
+    if !has_marks(shadow) || unmarked.contains(&(Arc::as_ptr(shadow) as usize)) {
+        return;
+    }
+    MARK_STATS[8].fetch_add(1, Ordering::Relaxed);
+    if !shadow.piece_marked(bits, lo) {
+        MARK_STATS[9].fetch_add(1, Ordering::Relaxed);
     }
 }
 

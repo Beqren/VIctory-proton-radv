@@ -393,6 +393,57 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+impl Physical {
+    /// The page shown at `at` ([`Slice::key`]), if a view of ours is there.
+    fn shown_at(&self, at: usize) -> Option<(usize, usize)> {
+        self.views
+            .range(..=at)
+            .next_back()
+            .filter(|(base, (size, _))| at < *base + size)
+            .map(|(base, (_, slice))| slice.key((at - base) / PAGE))
+    }
+
+    /// How many of the `n` pages from `base` on show already what `want`
+    /// says page `k` is to show (`Some(None)`: nothing; `None`: a page that
+    /// cannot be mapped, never counted).
+    fn already(&self, base: usize, n: usize, want: impl Fn(usize) -> Option<Option<(usize, usize)>>) -> usize {
+        (0..n).filter(|&k| want(k).is_some_and(|w| w == self.shown_at(base + k * PAGE))).count()
+    }
+}
+
+/// Whether a page mapping that changes nothing is left undone
+/// (`VICTORY_REMAP_SAME=1` does each as before).
+///
+/// The title has the GPU map pages into its tiled heap every frame
+/// (`CopyPageMappingsBatchX`, kind 1 maps one constant page over many
+/// pages one by one), most of them as they are already. Each was an
+/// unmapping and a mapping again under the lock that holds reads of title
+/// memory in place, four or five memory calls a page under Wine: in run 2
+/// of the frame study 1,700-2,700 remappings a frame held that lock
+/// 3.0-3.5 s, and the submitting thread waited 2.4-2.8 s a frame for it
+/// in its texture refreshes. Left undone, the pages keep their views and
+/// those views their guards, which are still right: the bytes shown are
+/// the same physical pages. A write into the pages through another view
+/// is seen as before a remapping, by the guards over every view of a page
+/// (`victory_gpu` watch, up to 64 views). What a remapping told the
+/// descriptors (a placed texture there may have changed) is still told.
+/// Diagnostics: a page mapping (the GPU's, or physical pages), its pages,
+/// those already so, and when it began; counted when it ends.
+#[cfg(feature = "diagnostics")]
+struct Counted(bool, usize, usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Counted {
+    fn drop(&mut self) {
+        victory_gpu::page_mapping(self.0, self.1 as u64, self.2 as u64, self.3.elapsed().as_micros() as u64);
+    }
+}
+
+fn skip_same() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_REMAP_SAME").is_none_or(|v| v != "1"));
+    *ON
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -635,6 +686,25 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let same = {
+        let p = &*physical;
+        p.already(base, n, |k| {
+            if pages.is_null() {
+                return Some(None);
+            }
+            // SAFETY: the title passes `n` page numbers.
+            let page = unsafe { *pages.add(k) };
+            p.pages.get(&page).map(|s| Some(s.key(0)))
+        })
+    };
+    #[cfg(feature = "diagnostics")]
+    let _count = Counted(false, n, same, started);
+    if n > 0 && same == n && skip_same() {
+        victory_gpu::title_memory_reshown(base, n * PAGE);
+        return address;
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -707,6 +777,16 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let n = len.div_ceil(PAGE);
+    let same = physical.already(to, n, |k| if from == 0 { Some(None) } else { physical.shown_at(from + k * PAGE).map(Some) });
+    #[cfg(feature = "diagnostics")]
+    let _count = Counted(true, n, same, started);
+    if n > 0 && same == n && skip_same() {
+        victory_gpu::title_memory_reshown(to, len);
+        return true;
+    }
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);

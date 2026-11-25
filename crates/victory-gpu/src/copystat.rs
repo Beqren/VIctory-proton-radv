@@ -169,9 +169,35 @@ pub(crate) enum C {
     ReadingCalls,
     ReadingWaitUs,
     ReadingHeldUs,
+    /// The runtime's page mappings: the GPU's page-mapping copies
+    /// (`map_alias`) and `XMemMapPhysicalPages`; calls, pages, pages that
+    /// showed what they were to show already, microseconds.
+    AliasCalls,
+    AliasPages,
+    AliasSame,
+    AliasUs,
+    PhysicalCalls,
+    PhysicalPages,
+    PhysicalSame,
+    PhysicalUs,
 }
-const COUNTERS: usize = 96;
-const _: () = assert!((C::ReadingHeldUs as usize) < COUNTERS);
+
+/// A page mapping of the runtime (`alias`: the GPU's page-mapping copies,
+/// else `XMemMapPhysicalPages`) of `pages` pages, `same` of which already
+/// showed what they were to show, took `us`.
+pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
+    let [c, p, s, t] = if alias {
+        [C::AliasCalls, C::AliasPages, C::AliasSame, C::AliasUs]
+    } else {
+        [C::PhysicalCalls, C::PhysicalPages, C::PhysicalSame, C::PhysicalUs]
+    };
+    add(c, 1);
+    add(p, pages);
+    add(s, same);
+    add(t, us);
+}
+const COUNTERS: usize = 112;
+const _: () = assert!((C::PhysicalUs as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1242,7 +1268,9 @@ pub(crate) fn log(frames: f64) {
          queries {:.2} ms, lock waited {:.2} ms, {:.2} ms in the fault handler; submission lock waited \
          {:.2} ms; from a present to the first list call the process ran {:.1} ms (all threads), \
          {:.1} ms of the title's frame waits fell in it; title memory's mapping lock: {:.0} remaps \
-         waited {:.1} ms held {:.1} ms, {:.0} reads in place waited {:.1} ms held {:.1} ms",
+         waited {:.1} ms held {:.1} ms, {:.0} reads in place waited {:.1} ms held {:.1} ms; page \
+         mappings: the GPU's {:.0} calls {:.0} pages ({:.0} already so) {:.1} ms, physical {:.0} \
+         calls {:.0} pages ({:.0} already so) {:.1} ms",
         c[C::KernelCalls as usize],
         ms(c[C::KernelUs as usize]),
         mb(c[C::KernelBytes as usize]),
@@ -1265,6 +1293,14 @@ pub(crate) fn log(frames: f64) {
         c[C::ReadingCalls as usize],
         ms(c[C::ReadingWaitUs as usize]),
         ms(c[C::ReadingHeldUs as usize]),
+        c[C::AliasCalls as usize],
+        c[C::AliasPages as usize],
+        c[C::AliasSame as usize],
+        ms(c[C::AliasUs as usize]),
+        c[C::PhysicalCalls as usize],
+        c[C::PhysicalPages as usize],
+        c[C::PhysicalSame as usize],
+        ms(c[C::PhysicalUs as usize]),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

@@ -57,12 +57,13 @@ mod texture;
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use copystat::phase as frame_phase;
+pub use copystat::{page_mapping, phase as frame_phase};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_reshown,
+    writing as kernel_will_write,
 };

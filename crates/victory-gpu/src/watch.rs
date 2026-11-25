@@ -880,6 +880,24 @@ pub fn title_memory_reading_now() -> Option<Reading> {
     }
 }
 
+/// The runtime was asked to map `[at, at + len)` as it is mapped already
+/// and left it so: views and protections stay. Its guarded blocks count as
+/// written once more, as a remapping made them (the next check copies them
+/// again, with no protection call: they are still read-only), so no copy
+/// is staler than with the remapping; that matters for a page shown at
+/// more than [`MANY_VIEWS`] views (the constant page the title maps over
+/// many), whose views are guarded one by one and a write through another
+/// view is not seen here. Placed textures there are told as for a
+/// remapping.
+pub fn title_memory_reshown(at: usize, len: usize) {
+    crate::descriptor::host::remapped(at, len);
+    let mut g = guards();
+    let blocks: Vec<usize> = g.clean.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
+    for block in blocks {
+        g.clean.remove(&block);
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).

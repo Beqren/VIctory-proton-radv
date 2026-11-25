@@ -6030,6 +6030,38 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first (an
+    /// odd last high half 0). Integer formats keep their low 16 bits (the
+    /// pack's d16 loads of integer data are read by WORD_0 and WORD_1, e.g.
+    /// 0aa7934094794dbf); the others become f16.
+    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+                let m = self.s.m.i32(0xFFFF);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                let (f, i32t) = (self.as_float(x), self.s.t.i32);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            });
+        }
+        let k16 = self.s.m.i32(16);
+        Ok(halves
+            .chunks(2)
+            .map(|p| match *p {
+                [lo, hi] => {
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                _ => p[0],
+            })
+            .collect())
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -10270,8 +10302,10 @@ impl<'a> Lower<'a> {
             "buffer_load_sshort" => Some((16, true)),
             _ => None,
         };
-        // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // d16: two 16-bit channels per VGPR, low half first, buffer and
+        // tbuffer formats alike (upstream c430b1d, also Belobug a103937: tbuffer d16 loads took
+        // the 32-bit path, a channel a VGPR).
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -10602,7 +10636,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let mut xs = self.format_load(h, off, f, count)?;
+            if d16 {
+                xs = self.d16_channels(f, xs)?;
+            }
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -11904,6 +11942,54 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// `tbuffer_load_format_d16_*` packs two 16-bit channels a VGPR, low half
+    /// first, as `buffer_load_format_d16_*` does (the pack's
+    /// 0aa7934094794dbf loads d16_xyzw into v[1:2] and reads v1's WORD_0 and
+    /// WORD_1, v2's WORD_0). Four channels at the top of the register file
+    /// fill v254 and v255; taken as a channel a VGPR they ran past v255.
+    #[test]
+    fn a_d16_typed_buffer_load_packs_two_channels_a_register() {
+        // MTBUF `op vdata, off, s[8:11], 0 format:format`.
+        let mtbuf = |op: u32, vdata: u32, format: u32| {
+            [
+                0x3A << 26 | format << 19 | (op & 7) << 16,
+                0x80 << 24 | (op >> 3 & 1) << 21 | 2 << 16 | vdata << 8,
+            ]
+        };
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        // tbuffer_load_format_d16_xyzw (11) in 16_16_16_16_FLOAT (71) and
+        // _UINT (69).
+        for format in [71, 69] {
+            let load = mtbuf(11, 254, format);
+            let words = [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                load[0],
+                load[1], // tbuffer_load_format_d16_xyzw v[254:255], off, s[8:11], 0
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xD834_0000,
+                0x0000_FE00, // ds_write_b32 v0, v254
+                0xD834_0004,
+                0x0000_FF00, // ds_write_b32 v0, v255 offset:4
+                S_ENDPGM,
+            ];
+            lower_with(&words, layout.clone(), used.clone()).unwrap();
+        }
     }
 
     #[test]

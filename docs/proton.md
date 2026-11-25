@@ -329,10 +329,19 @@ Fixes, helped by the faster frames of the patched wineserver:
 - Commit 083b06c: the draws of the character shaders note the slots their material
   record names, and on a full card those come first and may be made up to 99% of
   the budget, 32 MB a pass (`VICTORY_TEXTURE_ASKED=0` turns it off).
-- The stale rule stays at the overlap rule (a newer view makes an older one stale
-  wherever their spans overlap). `VICTORY_STALE_TEXTURES=start` selects the 4 KiB
-  rule, `=0` makes none stale; the two runs that tried the 4 KiB rule were under the
-  stock Wine, and it is not the default until a run under the patched one measures it.
+- The stale rule is the head rule (a newer view makes an older one stale where
+  their spans overlap and the older texture's first 4 KiB, its smallest mips,
+  changed since its view was noted). Under the overlap rule, the default before,
+  the title's small textures packed where a newer streamed texture's large mips
+  would be were made stale and null while draws still read them: of the null slots
+  the character programs asked for, 51,280 slot-frames of 53,500 were stale (run
+  room-3); under the head rule none, slots made stale fell from 68,820 to 708, and
+  the diner shots' faces, clothes and posters are textured (run room-4).
+  `VICTORY_STALE_TEXTURES=overlap` or `=start` (the 4 KiB rule) select the others,
+  `=0` makes none stale. `VICTORY_STALE_LIST=1` lists stale slots read later.
+- Eviction of host textures by their last read (`VICTORY_TEXTURE_EVICT=1`) is off:
+  the host sees no reads of 6.2 of the 6.4 GB of textures slots show (programs
+  pick them by index), and what it can see is read again within seconds.
 - `tools/face_time.py` measures the result: from the per-frame log line of character
   textures asked for and missing on the card, it prints the frames and seconds after
   the world's first frame until none is missing.

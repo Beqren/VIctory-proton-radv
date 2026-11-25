@@ -1,0 +1,15 @@
+[package]
+name = "winbench"
+description = "Times the Windows memory primitives the write tracking uses (write watches, guards, queries, views), to compare Wine with Windows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# The same bindings, at the same version, that the layer's watch.rs calls through.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_Memory"] }

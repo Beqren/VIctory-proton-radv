@@ -1485,6 +1485,33 @@ pub(crate) fn log(frames: f64) {
             p[P_FAULT_LOCK_US] / 1e3,
             p[P_NOTED_ALIAS],
         );
+        let r = crate::shadow::reads_take().map(|n| n as f64 / frames);
+        let guard_ms = p[P_GUARD_US] / 1e3;
+        tracing::info!(
+            "asking and reading per frame: askings {:.0} ({:.0} from the journal asked ahead); guard calls {:.0} {:.2} ms over \
+             {:.0} blocks ({:.0} all clean): lock {:.2} ms, guarding again {:.2} ms, the walk and the rest {:.2} ms; \
+             refreshes of watched ranges {:.0}, {:.0} of them found something written; reads into copies {:.0}, {:.1} MB, \
+             {:.2} ms ({:.2} GB/s, {:.1} KiB a read); sampled reads: {:.1} MB of which {:.2} MB in 4 KiB pages that differed \
+             from the copy",
+            p[P_WRITES],
+            p[P_WRITES_AHEAD],
+            p[P_GUARD_CALLS],
+            guard_ms,
+            p[P_GUARD_BLOCKS],
+            p[P_GUARD_CLEAN],
+            p[P_GUARD_LOCK_US] / 1e3,
+            p[P_GUARD_PROTECT_US] / 1e3,
+            (guard_ms - p[P_GUARD_LOCK_US] / 1e3 - p[P_GUARD_PROTECT_US] / 1e3).max(0.0),
+            r[0],
+            r[1],
+            r[2],
+            r[3] / 1e6,
+            r[4] / 1e3,
+            if r[4] > 0.0 { r[3] / r[4] / 1e3 } else { 0.0 },
+            if r[2] > 0.0 { r[3] / r[2] / 1024.0 } else { 0.0 },
+            r[5] / 1e6,
+            r[6] / 1e6,
+        );
     }
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

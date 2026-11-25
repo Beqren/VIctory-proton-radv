@@ -2067,6 +2067,50 @@ mod wide_tests {
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Diagnostics, since the last frame line: refreshes of watched ranges,
+/// of them those that found something written; reads of title memory into
+/// copies ([`Shadow::copy`]), their bytes and microseconds (with a sampled
+/// compare, below); bytes of the sampled reads, and of those the bytes in
+/// 4 KiB pages that differed from what the copy held.
+#[cfg(feature = "diagnostics")]
+static READS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// [`READS`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn reads_take() -> [u64; 7] {
+    std::array::from_fn(|i| READS[i].swap(0, Ordering::Relaxed))
+}
+
+/// Diagnostics: one read into a copy in 16, compared before it is made
+/// with what the copy holds, by 4 KiB page: how much of what is read had
+/// changed at all (the guards see 64 KiB blocks; below a page only a
+/// compare can tell).
+#[cfg(feature = "diagnostics")]
+fn sample_read(held: *const u8, from: usize, len: usize) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) % 16 != 0 || len == 0 || len > 64 << 20 {
+        return;
+    }
+    let mut now = vec![0u8; len];
+    if !crate::host::read_into(from as *const u8, &mut now) {
+        return;
+    }
+    // SAFETY: the caller's range of the copy's mapping, `len` bytes.
+    let held = unsafe { std::slice::from_raw_parts(held, len) };
+    let mut differ = 0u64;
+    // Pages by title address.
+    let mut at = 0;
+    while at < len {
+        let end = ((from + at) / 4096 * 4096 + 4096 - from).min(len);
+        if now[at..end] != held[at..end] {
+            differ += (end - at) as u64;
+        }
+        at = end;
+    }
+    READS[5].fetch_add(len as u64, Ordering::Relaxed);
+    READS[6].fetch_add(differ, Ordering::Relaxed);
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -3609,6 +3653,11 @@ impl Shadow {
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
+                    READS[0].fetch_add(1, Ordering::Relaxed);
+                    READS[1].fetch_add(u64::from(copied > 0), Ordering::Relaxed);
+                }
+                #[cfg(feature = "diagnostics")]
+                {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
@@ -3670,7 +3719,17 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        sample_read(at, from, to - from);
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        #[cfg(feature = "diagnostics")]
+        {
+            READS[2].fetch_add(1, Ordering::Relaxed);
+            READS[3].fetch_add((to - from) as u64, Ordering::Relaxed);
+            READS[4].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);

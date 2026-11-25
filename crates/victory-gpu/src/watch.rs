@@ -355,10 +355,12 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    prep(P_WRITES, 1);
     let mut j = journal();
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        prep(P_WRITES_AHEAD, 1);
         return Some((
             j.ahead_asked,
             j.written
@@ -382,7 +384,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+        {
+            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+            prep(P_GUARD_US, guarding.elapsed().as_micros() as u64);
+            prep(P_GUARD_BLOCKS, (last - first) as u64);
+        }
         written?
     } else {
         Vec::new()
@@ -447,6 +453,16 @@ pub(crate) const P_FAULT_LOCK_US: usize = 30;
 /// Blocks at other views noted written but left read-only by a write of
 /// ours (`VICTORY_OPEN_ONE_VIEW`).
 pub(crate) const P_NOTED_ALIAS: usize = 31;
+/// [`writes`] calls, of them answered from the journal (asked ahead), and
+/// `guard` calls' whole microseconds and the blocks their ranges hold: the
+/// asking taken apart (what is left of a `guard` call beyond its lock and
+/// its guarding again is its walk over the blocks).
+pub(crate) const P_WRITES: usize = 32;
+pub(crate) const P_WRITES_AHEAD: usize = 33;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const P_GUARD_US: usize = 34;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const P_GUARD_BLOCKS: usize = 35;
 
 /// Why a guarded block was opened (diagnostics).
 #[derive(Clone, Copy)]

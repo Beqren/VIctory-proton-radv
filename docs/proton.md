@@ -405,6 +405,16 @@ Tried on stock Proton and what came of it (`<data>/notes/`):
 - Known ranges in view memory go to the guards without a failing `GetWriteWatch`
   call (`VICTORY_VIEWS_KNOWN`, on by default): failed calls fell from 4,536-7,852 a
   frame to 536-687; frame time unchanged within noise.
+- Page marks (`VICTORY_PAGE_MARKS=1`, off by default; port of upstream cd94d35 and
+  940d32f, branch `page-marks`): translated shaders mark the 64 KiB pages they write
+  through heap views, and copies in the PC's memory are compared only there. Two check
+  runs (`VICTORY_PAGE_MARKS=check`) found 0 unmarked pieces that differed, out of about
+  160 to 210 differing pieces judged a second. Every program of the pack still
+  translates, and its pipeline builds with marks on. How much it gains depends on how
+  much is compared on the CPU. One run without marks had the card full (720 MB
+  compared a frame, 40 to 54 ms). The marks runs got card copies for every copy of
+  1 MiB or more, and compared 13 MB instead of about 27 MB. The snapshots are still
+  taken; upstream drops them, which needs a save on the title's first write.
 - Also without gain: `VICTORY_RELAY=2`, `VICTORY_WIDE_BACK=1`,
   `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`,
   `VICTORY_LATE_WAIT_LISTS=256`.

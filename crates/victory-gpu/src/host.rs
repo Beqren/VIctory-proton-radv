@@ -2847,6 +2847,13 @@ fn hand_back(back: &[Declared], marks: &MarkView) {
                 _ => spans.push((from, to)),
             }
         }
+        // shortcut: page marks' check counts nothing on this path (the
+        // compare is inside `copy_back`); it needs VICTORY_WIDE_BACK=1 or the
+        // relay.
+        if crate::shadow::marks_mode() == 2 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("VICTORY_PAGE_MARKS=check counts misses only with VICTORY_WIDE_BACK=1 or VICTORY_RELAY"));
+        }
         let work = spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)).collect();
         for (_, from, to) in crate::shadow::cut_to_marks(work, marks.bits.as_deref(), &marks.unmarked) {
             let written = shadow.copy_back(from, to - from);

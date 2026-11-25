@@ -300,7 +300,11 @@ pub(crate) fn ready(
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
+    // Page marks: a writer that does not mark declares again under a key of
+    // its own, so that a marking writer before it in the list does not hide
+    // it (the copies are then compared whole).
+    const WRITE_UNMARKED: usize = usize::MAX - 0x70;
+    let first_write = writes && list.first_use(if marking { WRITE } else { WRITE_UNMARKED });
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {

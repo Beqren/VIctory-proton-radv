@@ -1302,8 +1302,14 @@ impl HostHeap {
 
     /// Enters slot `index`'s view-mark entry (`crate::shadow::Shadow::
     /// mark_entry_at`): none, unmarked. Called after the slot's descriptor is
-    /// written: a draw in the air sees the old view with the old entry or the
-    /// new view, and with the new one the new entry once this is done.
+    /// written.
+    /// shortcut: a title slot rewritten while a submission that reads it is
+    /// in the air (a title descriptor write, `mirror`) can show that
+    /// submission the new view with the old entry, or none, for a moment: a
+    /// write through it then marks the old view's page or nothing. The new
+    /// view's writes are not declared for that submission (it declared the
+    /// old view), so they were lost before page marks too, unless the new
+    /// view is of the same copy inside a range the submission declared.
     pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
         let Some((_, _, data)) = &self.marks else {
             return;

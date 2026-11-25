@@ -2180,6 +2180,8 @@ struct UnderJob {
     n: usize,
     next: Arc<std::sync::atomic::AtomicUsize>,
     left: Arc<(Mutex<usize>, std::sync::Condvar)>,
+    /// A call of `f` panicked: its index's work was not done.
+    failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Threads for [`each_under`] (`VICTORY_UNDER_THREADS`, 4 unless set, 1 to
@@ -2201,7 +2203,7 @@ fn under_threads() -> &'static Mutex<Vec<std::sync::mpsc::Sender<UnderJob>>> {
                 while let Ok(job) = rx.recv() {
                     // Whatever happens in `f`, the caller is told this
                     // thread is done with the job.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         loop {
                             let i = job.next.fetch_add(1, Ordering::Relaxed);
                             if i >= job.n {
@@ -2210,6 +2212,9 @@ fn under_threads() -> &'static Mutex<Vec<std::sync::mpsc::Sender<UnderJob>>> {
                             (job.f)(i);
                         }
                     }));
+                    if ran.is_err() {
+                        job.failed.store(true, Ordering::Relaxed);
+                    }
                     let mut left = job.left.0.lock().unwrap_or_else(|e| e.into_inner());
                     *left -= 1;
                     if *left == 0 {
@@ -2226,9 +2231,11 @@ fn under_threads() -> &'static Mutex<Vec<std::sync::mpsc::Sender<UnderJob>>> {
 }
 
 /// Calls `f` for `0..n`, on this thread and [`under_threads`]; returns when
-/// every call is done. `f` reads and compares memory; it takes no lock that
-/// a caller of this may hold.
-fn each_under(n: usize, f: &(dyn Fn(usize) + Sync)) {
+/// every call is done (also when one panicked: no thread holds `f` after
+/// this returns), true if none panicked. `f` reads and compares memory; it
+/// takes no lock that a caller of this may hold.
+fn each_under(n: usize, f: &(dyn Fn(usize) + Sync)) -> bool {
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let left = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
     // SAFETY: the reference is used only by the threads handed the job
@@ -2244,23 +2251,28 @@ fn each_under(n: usize, f: &(dyn Fn(usize) + Sync)) {
                 n,
                 next: next.clone(),
                 left: left.clone(),
+                failed: failed.clone(),
             };
             if tx.send(job).is_ok() {
                 *count += 1;
             }
         }
     }
-    loop {
-        let i = next.fetch_add(1, Ordering::Relaxed);
-        if i >= n {
-            break;
+    // Caught, so that the wait below always comes before `f` goes.
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            f(i);
         }
-        f(i);
-    }
+    }));
     let mut count = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *count > 0 {
         count = left.1.wait(count).unwrap_or_else(|e| e.into_inner());
     }
+    ran.is_ok() && !failed.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -3327,10 +3339,12 @@ impl Shadow {
                     .collect()
             };
             if under_wide() && stale.len() > 2 {
-                if self.merge_pages_wide(&stale, (a, e), now, runs_left) {
-                    return true;
+                match self.merge_pages_wide(&stale, (a, e), now, runs_left) {
+                    Some(true) => return true,
+                    Some(false) => continue,
+                    // No snapshot: the loop below says what that means.
+                    None => {}
                 }
-                continue;
             }
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
@@ -3412,7 +3426,8 @@ impl Shadow {
     /// `now` is the journal's mark for the pages taken. Whether the caller
     /// must settle (no snapshot, or `runs_left` ran out); pages put in
     /// before that stay put in.
-    fn merge_pages_wide(&self, stale: &[usize], (a, e): (usize, usize), now: u64, runs_left: &mut usize) -> bool {
+    /// `None` (nothing done) for a copy without a snapshot.
+    fn merge_pages_wide(&self, stale: &[usize], (a, e): (usize, usize), now: u64, runs_left: &mut usize) -> Option<bool> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let card = self.card.is_some();
@@ -3423,9 +3438,13 @@ impl Shadow {
         } else {
             match before.as_mut() {
                 Some(snapshot) => snapshot.as_mut_ptr() as usize,
-                None => return true,
+                None => return None,
             }
         };
+        // A copy in the card's memory takes at most this many runs: a page
+        // with more stops the merge there, and its runs need not be kept
+        // (a page of bytes that change one in two would keep 512 KiB).
+        let most = if card { *runs_left } else { usize::MAX };
         // Per page: title memory as read now and its changed runs; none for
         // a page that is not there (left as it is, and looked at again).
         type Read = Option<(Vec<u8>, Vec<(usize, usize)>)>;
@@ -3445,14 +3464,21 @@ impl Shadow {
             // while the lock above is held (the CPU side: only the
             // submitting thread, which is waiting here).
             let reference = unsafe { std::slice::from_raw_parts((held as *const u8).add(lo - start), hi - lo) };
-            let runs = changed_runs_fast(&title, reference);
+            let mut runs = changed_runs_fast(&title, reference);
+            if runs.len() > most {
+                runs.truncate(most + 1);
+                runs.shrink_to_fit();
+            }
             *done[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((title, runs));
         };
-        each_under(stale.len(), &one);
+        // A compare that panicked left its page undone: the caller settles.
+        let mut over = !each_under(stale.len(), &one);
         let (mut pages, mut count, mut bytes) = (0u64, 0u64, 0u64);
         let mut taken = Vec::new();
-        let mut over = false;
         for (i, read) in done.into_iter().enumerate() {
+            if over {
+                break;
+            }
             let Some((title, runs)) = read.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                 continue;
             };
@@ -3498,7 +3524,7 @@ impl Shadow {
                 *at = now;
             }
         }
-        over
+        Some(over)
     }
 
     /// At submission: copies what changed of `[address, address + len)`

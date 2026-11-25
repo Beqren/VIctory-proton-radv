@@ -2667,26 +2667,47 @@ impl State {
     fn graph_dump(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3], after: bool) {
         use std::fmt::Write;
         let Some(w) = crate::graphdump::window() else { return };
-        let frame = crate::queue::presented() + 1;
-        if !(w.first..=w.first + w.full).contains(&frame) {
+        let real_frame = crate::queue::presented() + 1;
+        if real_frame < w.first {
             return;
         }
-        let full = frame < w.first + w.full;
         let hash = |h: &str| p.stages.iter().any(|s| s.shader.hash == h);
         let graph = p.stages.iter().any(|s| GRAPH_PROGRAMS.contains(&s.shader.hash.as_str()));
-        let head = hash("970c4fbb3b017c0e") || hash("61e54e90adccaf6a") || hash("36e010b53acffd77");
+        let skinning = hash("36e010b53acffd77");
+        let head = hash("970c4fbb3b017c0e") || hash("61e54e90adccaf6a") || skinning;
         if !graph && !head {
             return;
         }
         if graph && after {
             return;
         }
+        // Passes of the network, each from its Formula dispatch (the face
+        // controls) to the next: the first `full` with the arena before
+        // every dispatch, the next `light` with first-sight copies only.
+        static PASS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+        let formula = hash("0aa7934094794dbf");
+        if formula && !after {
+            PASS.fetch_add(1, Ordering::Relaxed);
+        }
+        let pass = PASS.load(Ordering::Relaxed);
+        if pass < 0 {
+            return;
+        }
+        let pass = pass as u64;
+        if pass >= w.full + w.light {
+            crate::graphdump::finish(real_frame);
+            return;
+        }
+        let full = pass < w.full;
+        let frame = pass;
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let phase = if after { "after" } else { "before" };
         let hashes: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
         let [x, y, z] = groups;
-        let mut text = format!("dispatch {seq} frame={frame} {phase} programs={hashes:?} groups={x},{y},{z}");
+        let mut text = format!(
+            "dispatch {seq} frame={frame} {phase} programs={hashes:?} groups={x},{y},{z} realframe={real_frame}"
+        );
         for (slot, root) in self.compute.iter().enumerate() {
             match root {
                 Root::None => {}
@@ -2728,17 +2749,33 @@ impl State {
             }
         }
         crate::graphdump::note(text);
+        if skinning {
+            return;
+        }
         for (label, address, len) in buffers {
             let what = format!("seq={seq} {phase} {label}");
             if graph {
                 if len >= 16 << 20 {
-                    if full {
+                    // Between two Zero dispatches the arena holds nothing
+                    // the next one reads: no copy.
+                    static ZERO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    let zero = hash("6a04b371a8e26853");
+                    let zeros = ZERO.swap(zero, Ordering::Relaxed) && zero;
+                    if (full && !zeros) || formula {
                         crate::graphdump::copy(list, frame, address, arena_extent(address, len), &format!("{what} arena"));
-                    } else if crate::graphdump::first_sight(frame, address, len) {
-                        crate::graphdump::copy(list, frame, address, arena_extent(address, len), &format!("{what} arena first"));
                     }
-                } else if crate::graphdump::first_sight(frame, address, len) {
-                    crate::graphdump::copy(list, frame, address, len, &format!("{what} first"));
+                } else {
+                    // The controls as title memory holds them now, to
+                    // compare with what the card is given.
+                    if formula && len <= 4 << 20 {
+                        let mut b = vec![0u8; len as usize];
+                        if crate::host::read_into(address as *const u8, &mut b) {
+                            crate::graphdump::cpu(frame, &format!("{what} title"), address, b);
+                        }
+                    }
+                    if crate::graphdump::first_sight(frame, address, len) {
+                        crate::graphdump::copy(list, frame, address, len, &format!("{what} first"));
+                    }
                 }
             } else {
                 crate::graphdump::copy(list, frame, address, len.min(32 << 20), &what);

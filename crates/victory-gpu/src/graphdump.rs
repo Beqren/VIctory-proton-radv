@@ -28,12 +28,15 @@ use crate::host::HostList;
 
 /// Room for every copy of the window; past it copies are left out (and
 /// counted).
-const CAP: u64 = 2_400 << 20;
+const CAP: u64 = 3_200 << 20;
 const CHUNK: u64 = 64 << 20;
 
 pub(crate) struct Window {
     pub(crate) first: u64,
     pub(crate) full: u64,
+    /// Passes after the full ones with first-sight copies only
+    /// (`VICTORY_GRAPH_DUMP_LIGHT`, default 8).
+    pub(crate) light: u64,
     folder: PathBuf,
 }
 
@@ -46,8 +49,9 @@ pub(crate) fn window() -> Option<&'static Window> {
         let full = parts.next()?.trim().parse().ok()?;
         let folder = PathBuf::from(parts.next()?.trim());
         let _ = std::fs::create_dir_all(&folder);
-        tracing::info!(first, full, folder = %folder.display(), "face network dump window (VICTORY_GRAPH_DUMP)");
-        Some(Window { first, full, folder })
+        let light = std::env::var("VICTORY_GRAPH_DUMP_LIGHT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8);
+        tracing::info!(first, full, light, folder = %folder.display(), "face network dump window (VICTORY_GRAPH_DUMP)");
+        Some(Window { first, full, light, folder })
     })
     .as_ref()
 }
@@ -68,6 +72,10 @@ struct State {
     left_out: u64,
     /// Per frame: the title buffers copied at first sight.
     seen: Vec<(u64, u64, u64)>,
+    /// Title memory read on the CPU: (pass, label, address, bytes).
+    cpu: Vec<(u64, String, u64, Vec<u8>)>,
+    /// The frame the window ended in.
+    ended: Option<u64>,
     flushed: bool,
 }
 
@@ -76,6 +84,18 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     f(s.get_or_insert_with(State::default))
+}
+
+/// Title memory read at record time, written to `cpu.bin`.
+pub(crate) fn cpu(pass: u64, label: &str, address: u64, bytes: Vec<u8>) {
+    with(|s| s.cpu.push((pass, label.to_owned(), address, bytes)));
+}
+
+/// The window's passes are over (at frame `frame`).
+pub(crate) fn finish(frame: u64) {
+    with(|s| {
+        s.ended.get_or_insert(frame);
+    });
 }
 
 /// A line of the index (dispatch records, notes).
@@ -158,12 +178,10 @@ pub(crate) fn copy(list: &HostList, frame: u64, address: u64, len: u64, label: &
 /// submission settled, the copies go to files.
 pub(crate) fn flush(frame: u64) {
     let Some(w) = window() else { return };
-    if frame < w.first + w.full + 4 {
-        return;
-    }
+    let _ = w.first;
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = guard.as_mut() else { return };
-    if s.flushed {
+    if s.flushed || s.ended.is_none_or(|e| frame < e + 4) {
         return;
     }
     s.flushed = true;
@@ -190,6 +208,12 @@ pub(crate) fn flush(frame: u64) {
             index.push('\n');
         }
     }
+    let mut cpu = Vec::new();
+    for (pass, label, address, bytes) in &s.cpu {
+        index.push_str(&format!("cpu frame={pass} {label} addr={address:#x} len={:#x} at={:#x}\n", bytes.len(), cpu.len()));
+        cpu.extend_from_slice(bytes);
+    }
+    let _ = std::fs::write(w.folder.join("cpu.bin"), cpu);
     index.push_str(&format!("total={:#x} left_out={:#x}\n", s.total, s.left_out));
     let _ = std::fs::write(w.folder.join("index.txt"), index);
     tracing::info!(total = s.total, left_out = s.left_out, copies = s.copies.len(), "face network dump written (VICTORY_GRAPH_DUMP)");

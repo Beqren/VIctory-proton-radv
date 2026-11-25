@@ -167,6 +167,106 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// Whether [`norm_quotient`] converts codes of `w` bits: every width to 16
+/// but 11 and 12, whose smallest codes need more bits than it keeps
+/// (upstream da82e44 rounds those fully in integers).
+// shortcut: 11- and 12-bit normalized channels still divide on the host;
+// the pack has none (its normalized buffer formats are 8_8_8_8_UNORM,
+// 2_10_10_10_UNORM and 16_16_SNORM).
+fn norm_exact(w: u32) -> bool {
+    w <= 16 && !matches!(w, 11 | 12)
+}
+
+/// The integer and bit operations [`norm_quotient`] is written in: DXIL
+/// instructions in the lowering, plain arithmetic in the tests (which so
+/// check the emitted sequence for every code).
+trait NormOps {
+    type V: Copy;
+    fn k(&mut self, x: u32) -> Self::V;
+    /// An integer operation of `Add`, `Sub`, `Mul`, `UDiv`, `Shl`, `LShr`,
+    /// `And`.
+    fn int(&mut self, op: Bin, a: Self::V, b: Self::V) -> Self::V;
+    fn ult(&mut self, a: Self::V, b: Self::V) -> Self::V;
+    fn select(&mut self, c: Self::V, a: Self::V, b: Self::V) -> Self::V;
+    /// The f32 bits of the unsigned integer `a`.
+    fn to_float(&mut self, a: Self::V) -> Self::V;
+    /// The bits of the f32 product of f32 bits `a` and `b`.
+    fn fmul(&mut self, a: Self::V, b: Self::V) -> Self::V;
+}
+
+impl NormOps for Lower<'_> {
+    type V = V;
+    fn k(&mut self, x: u32) -> V {
+        self.s.m.i32(x)
+    }
+    fn int(&mut self, op: Bin, a: V, b: V) -> V {
+        self.s.m.bin(self.cur, op, a, b)
+    }
+    fn ult(&mut self, a: V, b: V) -> V {
+        self.s.m.cmp(self.cur, pred::IULT, a, b)
+    }
+    fn select(&mut self, c: V, a: V, b: V) -> V {
+        self.s.m.select(self.cur, c, a, b)
+    }
+    fn to_float(&mut self, a: V) -> V {
+        let f = self.s.m.cast(self.cur, Cast::UiToFp, a, self.s.t.f32);
+        self.as_int(f)
+    }
+    fn fmul(&mut self, a: V, b: V) -> V {
+        let (a, b) = (self.as_float(a), self.as_float(b));
+        let p = self.s.m.bin(self.cur, Bin::Mul, a, b);
+        self.as_int(p)
+    }
+}
+
+/// The bits of the float nearest to `a / d`, `d = 2^w - 1`, for codes
+/// `0 <= a < d` and [`norm_exact`] widths: what the console's buffer unit
+/// gives for a normalized code. After upstream da82e44:
+///
+/// `Q = floor(a * 2^32 / d) = a * K + floor(a * r / d)` with `K =
+/// floor(2^32 / d)` and `r = 2^32 mod d` (no division when `r` is 1:
+/// widths dividing 32). `a / d` is never exact for `0 < a < d`, so `Q`
+/// rounds to 24 bits up exactly when its highest dropped bit is set, and the
+/// result is that integer (at most 2^24, so its conversion is exact on any
+/// host) scaled by a power of two.
+fn norm_quotient<O: NormOps>(o: &mut O, a: O::V, w: u32) -> O::V {
+    debug_assert!(norm_exact(w), "{w}-bit normalized code");
+    let d = (1u64 << w) - 1;
+    let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
+    let (one, kv) = (o.k(1), o.k(kk as u32));
+    let mut q = o.int(Bin::Mul, a, kv);
+    if r != 1 {
+        let (rv, dv) = (o.k(r as u32), o.k(d as u32));
+        let t = o.int(Bin::Mul, a, rv);
+        let more = o.int(Bin::UDiv, t, dv);
+        q = o.int(Bin::Add, q, more);
+    }
+    // The bits to drop (1 to 8) from the exponent of `q >> 8`, which
+    // converts exactly (fewer than 25 bits); none when `q` fits.
+    let k8 = o.k(8);
+    let top = o.int(Bin::LShr, q, k8);
+    let top = o.to_float(top);
+    let k23 = o.k(23);
+    let e = o.int(Bin::LShr, top, k23);
+    let bias = o.k(127 + 15);
+    let shift = o.int(Bin::Sub, e, bias);
+    let (zero, b24) = (o.k(0), o.k(1 << 24));
+    let fits = o.ult(q, b24);
+    let shift = o.select(fits, zero, shift);
+    // Rounded up when the highest dropped bit is set: never a tie.
+    let up = o.int(Bin::Shl, q, one);
+    let up = o.int(Bin::LShr, up, shift);
+    let up = o.int(Bin::And, up, one);
+    let m = o.int(Bin::LShr, q, shift);
+    let m = o.int(Bin::Add, m, up);
+    // At most 2^24: exact as a float, and so its scale by 2^(shift - 32).
+    let f = o.to_float(m);
+    let b95 = o.k(127 - 32);
+    let scale = o.int(Bin::Add, shift, b95);
+    let scale = o.int(Bin::Shl, scale, k23);
+    o.fmul(f, scale)
+}
+
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
@@ -6129,19 +6229,56 @@ impl<'a> Lower<'a> {
             };
             let f32t = self.s.t.f32;
             let x = match numeric {
+                // The console's buffer unit gives the float nearest the exact
+                // quotient; the host's division does not (a division by a
+                // constant may become a multiply by its reciprocal), and the
+                // pack's mesh programs truncate `x * 255.0` back to a code
+                // (0066320cb6da26b0 at 0x1a40: `v_mul_legacy_f32` by 255.0,
+                // then `v_cvt_u32_f32`). After upstream da82e44: the quotient
+                // from integers ([`norm_quotient`]), the ends exact.
                 Numeric::Unorm => {
-                    let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
-                    let max = self.s.m.f32((((1u64 << w) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
+                    let top = (1u64 << w) - 1;
+                    let q = if norm_exact(w) {
+                        let q = norm_quotient(self, field, w);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::UiToFp, field, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
+                    let (high, one) = (self.s.m.i32(top as u32), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::EQ, field, high);
+                    let q = self.s.m.select(c, at_top, one, q);
                     float(self, q)
                 }
                 Numeric::Snorm => {
                     let s = signed(self);
-                    let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
-                    let max = self.s.m.f32((((1u64 << (w - 1)) - 1) as f32).to_bits());
-                    let q = self.s.m.bin(c, Bin::SDiv, f, max);
-                    let lo = self.s.m.f32((-1.0f32).to_bits());
-                    let q = self.binary(35, q, lo);
+                    let top = (1u32 << (w - 1)) - 1;
+                    let q = if norm_exact(w - 1) {
+                        // The magnitude's quotient, signed (codes at and
+                        // below -top are -1.0 below).
+                        let (zero, sign) = (self.s.m.i32(0), self.s.m.i32(0x8000_0000));
+                        let neg = self.s.m.cmp(c, pred::SLT, s, zero);
+                        let minus = self.s.m.bin(c, Bin::Sub, zero, s);
+                        let m = self.s.m.select(c, neg, minus, s);
+                        let q = norm_quotient(self, m, w - 1);
+                        let sign = self.s.m.select(c, neg, sign, zero);
+                        let q = self.s.m.bin(c, Bin::Or, q, sign);
+                        self.as_float(q)
+                    } else {
+                        let f = self.s.m.cast(c, Cast::SiToFp, s, f32t);
+                        let max = self.s.m.f32((top as f32).to_bits());
+                        self.s.m.bin(c, Bin::SDiv, f, max)
+                    };
+                    // The top code is 1.0; the lowest is -1.0 too, as is the
+                    // one above it.
+                    let (high, one) = (self.s.m.i32(top), self.s.m.f32(1.0f32.to_bits()));
+                    let at_top = self.s.m.cmp(c, pred::SGE, s, high);
+                    let q = self.s.m.select(c, at_top, one, q);
+                    let low = self.s.m.i32(top.wrapping_neg());
+                    let minus_one = self.s.m.f32((-1.0f32).to_bits());
+                    let at_bottom = self.s.m.cmp(c, pred::SLE, s, low);
+                    let q = self.s.m.select(c, at_bottom, minus_one, q);
                     float(self, q)
                 }
                 Numeric::Uscaled => {
@@ -12093,6 +12230,61 @@ mod tests {
         };
         assert!(table(true), "d16");
         assert!(!table(false), "32-bit");
+    }
+
+    /// Plain arithmetic for [`super::norm_quotient`]'s operations.
+    struct Eval;
+
+    impl super::NormOps for Eval {
+        type V = u32;
+        fn k(&mut self, x: u32) -> u32 {
+            x
+        }
+        fn int(&mut self, op: super::Bin, a: u32, b: u32) -> u32 {
+            use super::Bin::*;
+            match op {
+                Add => a.wrapping_add(b),
+                Sub => a.wrapping_sub(b),
+                Mul => a.wrapping_mul(b),
+                UDiv => a / b,
+                Shl => a << (b & 31),
+                LShr => a >> (b & 31),
+                And => a & b,
+                _ => unreachable!("{op:?}"),
+            }
+        }
+        fn ult(&mut self, a: u32, b: u32) -> u32 {
+            u32::from(a < b)
+        }
+        fn select(&mut self, c: u32, a: u32, b: u32) -> u32 {
+            if c != 0 { a } else { b }
+        }
+        fn to_float(&mut self, a: u32) -> u32 {
+            (a as f32).to_bits()
+        }
+        fn fmul(&mut self, a: u32, b: u32) -> u32 {
+            (f32::from_bits(a) * f32::from_bits(b)).to_bits()
+        }
+    }
+
+    /// The sequence `norm_quotient` emits gives every code below the top of
+    /// every width it takes (the pack's normalized formats have 8, 10 and 2
+    /// bits, and 15 for 16_16_SNORM's magnitude) the float nearest the exact
+    /// quotient, as the console's buffer unit does; so 255 times an 8-bit
+    /// code's float truncates back to the code (0066320cb6da26b0 at 0x1a40).
+    #[test]
+    fn normalized_codes_convert_to_the_nearest_float() {
+        for w in (2..=16).filter(|&w| super::norm_exact(w)) {
+            let d = (1u64 << w) - 1;
+            for a in 0..d as u32 {
+                let got = super::norm_quotient(&mut Eval, a, w);
+                let want = (f64::from(a) / d as f64) as f32;
+                assert_eq!(got, want.to_bits(), "{w}-bit code {a}: {}, want {want}", f32::from_bits(got));
+                if w == 8 {
+                    assert_eq!((f32::from_bits(got) * 255.0) as u32, a, "8-bit code {a} back");
+                }
+            }
+        }
     }
 
     #[test]

@@ -1624,6 +1624,22 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    #[test]
+    fn interpolation_first_half_also_used_as_data() {
+        let [e0, e1] = exp_mrt0(3);
+        let words = [
+            0xC808_0000,        // v_interp_p1_f32 v2, v0, attr0.x
+            0x7E06_0302,        // v_mov_b32 v3, v2
+            0xC809_0001,        // v_interp_p2_f32 v2, v1, attr0.x
+            v_add_f32(3, 3, 2), // consume both results
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        validate(&shader);
+    }
+
     /// Both: the attribute is interpolated and J is used as a value.
     #[test]
     fn interpolation_and_a_barycentric_value_together() {

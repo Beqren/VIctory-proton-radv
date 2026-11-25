@@ -112,6 +112,15 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// Low (`!high`) or high (`high`) 32 bits of the 64-bit float sum over
+    /// `lanes` of `mask ? f64(lo, hi) : 0.0`.
+    Red64F {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+        high: bool,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -123,6 +132,8 @@ pub(crate) enum Shape {
     Masked(Value, Value, u32),
     /// `op` over every lane.
     Active(Op, Value, Value, u32),
+    /// Low (`!high`) or high (`high`) 32 bits of the 64-bit float sum over every lane.
+    ActiveF64(Value, Value, Value, bool),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
 }
@@ -298,12 +309,27 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
         }
-        if let Fields::Sop { src, .. } = &inst.fields {
+        if let Fields::Sop { dst, src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
                 && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
                 && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
+            }
+            if name == "s_mov_b32"
+                && let (Some(Operand::Scalar { code: dc, .. }), Some(s0)) = (dst, src.first())
+                && *dc != NULL
+                && let Some(w) = inst.write(Reg::S(*dc))
+            {
+                let sym = match *s0 {
+                    Operand::Scalar { code, .. } if code != NULL => inst
+                        .read(Reg::S(code))
+                        .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
+                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+                    Operand::Literal(x) => Sym::K(x),
+                    _ => Sym::Unknown,
+                };
+                uni.insert(w, sym);
             }
             for &(_, w) in &inst.writes {
                 uni.entry(w).or_insert(Sym::Unknown);
@@ -357,6 +383,133 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
+            continue;
+        }
+        // A double sum shuffles its words separately and adds matching
+        // pairs. Both words must describe the same saved mask and lanes.
+        if name == "v_add_f64"
+            && !modifiers
+            && v.dpp.is_none()
+            && let Some(Operand::Vector { reg: dreg, .. }) = v.dst
+            && let Some(dreg_hi) = dreg.checked_add(1)
+            && let (Some(dst_lo), Some(dst_hi)) =
+                (inst.write(Reg::V(dreg)), inst.write(Reg::V(dreg_hi)))
+        {
+            let pair_lanes = |op: Option<&Operand>| -> Option<(Vec<Sym>, Vec<Sym>)> {
+                match *op? {
+                    Operand::Vector { reg, .. } => Some((
+                        lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni),
+                        lanes(
+                            &Operand::Vector {
+                                reg: reg.checked_add(1)?,
+                                dwords: 1,
+                            },
+                            &vec,
+                            &uni,
+                        ),
+                    )),
+                    Operand::Scalar { code, .. } if code != NULL => Some((
+                        lanes(&Operand::Scalar { code, dwords: 1 }, &vec, &uni),
+                        lanes(
+                            &Operand::Scalar {
+                                code: code.checked_add(1)?,
+                                dwords: 1,
+                            },
+                            &vec,
+                            &uni,
+                        ),
+                    )),
+                    _ => None,
+                }
+            };
+            let old_lo = lanes(
+                &Operand::Vector {
+                    reg: dreg,
+                    dwords: 1,
+                },
+                &vec,
+                &uni,
+            );
+            let old_hi = lanes(
+                &Operand::Vector {
+                    reg: dreg_hi,
+                    dwords: 1,
+                },
+                &vec,
+                &uni,
+            );
+            let f64_term = |lo_s: Sym, hi_s: Sym| -> Option<(Value, Value, Value, u64)> {
+                match (lo_s, hi_s) {
+                    (
+                        Sym::Red {
+                            op: None,
+                            src: lo,
+                            mask: ml,
+                            ident: 0,
+                            lanes: ll,
+                        },
+                        Sym::Red {
+                            op: None,
+                            src: hi,
+                            mask: mh,
+                            ident: 0,
+                            lanes: lh,
+                        },
+                    ) if ml == mh && ll == lh => Some((lo, hi, ml, ll)),
+                    (
+                        Sym::Red64F {
+                            lo: lo1,
+                            hi: hi1,
+                            mask: m1,
+                            lanes: l1,
+                            high: false,
+                        },
+                        Sym::Red64F {
+                            lo: lo2,
+                            hi: hi2,
+                            mask: m2,
+                            lanes: l2,
+                            high: true,
+                        },
+                    ) if (lo1, hi1, m1, l1) == (lo2, hi2, m2, l2) => Some((lo1, hi1, m1, l1)),
+                    _ => None,
+                }
+            };
+            let mut out_lo = vec![Sym::Unknown; wave as usize];
+            let mut out_hi = vec![Sym::Unknown; wave as usize];
+            if let (Some((alo, ahi)), Some((blo, bhi))) =
+                (pair_lanes(v.src.first()), pair_lanes(v.src.get(1)))
+            {
+                for l in 0..wave as usize {
+                    let (rl, rh) = match (f64_term(alo[l], ahi[l]), f64_term(blo[l], bhi[l])) {
+                        (Some((lo1, hi1, m1, la)), Some((lo2, hi2, m2, lb)))
+                            if (lo1, hi1, m1) == (lo2, hi2, m2) && la & lb == 0 =>
+                        {
+                            (
+                                Sym::Red64F {
+                                    lo: lo1,
+                                    hi: hi1,
+                                    mask: m1,
+                                    lanes: la | lb,
+                                    high: false,
+                                },
+                                Sym::Red64F {
+                                    lo: lo1,
+                                    hi: hi1,
+                                    mask: m1,
+                                    lanes: la | lb,
+                                    high: true,
+                                },
+                            )
+                        }
+                        _ => (Sym::Unknown, Sym::Unknown),
+                    };
+                    out_lo[l] = if exec >> l & 1 != 0 { rl } else { old_lo[l] };
+                    out_hi[l] = if exec >> l & 1 != 0 { rh } else { old_hi[l] };
+                }
+            }
+            vec.insert(dst_lo, out_lo);
+            vec.insert(dst_hi, out_hi);
             continue;
         }
         let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
@@ -560,6 +713,13 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        Sym::Red64F {
+            lo,
+            hi,
+            mask,
+            lanes,
+            high,
+        } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
         _ => None,
     };
     for (v, s) in uni {
@@ -603,6 +763,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::Red64F {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high,
+            } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
             _ => None,
         };
     }
@@ -684,6 +851,55 @@ pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
     0xD760_0007,
     0x0001_0101, // v_readlane_b32 s7, v1, 0
     0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+];
+
+/// The compiler's wave32 double sum, from s[0:1] into s[16:17].
+#[cfg(test)]
+pub(super) const WAVE_SUM_F64_TO_S16: [u32; 44] = [
+    0x7E0C_0200, // v_mov_b32 v6, s0
+    0x7E0E_0201, // v_mov_b32 v7, s1
+    0xBE8C_3DC1, // s_or_saveexec_b32 s12, -1
+    0xD501_0002,
+    0x0032_0C80, // v_cndmask_b32 v2, 0, v6, s12
+    0xD501_0003,
+    0x0032_0E80, // v_cndmask_b32 v3, 0, v7, s12
+    0x7E08_02E9,
+    0xDE54_C102, // v_mov_b32 v4, v2 dpp8 (distance 1)
+    0x7E0A_02E9,
+    0xDE54_C103, // v_mov_b32 v5, v3 dpp8 (distance 1)
+    0xD564_0002,
+    0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0x7E08_02E9,
+    0x9360_1202, // v_mov_b32 v4, v2 dpp8 (distance 2)
+    0x7E0A_02E9,
+    0x9360_1203, // v_mov_b32 v5, v3 dpp8 (distance 2)
+    0xD564_0002,
+    0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0x7E08_02E9,
+    0x0009_2402, // v_mov_b32 v4, v2 dpp8 (distance 4)
+    0x7E0A_02E9,
+    0x0009_2403, // v_mov_b32 v5, v3 dpp8 (distance 4)
+    0xD564_0002,
+    0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0x7E08_02FA,
+    0xFF09_4002, // v_mov_b32 v4, v2 row_mirror bound_ctrl:1
+    0x7E0A_02FA,
+    0xFF09_4003, // v_mov_b32 v5, v3 row_mirror bound_ctrl:1
+    0xD564_0002,
+    0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0xD778_0004,
+    0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+    0xD778_0005,
+    0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+    0xD564_0002,
+    0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0xD760_000E,
+    0x0001_0102, // v_readlane_b32 s14, v2, 0
+    0xD760_000F,
+    0x0001_0103, // v_readlane_b32 s15, v3, 0
+    0xBE90_030E, // s_mov_b32 s16, s14
+    0xBE91_030F, // s_mov_b32 s17, s15
+    0xBEFE_030C, // s_mov_b32 exec_lo, s12
 ];
 
 #[cfg(test)]

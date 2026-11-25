@@ -63,6 +63,8 @@ pub const ALL: u32 = MODULE | FIRST;
 pub(crate) struct Usage {
     /// A wave or quad operation.
     pub wave_ops: bool,
+    /// A double, as a result or an operand.
+    pub doubles: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
     /// A typed load of several components from a UAV.
@@ -996,7 +998,12 @@ impl Module {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.doubles |= matches!(self.types[inst.ty.0 as usize], TypeDef::Double);
+                for_each_operand(&inst.op, |v| {
+                    let ty = self.type_of(v);
+                    u.int64 |= wide(ty);
+                    u.doubles |= matches!(self.types[ty.0 as usize], TypeDef::Double);
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };

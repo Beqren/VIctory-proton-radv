@@ -217,7 +217,7 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() || p.died.load(Ordering::Relaxed) {
+    if p.left_out.is_some() {
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
@@ -226,20 +226,38 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        if p.died.load(Ordering::Relaxed) {
+            return None;
+        }
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
 }
 
-/// Makes `p` on this thread if it is not made yet (waiting for a worker
-/// that is making it); whether it has a host pipeline.
+/// Has `p` made if it is not made yet and waits for it, however long it
+/// takes; whether it has a host pipeline.
+///
+/// A worker makes it (this thread only where there are no workers): a
+/// thread that joined a worker in `made`'s initialisation would wait for
+/// ever if that worker ended there, and a program that ends the thread
+/// making it would end the title's thread here. This way [`watch`] sees the
+/// worker gone, marks the pipeline and the wait below ends.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    // (Making one whose worker died would wait for that worker for ever.)
-    if p.left_out.is_some() || p.died.load(Ordering::Relaxed) || ends_workers(&p.shaders) {
+    if p.left_out.is_some() {
         return false;
     }
-    p.make();
+    if p.made.get().is_none() && !p.died.load(Ordering::Relaxed) {
+        start(p, REQUESTED);
+        let (lock, done) = &DONE;
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while p.made.get().is_none() && !p.died.load(Ordering::Relaxed) {
+            held = done
+                .wait_timeout(held, Duration::from_millis(250))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
     p.made.get().is_some_and(|made| made.is_some())
 }
 
@@ -427,14 +445,31 @@ fn next() -> Arc<Pending> {
 /// What a worker is making now, for [`watch`].
 type Slot = Arc<Mutex<Option<Arc<Pending>>>>;
 
-/// Hashes of shaders whose host pipeline ended the worker that was making
-/// it: pipelines with one of them are not tried again in this run.
+/// The shaders, as [`shader_set`] names them, of pipelines that ended the
+/// worker making them: a pipeline of the same shaders (in another state,
+/// say) is not tried again in this run. By the whole set, not by each
+/// shader: a mesh shader that one pixel shader's pipeline died with is in
+/// other pipelines that are fine.
 static ENDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Whether one of `shaders` ended a worker before.
+/// The stages and hashes of a pipeline's shaders, in their order.
+fn shader_set(shaders: &[Arc<Shader>]) -> String {
+    let named: Vec<String> = shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    named.join(", ")
+}
+
+/// Whether a pipeline of these shaders ended a worker before.
 fn ends_workers(shaders: &[Arc<Shader>]) -> bool {
     let ended = ENDED.lock().unwrap_or_else(|e| e.into_inner());
-    !ended.is_empty() && shaders.iter().any(|s| ended.contains(&s.hash))
+    !ended.is_empty() && ended.contains(&shader_set(shaders))
+}
+
+/// Gives `p` up: it has no host pipeline and those waiting for it go on.
+fn give_up(p: &Pending) {
+    p.died.store(true, Ordering::Relaxed);
+    let (lock, done) = &DONE;
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    done.notify_all();
 }
 
 fn worker(i: usize, slot: Slot) -> std::io::Result<std::thread::JoinHandle<()>> {
@@ -449,9 +484,15 @@ fn worker(i: usize, slot: Slot) -> std::io::Result<std::thread::JoinHandle<()>> 
             }
             loop {
                 let p = next();
-                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
-                p.make();
-                *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                // (Queued, it may be, before its shaders were known to end
+                // the worker that makes them.)
+                if ends_workers(&p.shaders) {
+                    give_up(&p);
+                } else {
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(p.clone());
+                    p.make();
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 } else {
@@ -482,41 +523,44 @@ fn ended(thread: &std::thread::JoinHandle<()>) -> bool {
 /// Experimental of 2026-11-12 and GE-Proton11-14; a 64 MiB stack overflowed
 /// as the 2 MiB one did). Their pipelines then stayed "being made" for the
 /// rest of the run with a worker lost for each.
-fn watch(mut threads: Vec<(std::thread::JoinHandle<()>, Slot)>) {
+fn watch(threads: Vec<(std::thread::JoinHandle<()>, Slot)>) {
+    // (`None`: no worker could be started in the place of one that ended.)
+    let mut threads: Vec<(Option<std::thread::JoinHandle<()>>, Slot)> =
+        threads.into_iter().map(|(thread, slot)| (Some(thread), slot)).collect();
     loop {
         std::thread::sleep(Duration::from_millis(250));
         for (i, (thread, slot)) in threads.iter_mut().enumerate() {
-            if !ended(thread) {
+            if !thread.as_ref().is_some_and(ended) {
                 continue;
             }
             let making = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(p) = making {
-                let shaders: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+                let shaders = shader_set(&p.shaders);
                 tracing::warn!(
-                    ?shaders,
+                    shaders,
                     worker = i,
                     "a pipeline worker ended while making a host pipeline (under Wine: a stack overflow in the host's shader converter); the pipeline is given up and its draws or dispatches are dropped"
                 );
-                ENDED
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend(p.shaders.iter().map(|s| s.hash.clone()));
-                p.died.store(true, Ordering::Relaxed);
                 {
-                    let (lock, done) = &DONE;
-                    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    done.notify_all();
+                    let mut ended = ENDED.lock().unwrap_or_else(|e| e.into_inner());
+                    if !ended.contains(&shaders) {
+                        ended.push(shaders);
+                    }
                 }
+                give_up(&p);
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
                 }
             } else {
                 tracing::warn!(worker = i, "a pipeline worker ended");
             }
-            match worker(i, slot.clone()) {
-                Ok(new) => *thread = new,
-                Err(e) => tracing::warn!(error = %e, worker = i, "no pipeline worker in its place"),
-            }
+            *thread = match worker(i, slot.clone()) {
+                Ok(new) => Some(new),
+                Err(e) => {
+                    tracing::warn!(error = %e, worker = i, "no pipeline worker in its place: one fewer from here on");
+                    None
+                }
+            };
         }
     }
 }

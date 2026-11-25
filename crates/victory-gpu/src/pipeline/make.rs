@@ -280,17 +280,114 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Whether the frame's budget is one for all threads together: a thread
-/// that waits takes what is left of it and gives back what it did not
-/// use. Counted only when a wait had ended, the budget was one per thread:
-/// each of the title's five recording threads began its first wait of a
-/// frame with nothing counted yet and waited the whole half second, 2.5 s
-/// of waiting in every frame in which pipelines were being made (runs
-/// 34-49: "2504 ms waiting for pipelines" in each such frame).
-/// On by default; `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before.
-fn shared_budget() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+/// How the title's recording threads share a frame's waiting budget
+/// (`VICTORY_PIPELINE_WAIT_SHARED`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sharing {
+    /// `0`: a budget per thread, counted when a wait ends. Each of the
+    /// title's five recording threads began its first wait of a frame with
+    /// nothing counted yet and waited the whole half second, 2.5 s of
+    /// waiting in every frame in which pipelines were being made (runs
+    /// 34-49: "2504 ms waiting for pipelines" in each such frame).
+    PerThread,
+    /// The default (`take`): one budget, and a thread that waits takes all that is left
+    /// of it, giving back what it did not use when it is done. Meanwhile
+    /// every other thread finds nothing left and drops its draw or
+    /// dispatch at once. At the world's first frame that dropped the head
+    /// blend-shape mapping pass (CS_ComputeBlendshapeMappings,
+    /// 61e54e90adccaf6a), whose pipeline was made 1.5 ms after its first
+    /// bind (run blend-3): the title runs it once per head, so the maps
+    /// stayed at the title's 0xffffffff fill, every vertex of
+    /// 970c4fbb3b017c0e read source vertex 0xffff (out of its buffer:
+    /// zeros) and was put at one point, and the culling kept no meshlet of
+    /// any head (runs skin-1 to skin-17, blend-1 to blend-3).
+    Take,
+    /// `overlap`: one budget of wall time for all threads. Threads that
+    /// wait at the same time spend it together (the frame waits as long as
+    /// the longest of them), so the frame waits at most the budget and no
+    /// thread finds it taken by another's wait. Not the default yet: its
+    /// one title run (blend-4) ran the three mapping passes at the world's
+    /// first frame (frame 871), then the card faulted (gfxhub page fault,
+    /// ring gfx timeout after a 2 s submission of compute and mesh lists)
+    /// before a world frame was shown; whether a pass that now runs caused
+    /// it is not known.
+    Overlap,
+}
+
+fn sharing() -> Sharing {
+    static MODE: OnceLock<Sharing> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PIPELINE_WAIT_SHARED").ok().as_deref().map(str::trim) {
+        Some("0") => Sharing::PerThread,
+        Some("overlap") => Sharing::Overlap,
+        _ => Sharing::Take,
+    })
+}
+
+/// What a frame has waited for pipelines ([`wait`]).
+#[derive(Clone, Copy, Debug)]
+struct FrameBudget {
+    frame: u64,
+    /// Waited in the frame so far (with [`Sharing::Take`]: also what the
+    /// threads waiting now have taken).
+    spent: Duration,
+    /// [`Sharing::Overlap`]: the wait going on now, since when and how many
+    /// threads are in it.
+    open: Option<(Instant, u32)>,
+}
+
+impl FrameBudget {
+    const fn new() -> Self {
+        FrameBudget { frame: u64::MAX, spent: Duration::ZERO, open: None }
+    }
+
+    /// A thread of frame `frame` begins to wait at `now`: how long it may.
+    fn begin(&mut self, mode: Sharing, frame: u64, budget: Duration, now: Instant) -> Duration {
+        if self.frame != frame {
+            *self = FrameBudget { frame, ..FrameBudget::new() };
+        }
+        match mode {
+            Sharing::PerThread => budget.saturating_sub(self.spent),
+            Sharing::Take => {
+                let left = budget.saturating_sub(self.spent);
+                self.spent += left;
+                left
+            }
+            Sharing::Overlap => {
+                let going = self.open.map_or(Duration::ZERO, |(since, _)| now.saturating_duration_since(since));
+                let left = budget.saturating_sub(self.spent + going);
+                if !left.is_zero() {
+                    self.open = Some(match self.open {
+                        Some((since, n)) => (since, n + 1),
+                        None => (now, 1),
+                    });
+                }
+                left
+            }
+        }
+    }
+
+    /// The thread that [`Self::begin`] gave `left` stops waiting at `now`,
+    /// having waited `waited`. A frame that began meanwhile has its own
+    /// budget.
+    fn end(&mut self, mode: Sharing, frame: u64, left: Duration, waited: Duration, now: Instant) {
+        if self.frame != frame || left.is_zero() {
+            return;
+        }
+        match mode {
+            Sharing::PerThread => self.spent += waited,
+            Sharing::Take => self.spent = self.spent.saturating_sub(left.saturating_sub(waited)),
+            Sharing::Overlap => {
+                if let Some((since, n)) = self.open {
+                    if n <= 1 {
+                        self.spent += now.saturating_duration_since(since);
+                        self.open = None;
+                    } else {
+                        self.open = Some((since, n - 1));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Waits for `p` while frame `frame` has budget left.
@@ -308,24 +405,14 @@ fn wait(p: &Pending, frame: u64) {
     let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
-    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENTS: [Mutex<FrameBudget>; 2] = [const { Mutex::new(FrameBudget::new()) }; 2];
     let frame_spent = &SPENTS[usize::from(compute)];
-    let shared = shared_budget();
-    let left = {
-        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
-        if spent.0 != frame {
-            *spent = (frame, Duration::ZERO);
-        }
-        let left = budget.saturating_sub(spent.1);
-        if shared {
-            spent.1 += left;
-        }
-        left
-    };
+    let mode = sharing();
+    let started = Instant::now();
+    let left = frame_spent.lock().unwrap_or_else(|e| e.into_inner()).begin(mode, frame, budget, started);
     if left.is_zero() {
         return;
     }
-    let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !slow(p) && !p.died.load(Ordering::Relaxed) {
@@ -341,17 +428,10 @@ fn wait(p: &Pending, frame: u64) {
     let waited = started.elapsed().min(left);
     let past = waited.saturating_sub(wait_budget());
     past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
-    {
-        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
-        // A frame that began meanwhile has its own budget.
-        if spent.0 == frame {
-            if shared {
-                spent.1 = spent.1.saturating_sub(left - waited);
-            } else {
-                spent.1 += waited;
-            }
-        }
-    }
+    frame_spent
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .end(mode, frame, left, waited, Instant::now());
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,
@@ -639,6 +719,42 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    /// Two recording threads wait in one frame: the second is not left
+    /// without budget while the first waits (that dropped the head
+    /// blend-shape mapping pass at the world's first frame), and the frame
+    /// as a whole waits no longer than the budget.
+    #[test]
+    fn a_second_thread_waits_while_the_first_does() {
+        let ms = Duration::from_millis;
+        let budget = ms(500);
+        let t0 = Instant::now();
+
+        let o = Sharing::Overlap;
+        let mut b = FrameBudget::new();
+        let first = b.begin(o, 7, budget, t0);
+        assert_eq!(first, budget);
+        let second = b.begin(o, 7, budget, t0 + ms(100));
+        assert_eq!(second, ms(400), "the second thread waits until the first's deadline");
+        b.end(o, 7, first, ms(300), t0 + ms(300));
+        b.end(o, 7, second, ms(400), t0 + ms(500));
+        assert!(b.begin(o, 7, budget, t0 + ms(600)).is_zero(), "the frame waited its budget");
+        // A new frame has its own.
+        assert_eq!(b.begin(o, 8, budget, t0 + ms(600)), budget);
+
+        // Waits one after the other add up.
+        let mut b = FrameBudget::new();
+        let first = b.begin(Sharing::Overlap, 1, budget, t0);
+        b.end(Sharing::Overlap, 1, first, ms(200), t0 + ms(200));
+        assert_eq!(b.begin(Sharing::Overlap, 1, budget, t0 + ms(1000)), ms(300));
+
+        // The default (`take`): the second thread finds nothing left.
+        let mut b = FrameBudget::new();
+        let first = b.begin(Sharing::Take, 7, budget, t0);
+        assert!(b.begin(Sharing::Take, 7, budget, t0 + ms(100)).is_zero());
+        b.end(Sharing::Take, 7, first, ms(300), t0 + ms(300));
+        assert_eq!(b.begin(Sharing::Take, 7, budget, t0 + ms(300)), ms(200));
     }
 
     #[test]

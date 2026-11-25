@@ -477,8 +477,9 @@ pub(crate) fn shaders_text(this: This) -> String {
 }
 
 /// Whether a shader of the title's pipeline `this` holds `name` in its
-/// container (diagnostics: programs found by the title's own names).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// container (programs found by the title's own names: diagnostics, and
+/// `State::skin_no_blend`).
+#[cfg(windows)]
 pub(crate) fn holds_name(this: This, name: &[u8]) -> bool {
     !this.is_null() && pipeline(this).shaders.iter().any(|s| s.container.windows(name.len()).any(|w| w == name))
 }

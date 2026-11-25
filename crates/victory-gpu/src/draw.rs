@@ -412,9 +412,8 @@ fn asked_wide() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_WIDE").is_some_and(|v| v == "1"))
 }
 
-/// Diagnostics: title descriptor handles a fresh copy of a table makes
-/// null (`State::skin_no_blend`).
-#[cfg(feature = "diagnostics")]
+/// Title descriptor handles a fresh copy of a table makes null
+/// (`State::skin_no_blend`).
 static NULLED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
 /// Since the start: slots draws asked for (`State::note_asked`), and
@@ -2251,23 +2250,33 @@ impl State {
     }
 
     /// Diagnostics: at a dispatch of the title's head blend-shape programs
-    /// (`ped_standard_head_cs`), the floats of each buffer it reads or
+    /// (`ped_standard_head_cs`) and of the head's skinning
+    /// (`CS_PedStandardSkinning_11`), the floats of each buffer it reads or
     /// writes through its table, in title memory (where what earlier
     /// dispatches wrote has been copied back) and in the host copy: how
     /// many are NaN, infinite, huge or zero, and how many bytes the two
-    /// differ by. The heads drawn with blend shapes are the ones missing.
+    /// differ by; the host copy each view lies in; the first words of its
+    /// constant buffers. For 970c4fbb3b017c0e the 28-byte header it writes
+    /// at constant 0x30 of its output (from bytes 0x60..0x80 of table 0
+    /// dword 8) and the first vertices after it; for the skinning the same
+    /// words where it reads them (table 1 dword 0, at word 0 of the
+    /// constants at table 1 dword 72). The heads drawn with blend shapes are
+    /// the ones missing.
     #[cfg(feature = "diagnostics")]
     fn probe_blendshapes(&self, p: &HostPipeline) {
-        const NAMES: [&[u8]; 3] = [
+        const NAMES: [&[u8]; 5] = [
             b"CS_BlendshapeTranslationsHSSGraphOutputExtract",
             b"CS_ComputeStickyLips",
             b"CS_ReconstructBlendshapeNormals",
+            b"CS_PedStandardSkinning_11",
+            b"CS_ComputeBlendshapeMappings",
         ];
-        static SEEN: AtomicU64 = AtomicU64::new(0);
-        let Some(name) = NAMES.iter().find(|n| crate::pipeline::holds_name(self.pipeline as This, n)) else {
+        static SEEN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+        let Some(which) = NAMES.iter().position(|n| crate::pipeline::holds_name(self.pipeline as This, n)) else {
             return;
         };
-        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        let name = NAMES[which];
+        let n = SEEN[which].fetch_add(1, Ordering::Relaxed);
         if n >= 48 && n % 400 != 0 {
             return;
         }
@@ -2287,7 +2296,30 @@ impl State {
             }
             format!("{} floats: {nan} NaN {inf} inf {huge} huge {zero} zero", bytes.len() / 4)
         };
+        let words = |bytes: &[u8]| -> Vec<u32> {
+            bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()
+        };
+        // `len` bytes at `address`: title memory's and the host copy's words.
+        let at = |address: u64, len: usize| -> String {
+            let mut title = vec![0u8; len];
+            let t = if crate::host::read_into(address as *const u8, &mut title) {
+                format!("{:08x?}", words(&title))
+            } else {
+                "unreadable".to_owned()
+            };
+            let mut host = vec![0u8; len];
+            let copy = crate::shadow::find(address, len as u64);
+            let h = match &copy {
+                Some(s) if s.peek(address, &mut host) => format!("{:08x?}", words(&host)),
+                Some(_) => "not readable".to_owned(),
+                None => "none".to_owned(),
+            };
+            format!("title {t} host(copy {:?}) {h}", copy.as_ref().map(|s| s.id()))
+        };
         let mut text = String::new();
+        // Constant words and buffer ranges by (slot, dword).
+        let mut constants: Vec<((u8, u32), Vec<u32>)> = Vec::new();
+        let mut ranges: Vec<((u8, u32), (u64, u64))> = Vec::new();
         for stage in &p.stages {
             for u in &stage.translated().used {
                 let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
@@ -2295,12 +2327,27 @@ impl State {
                 };
                 let handle = table + u64::from(u.table_offset_dwords) * 4;
                 let view = crate::descriptor::view(handle);
+                let label = format!("{:?} s{}+{}", u.kind, u.slot, u.table_offset_dwords);
+                if let Some(View::Constant(address, size)) = view {
+                    let mut bytes = vec![0u8; (size as usize).min(256) & !3];
+                    if crate::host::read_into(address as *const u8, &mut bytes) {
+                        let w = words(&bytes);
+                        text.push_str(&format!("\n    {label} constants {address:#x}+{size:#x}: {w:08x?}"));
+                        constants.push(((u.slot, u.table_offset_dwords), w));
+                    } else {
+                        text.push_str(&format!("\n    {label} constants {address:#x}+{size:#x}: unreadable"));
+                    }
+                    continue;
+                }
+                let desc: String = format!("{view:?}").chars().take(160).collect();
                 let Some((address, len)) = view.as_ref().and_then(crate::descriptor::host::buffer_range) else {
+                    text.push_str(&format!("\n    {label} no buffer range: view {desc}"));
                     continue;
                 };
-                let desc: String = format!("{view:?}").chars().take(160).collect();
+                ranges.push(((u.slot, u.table_offset_dwords), (address, len)));
                 let mut title = vec![0u8; len.min(64 << 10) as usize & !3];
                 if title.is_empty() || !crate::host::read_into(address as *const u8, &mut title) {
+                    text.push_str(&format!("\n    {label} {address:#x}+{len:#x} unreadable: view {desc}"));
                     continue;
                 }
                 let mut host = vec![0u8; title.len()];
@@ -2312,15 +2359,151 @@ impl State {
                 } else {
                     "host copy not readable".to_owned()
                 };
+                let span = copy.as_ref().map(|s| {
+                    let (start, size) = s.span();
+                    format!("{} of {start:#x}+{size:#x}", s.id())
+                });
                 text.push_str(&format!(
-                    "\n    {:?} s{}+{} {address:#x}+{len:#x} (copy {:?}) view {desc}: title {}; {differ}",
-                    u.kind,
-                    u.slot,
-                    u.table_offset_dwords,
-                    copy.as_ref().map(|s| s.id()),
+                    "\n    {label} {address:#x}+{len:#x} (copy {span:?}) view {desc}: title {}; {differ}",
                     stats(&title)
                 ));
             }
+        }
+        let constant = |slot: u8, dword: u32, index: usize| {
+            constants.iter().find(|(k, _)| *k == (slot, dword)).and_then(|(_, w)| w.get(index).copied())
+        };
+        let range = |slot: u8, dword: u32| ranges.iter().find(|(k, _)| *k == (slot, dword)).map(|(_, r)| *r);
+        let root_constants: Vec<u32> = self
+            .compute
+            .iter()
+            .find_map(|r| match r {
+                Root::Constants(v) => Some(v[..v.len().min(4)].to_vec()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        match which {
+            0 => {
+                // 970c4fbb3b017c0e: constants at table 0 dword 56; input
+                // header at bytes 0x60..0x80 of table 0 dword 8; output at
+                // table 0 dword 48, its header at constant word 12 (0x30).
+                if let Some((input, _)) = range(0, 8) {
+                    let mut h = [0u8; 32];
+                    if crate::host::read_into((input + 0x60) as *const u8, &mut h) {
+                        let w = words(&h);
+                        let f = |i: usize| f32::from_bits(w[i]);
+                        // What thread 0 writes: base less a tenth of the range, the mode, 1.2 the scale.
+                        let expect = [
+                            f(0) + f32::from_bits(0xc9cc_cccc) * f(4),
+                            f(1) + f32::from_bits(0xc9cc_cccc) * f(5),
+                            f(2) + f32::from_bits(0xc5cc_cc00) * f(6),
+                            f(4) * 1.2,
+                            f(5) * 1.2,
+                            f(6) * 1.2,
+                        ];
+                        text.push_str(&format!(
+                            "\n    input header {w:08x?}: base {:?} mode {} scale {:?}; output header expected {expect:?}",
+                            [f(0), f(1), f(2)],
+                            w[3],
+                            [f(4), f(5), f(6)],
+                        ));
+                    }
+                }
+                if let (Some((out, len)), Some(o)) = (range(0, 48), constant(0, 56, 12)) {
+                    let o = u64::from(o);
+                    text.push_str(&format!(
+                        "\n    root constants {root_constants:08x?}; output at {o:#x} of {len:#x}: {}",
+                        if o + 60 <= len { at(out + o, 60) } else { "beyond the view".to_owned() }
+                    ));
+                    // Raw inputs of 64 vertices spread over the mesh, and what
+                    // this buffer holds for them (an earlier frame's output),
+                    // for a reference computed off line.
+                    let read = |a: u64, n: usize| -> Option<Vec<u32>> {
+                        let mut b = vec![0u8; n * 4];
+                        crate::host::read_into(a as *const u8, &mut b).then(|| words(&b))
+                    };
+                    let count = constant(0, 56, 1).unwrap_or(0);
+                    if let (Some((map, _)), Some((input, _)), Some(k4), Some(k5)) =
+                        (range(0, 24), range(0, 8), constant(0, 56, 4), constant(0, 56, 5))
+                    {
+                        let step = (count / 64).max(1);
+                        let mut v = 0;
+                        while v < count && (40..48).contains(&n) {
+                            let m = read(map + 4 * u64::from(v), 1).map_or(0, |w| w[0]);
+                            let q = read(input + u64::from(k4 + k5 * (m & 0xffff)), 2);
+                            let d = if m >> 16 != 0xffff {
+                                range(0, 16).and_then(|(deltas, _)| {
+                                    let at = (m >> 16) * 3 + constant(0, 56, 15).unwrap_or(0);
+                                    let mut b = [0u8; 6];
+                                    crate::host::read_into((deltas + 2 * u64::from(at)) as *const u8, &mut b)
+                                        .then(|| [0, 2, 4].map(|i| u16::from_le_bytes([b[i], b[i + 1]])))
+                                })
+                            } else {
+                                None
+                            };
+                            let got = read(out + o + 28 + 8 * u64::from(v), 2);
+                            // The second correction (root constant 0 set, index below word 0).
+                            let second = match (constant(0, 56, 0), constant(0, 56, 6), constant(0, 56, 7)) {
+                                (Some(k0), Some(k6), Some(k7)) if (m & 0xffff) < k0 => {
+                                    read(input + u64::from(k6 + k7 * (m & 0xffff)) + 8, 1).map(|w| w[0])
+                                }
+                                _ => None,
+                            };
+                            text.push_str(&format!(
+                                "\n    vertex {v}: map {m:08x} packed {q:08x?} deltas {d:04x?} second {second:08x?} output {got:08x?}"
+                            ));
+                            v += step;
+                        }
+                    }
+                }
+            }
+            3 => {
+                // CS_PedStandardSkinning_11: this frame's blend output at
+                // table 1 dword 0, last frame's at dword 24, the offset in
+                // word 0 of the constants at table 1 dword 72 (word 3: on).
+                if let Some(o) = constant(1, 72, 0) {
+                    let o = u64::from(o);
+                    for dword in [0u32, 24] {
+                        if let Some((base, len)) = range(1, dword) {
+                            text.push_str(&format!(
+                                "\n    blend output s1+{dword} at {o:#x} of {base:#x}+{len:#x}: {}",
+                                if o + 60 <= len { at(base + o, 60) } else { "beyond the view".to_owned() }
+                            ));
+                        }
+                    }
+                }
+            }
+            4 => {
+                // CS_ComputeBlendshapeMappings (61e54e90adccaf6a): for each
+                // vertex below constant word 0, the record at word 6 + word 7
+                // times the vertex of table 0 dword 0; a record whose dword 3
+                // has top byte 0xb6 swaps (delta index - 1) << 16 | vertex
+                // into the map (table 0 dword 8) at the dword (dword 1 >> 16) - 1.
+                if let (Some((records, _)), Some(k0), Some(k6), Some(k7)) =
+                    (range(0, 0), constant(0, 16, 0), constant(0, 16, 6), constant(0, 16, 7))
+                {
+                    let (mut marked, mut low, mut high, mut first) = (0u32, u32::MAX, 0u32, None);
+                    for v in 0..k0.min(1 << 16) {
+                        let mut b = [0u8; 16];
+                        if !crate::host::read_into((records + u64::from(k6 + k7 * v)) as *const u8, &mut b) {
+                            break;
+                        }
+                        let w = words(&b);
+                        if w[3] & 0xff00_0000 == 0xb600_0000 {
+                            marked += 1;
+                            low = low.min(w[1] >> 16);
+                            high = high.max(w[1] >> 16);
+                            first.get_or_insert((v, w.clone()));
+                        }
+                    }
+                    text.push_str(&format!(
+                        "\n    {k0} vertices, {marked} marked, map dwords {low}..={high} (less one); first {first:08x?}"
+                    ));
+                }
+                if let Some((map, len)) = range(0, 8) {
+                    text.push_str(&format!("\n    map {map:#x}+{len:#x}: {}", at(map, 32)));
+                }
+            }
+            _ => {}
         }
         tracing::info!(
             "blend-shape probe {} #{n} frame {}:{text}",
@@ -2372,15 +2555,18 @@ impl State {
     }
 
 
-    /// Diagnostics, `VICTORY_SKIN_NO_BLEND=1`: before a dispatch of the
-    /// head's skinning (`CS_PedStandardSkinning_11`, 36e010b53acffd77), the
-    /// buffer views of its table 1 (the blend-shape output it adds to the
-    /// rest pose: s1+0 this frame's, s1+24 the last frame's) are shown as
-    /// null views, so the head is skinned without its blend shapes. A test
-    /// of whether the blend-shape output is what puts the head's meshlets
-    /// outside the culling (run skin-12: the three blend-shape programs
-    /// skipped left the buffer as it was, and the head stayed culled).
-    #[cfg(feature = "diagnostics")]
+    /// `VICTORY_SKIN_NO_BLEND=1` (off by default, every build): before a
+    /// dispatch of the head's skinning (`CS_PedStandardSkinning_11`,
+    /// 36e010b53acffd77), the buffer views of its table 1 that hold the
+    /// blend-shape output it adds to the rest pose (dword 0 this frame's,
+    /// dword 24 the last frame's) are shown as null views; the program
+    /// skips its blend-shape path on a view with no records, so the head
+    /// is skinned in its neutral pose (run skin-14: heads drawn, faces
+    /// still, hair off the head).
+    /// shortcut: a stopgap for heads that are not drawn at all. Their
+    /// blend-shape output is degenerate because the title's one-off
+    /// mapping pass (CS_ComputeBlendshapeMappings, 61e54e90adccaf6a) is
+    /// dropped at the world's first frame (see `pipeline::make::Sharing`).
     fn skin_no_blend(&self) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_SKIN_NO_BLEND").is_some_and(|v| v == "1")) {
@@ -2392,7 +2578,7 @@ impl State {
         let Some(Root::Table(table)) = self.compute.get(1) else {
             return;
         };
-        for dwords in [0u64, 6] {
+        for dwords in [0u64, 24] {
             let handle = table + dwords * 4;
             let Some(view) = crate::descriptor::view(handle) else {
                 continue;
@@ -2415,7 +2601,6 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        #[cfg(feature = "diagnostics")]
         self.skin_no_blend();
         // It may write the arguments a window holds clamped.
         self.window = None;
@@ -2457,7 +2642,6 @@ impl State {
         }
         let bound = self.bind(list, p, true);
         // Only this dispatch's tables were to be made with null entries.
-        #[cfg(feature = "diagnostics")]
         NULLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2981,7 +3165,6 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                #[cfg(feature = "diagnostics")]
                 if NULLED.lock().unwrap_or_else(|e| e.into_inner()).contains(&(table + u64::from(k) * 32)) {
                     host.make_null(index);
                     continue;

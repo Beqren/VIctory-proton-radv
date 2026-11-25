@@ -1426,7 +1426,7 @@ pub(crate) fn log(frames: f64) {
              fault/card/writing/every-view/mapped/not-by-us: {}/{:.0}); 4 KiB pages the kernel reported written {:.0}; \
              VirtualProtect read-only here {:.0} {:.2} ms, read-only at other views {:.0} {:.2} ms, read-write (opening) \
              {:.0} {:.2} ms; blocks opened (fault/card/writing/every-view/mapped) here {} at other views {}; \
-             fault handler waited for the guards' lock {:.2} ms",
+             fault handler waited for the guards' lock {:.2} ms; blocks at other views noted written and left read-only {:.0}",
             p[P_GUARD_CALLS],
             p[P_GUARD_CLEAN],
             p[P_GUARD_LOCK_US] / 1e3,
@@ -1444,6 +1444,7 @@ pub(crate) fn log(frames: f64) {
             why(P_OPENED),
             why(P_OPENED_ALIAS),
             p[P_FAULT_LOCK_US] / 1e3,
+            p[P_NOTED_ALIAS],
         );
     }
     // What is copied whole, largest first: memory nobody tells us about.

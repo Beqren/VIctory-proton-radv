@@ -444,6 +444,9 @@ pub(crate) const P_WRITTEN_WHY: usize = 24;
 /// Microseconds in the fault handler waiting for the guards' lock.
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) const P_FAULT_LOCK_US: usize = 30;
+/// Blocks at other views noted written but left read-only by a write of
+/// ours (`VICTORY_OPEN_ONE_VIEW`).
+pub(crate) const P_NOTED_ALIAS: usize = 31;
 
 /// Why a guarded block was opened (diagnostics).
 #[derive(Clone, Copy)]
@@ -662,7 +665,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 prep(P_WRITTEN_WHY + why, 1);
             }
             if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
+                // Written through the runtime, still read-only. With
+                // [`one_view`] another view of the page may be open (the
+                // one written through): guarded again first.
+                if one_view() && view_guard() {
+                    protect_views_of(&mut g, block);
+                }
                 g.clean.insert(block);
             } else {
                 run.get_or_insert(block);
@@ -733,24 +741,58 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
         for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
-            }
+            protect_views_of(g, block);
         }
     }
+}
+
+/// The other views of `block`'s page made read-only, and all its views
+/// noted guarded together ([`protect`]).
+fn protect_views_of(g: &mut Guards, block: usize) {
+    let shown = crate::inplace::pages_of(block * BLOCK);
+    // One view (nothing else to guard), or the page the title shows
+    // wherever it has nothing (thousands of views): each view of
+    // that one is guarded by itself.
+    if shown.len() < 2 || shown.len() > MANY_VIEWS {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for alias in shown {
+        let alias = alias / BLOCK;
+        g.aliased.insert(alias);
+        if alias != block {
+            protect_alias(g, alias);
+        }
+    }
+}
+
+/// Whether a write of ours (the copy-back's, a title copy at submission,
+/// the runtime's kernel reads: [`writing`]) opens only the view it goes
+/// through, leaving the other views of the same pages read-only and only
+/// noting them written (taken out of `clean`) (`VICTORY_OPEN_ONE_VIEW=1`).
+///
+/// Why: such a write needs one view writable, and the copy-back makes most
+/// of them. Run 1 of the preparing study (late world lines, diagnostics
+/// build): the copy-back opened ~1,060 blocks a frame and with them ~5,400
+/// blocks at other views of their pages, one `VirtualProtect` each, ~7,000
+/// read-write calls a frame in all (10-11 ms); the refreshes then made
+/// ~5,600 of those read-only again (4.2 ms) besides ~1,300 calls for the
+/// blocks themselves, in 15 ms a frame of guarding again; the fault handler
+/// waited 40-45 ms a frame (title threads) for the guards' lock meanwhile.
+///
+/// What it still guarantees: a block noted clean is read-only at every
+/// view of its page (pages of 2 to [`MANY_VIEWS`] views), so a title write
+/// to it through any view faults. The other views keep their protection
+/// and lose `clean`, so their copies see the pages written (as when they
+/// were opened); a title write through one of them still faults and opens
+/// every view ([`open`]). `guard`, noting such a read-only block clean
+/// again, first makes the views of its page read-only (the written view
+/// is open), which it did not need to before: every view had been opened
+/// together.
+fn one_view() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -879,7 +921,26 @@ pub(crate) fn writing_from_card(at: usize, len: usize) {
 
 fn writing_why(at: usize, len: usize, why: Why) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len), why);
+    let end = at.saturating_add(len);
+    if one_view() {
+        let mut g = guards();
+        open_here(&mut g, at, end, why, false);
+        if at < end && !g.aliased.is_empty() {
+            let aliased: Vec<usize> = g.aliased.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+            for block in aliased {
+                for alias in crate::inplace::pages_of(block * BLOCK) {
+                    let alias = alias / BLOCK;
+                    if alias != block && g.clean.remove(&alias) {
+                        prep(P_NOTED_ALIAS, 1);
+                        #[cfg(feature = "diagnostics")]
+                        g.why.insert(alias, why as u8);
+                    }
+                }
+            }
+        }
+    } else {
+        open(&mut guards(), at, end, why);
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }

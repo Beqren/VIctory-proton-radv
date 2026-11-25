@@ -10,7 +10,8 @@
 //! 2. The title pipelines a run drew or dispatched with are listed by a key
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
-//!    creation, during loading.
+//!    creation, during loading. This record is kept whether or not the host
+//!    has a library ([`record_path`]).
 //!
 //! Library calls overlap: the host documents the library as safe to use
 //! from several threads ("The pipeline library is thread-safe to use, and
@@ -430,7 +431,6 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// had it mapped (a system that refuses to replace a mapped file): the next
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
-const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -561,11 +561,13 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the record of title pipelines if it changed ([`save_record`]),
+/// and the library if pipelines were added since its last save and
+/// `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    save_record(now);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -583,17 +585,15 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let bytes: usize = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        if added == 0 {
             return;
         }
-        if added == 0 {
-            0
-        } else {
+        {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
@@ -607,12 +607,8 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    // With what earlier runs listed: a run that asks for no title pipeline
-    // (`victory warm`) wrote an empty list over theirs, and the next world
-    // began with every pipeline still to be asked for.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
-    if bytes > 0 && library_written.is_ok() {
+    let library_written = replace_library(dir, &tmp);
+    if library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -626,12 +622,9 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
+    match library_written {
         Ok(()) => tracing::info!(
             bytes,
-            early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -682,18 +675,106 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
+/// The record of the title pipelines draws and dispatches asked for, kept
+/// across sessions (`VICTORY_PIPELINE_RECORD`: on by default, in the
+/// pipeline cache's folder; `0` keeps none; any other value is the file).
+/// One key a line ([`Pending`](super::make::Pending)'s: the shaders' hashes
+/// and the graphics state). Written as it grows ([`save_record`]), so a run
+/// that is killed keeps it.
+///
+/// It was the early list, written only with the host pipeline library;
+/// vkd3d-proton refuses the library ("no host pipeline library: pipelines
+/// are not kept" in every run under Proton), so no list was ever written
+/// and every session made every pipeline when it was first drawn with
+/// ("title pipelines to start early pipelines=0", run loss-1808). A file of
+/// its own name, so that builds which read the old list are not changed.
+fn record_path() -> Option<&'static PathBuf> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| match std::env::var_os("VICTORY_PIPELINE_RECORD") {
+        Some(v) if v == "0" => None,
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => DIR.get().map(|d| d.join(RECORD_FILE)),
+    })
+    .as_ref()
+}
+
+const RECORD_FILE: &str = "title-pipelines.txt";
+/// The first line of the record: a file of another form is not read.
+const RECORD_HEAD: &str = "victory title pipelines 1";
+
+/// The keys of a record's text; none if it is not a record of this form.
+pub(crate) fn parse_record(text: &str) -> HashSet<String> {
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some(RECORD_HEAD) {
+        return HashSet::new();
+    }
+    lines
+        .map(str::trim)
+        .filter(|l| l.len() == 32 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .take(EARLY_MAX)
+        .collect()
+}
+
+/// A record's text for `keys` (sorted, so that a record that did not change
+/// is written the same).
+pub(crate) fn format_record<'a>(keys: impl IntoIterator<Item = &'a String>) -> String {
+    let mut keys: Vec<&String> = keys.into_iter().collect();
+    keys.sort_unstable();
+    let mut text = String::from(RECORD_HEAD);
+    for key in keys {
+        text.push('\n');
+        text.push_str(key);
+    }
+    text.push('\n');
+    text
+}
+
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
+        let listed = record_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let set = parse_record(&listed);
+        tracing::info!(pipelines = set.len(), record = ?record_path(), "title pipelines to start early, from the record");
         *used = Some(set);
     }
     used
+}
+
+/// Writes the record if it changed, at most every 5 s (or `now`). Called
+/// by the workers and once a second by the frame meter.
+pub(crate) fn save_record(now: bool) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+    let Some(path) = record_path() else { return };
+    if !USED_CHANGED.load(Ordering::Relaxed) {
+        return;
+    }
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if !now && last.is_some_and(|t| t.elapsed() < EVERY) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    USED_CHANGED.store(false, Ordering::Relaxed);
+    // With what earlier runs recorded: a run that asks for no title
+    // pipeline keeps theirs.
+    let (text, n) = {
+        let used = used();
+        let set = used.iter().flatten();
+        (format_record(set), used.as_ref().map_or(0, HashSet::len))
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match write_atomically(path, text.as_bytes()) {
+        Ok(()) => tracing::debug!(pipelines = n, "title pipeline record saved"),
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, path = %path.display(), "title pipeline record not saved");
+        }
+    }
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
@@ -724,6 +805,25 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// The record reads back what it wrote, sorted; a file of another form
+    /// (the old early list had no head line) and lines that are no key are
+    /// not read.
+    #[test]
+    fn the_record_reads_back_what_it_wrote() {
+        let a = "0123456789abcdef0123456789abcdef".to_owned();
+        let b = "fedcba9876543210fedcba9876543210".to_owned();
+        let text = format_record([&b, &a]);
+        assert_eq!(text, format!("{RECORD_HEAD}\n{a}\n{b}\n"));
+        let read = parse_record(&text);
+        assert_eq!(read, HashSet::from([a.clone(), b.clone()]));
+        assert_eq!(format_record(&read), text, "the same keys give the same file");
+        assert!(parse_record(&format!("{a}\n{b}\n")).is_empty(), "no head line");
+        assert!(parse_record("").is_empty());
+        let damaged = format!("{RECORD_HEAD}\n{a}\nnot a key\n{}\n\n", &b[..20]);
+        assert_eq!(parse_record(&damaged), HashSet::from([a]));
+        assert_eq!(parse_record(&format_record(&HashSet::new())).len(), 0);
     }
 
     #[test]

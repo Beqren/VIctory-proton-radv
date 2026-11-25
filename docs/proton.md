@@ -346,6 +346,63 @@ Fixes, helped by the faster frames of the patched wineserver:
   textures asked for and missing on the card, it prints the frames and seconds after
   the world's first frame until none is missing.
 
+### Frames of several seconds at scene cuts
+
+Symptom: steady play at 4 to 5 frames a second, and now and then a frame of
+2 to 4 s (the owner's session loss-1808: frame 1400 took 3,618 ms; the
+per-second line said 3,557 ms a frame with only about 320 ms in its
+meters). The title's simulation step follows the frame time, so such a
+frame may also be what throws geometry about for a frame.
+
+Cause: a scene cut brings about fifty pipelines the session has not made.
+Until then a graphics draw whose pipeline was not made could wait up to
+4 s a frame (`LOADING_FRAME`, meant for the load before the world; the
+run's bound on such waits, 120 s, counted only each wait's part past
+half a second and never closed). A recording thread queues a pipeline only
+when it records the draw, and then waits for it, so the eight workers made
+them one at a time. In frame 1401 of loss-1808, about 20 pipelines in a
+row took 0.6 s of translation and 1.9 s of host compile (vkd3d-proton's
+DXIL to SPIR-V and RADV), 10 to 70 ms and 20 to 230 ms each.
+
+Fixes (branch `warm-pipelines`):
+
+- In the world a graphics draw waits within the frame's budget only
+  (`VICTORY_PIPELINE_WAIT_MS`, 500 ms a frame); past it the draw is dropped
+  for that frame and the rest of the frame's new pipelines are queued at
+  once and made side by side. `VICTORY_PIPELINE_WORLD_WAIT=1` brings the
+  4 s back. Shortcut: a pass the title draws only once at a scene cut can
+  be lost. Compute dispatches still wait without that bound
+  (`VICTORY_COMPUTE_WAIT`, up to 20 s a frame), for the passes the title
+  runs once.
+- The record of title pipelines that draws and dispatches asked for is
+  written as it grows (`<cache>/pipelines/title-pipelines.txt`,
+  `VICTORY_PIPELINE_RECORD`: `0` none, or another file). It used to be
+  written only with the host pipeline library, which vkd3d-proton refuses,
+  so no session ever had one. The title creates its pipelines during its
+  load, and a host pipeline depends only on what the creation hands over,
+  so a pipeline of the record is started at creation, at the lowest
+  priority (`VICTORY_PIPELINE_WARM=0` turns this off,
+  `VICTORY_PIPELINE_WARM_MAX` caps it); a draw that asks for it first takes
+  it over.
+- Measured (diagnostics build, 240 s, 200 s of world, one run each,
+  2026-11-25): with an empty record, the world's first frame 3,532 ms (it
+  is still a loading frame), after it the longest frame 834 ms, none over
+  1 s, at most 325 ms of a frame waiting for pipelines; with the record of
+  that run (1,842 pipelines), all 1,853 started were made during the
+  title's load (in 21 s, 3.0 s of translation and 0.9 s of host compile
+  summed: every cache warm), 1,815 of 1,842 first uses found their pipeline
+  made, the world's first frame took 931 ms, the longest 568 ms, at most
+  66 ms of a frame waiting. Of the first uses, 1,820 came more than 10 s
+  after the title created the pipeline. The shared baseline (base15, same
+  settings, without these changes) had a world's first frame of 4,454 ms,
+  then 1,440 ms (a burst of 39 new pipelines) and 1,028 ms before its device
+  was removed 78 s into the world. Dropped draws, refused pipelines and
+  worker deaths (`runstat.py`) did not rise.
+- Every build logs each frame of more than a second in the world with what
+  its threads waited for pipelines, and every second the longest frame and
+  the pipeline waits; each host pipeline's translation and host compile
+  times (`host pipeline made`).
+
 ### "a descriptor read only as data"
 
 Symptom: shader does not translate, with that reason. Forty programs of the pack

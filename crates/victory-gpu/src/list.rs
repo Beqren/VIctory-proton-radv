@@ -150,7 +150,7 @@ fn note_submission(this: This) {
             list = ?this,
             times = k + 1,
             again = n,
-            frame = crate::queue::presented() + 1,
+            frame = crate::frame::current(),
             "a list submitted again without a reset (its recording went with its first submission)"
         );
     }

@@ -929,6 +929,19 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            #[cfg(all(windows, feature = "diagnostics"))]
+            {
+                use crate::copystat::{C, add};
+                let n = u64::from(r.count);
+                match r.kind {
+                    0 => add(C::PagesRun, n),
+                    // Run 6 also read each source page: 0-170 of these
+                    // pages a frame were of zeros (the probe is gone).
+                    1 => add(C::PagesOne, n),
+                    2 => add(C::PagesUnmapped, n),
+                    _ => add(C::PagesLeft, n),
+                }
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),

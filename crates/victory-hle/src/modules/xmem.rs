@@ -393,6 +393,41 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Diagnostics: whether the title's page mappings change anything. In run
+/// 3 of the frame study none did (0 of 2,000-3,700 pages a frame were
+/// already mapped as asked), so leaving such mappings undone gains nothing.
+#[cfg(feature = "diagnostics")]
+impl Physical {
+    /// The page shown at `at` ([`Slice::key`]), if a view of ours is there.
+    fn shown_at(&self, at: usize) -> Option<(usize, usize)> {
+        self.views
+            .range(..=at)
+            .next_back()
+            .filter(|(base, (size, _))| at < *base + size)
+            .map(|(base, (_, slice))| slice.key((at - base) / PAGE))
+    }
+
+    /// How many of the `n` pages from `base` on show already what `want`
+    /// says page `k` is to show (`Some(None)`: nothing; `None`: a page that
+    /// cannot be mapped, never counted).
+    fn already(&self, base: usize, n: usize, want: impl Fn(usize) -> Option<Option<(usize, usize)>>) -> usize {
+        (0..n).filter(|&k| want(k).is_some_and(|w| w == self.shown_at(base + k * PAGE))).count()
+    }
+}
+
+/// Diagnostics: a page mapping (the GPU's, or physical pages), its pages,
+/// those already so, and when it began; counted when it ends.
+#[cfg(feature = "diagnostics")]
+struct Counted(bool, usize, usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Counted {
+    fn drop(&mut self) {
+        victory_gpu::page_mapping(self.0, self.1 as u64, self.2 as u64, self.3.elapsed().as_micros() as u64);
+    }
+}
+
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -635,6 +670,20 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    #[cfg(feature = "diagnostics")]
+    let _count = {
+        let started = std::time::Instant::now();
+        let p = &*physical;
+        let same = p.already(base, n, |k| {
+            if pages.is_null() {
+                return Some(None);
+            }
+            // SAFETY: the title passes `n` page numbers.
+            let page = unsafe { *pages.add(k) };
+            p.pages.get(&page).map(|s| Some(s.key(0)))
+        });
+        Counted(false, n, same, started)
+    };
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
@@ -662,7 +711,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map_joined(&mut physical, base + i * PAGE, run * PAGE, first, false) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -707,6 +756,13 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    #[cfg(feature = "diagnostics")]
+    let _count = {
+        let started = std::time::Instant::now();
+        let n = len.div_ceil(PAGE);
+        let same = physical.already(to, n, |k| if from == 0 { Some(None) } else { physical.shown_at(from + k * PAGE).map(Some) });
+        Counted(true, n, same, started)
+    };
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
@@ -727,12 +783,121 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map_joined(&mut physical, to + k, PAGE, slice, true) {
             return false;
         }
     }
     true
 }
+
+/// Whether a page mapped next to a view that shows the pages just before
+/// or after it in the same section joins that view (`VICTORY_VIEW_JOIN=1`;
+/// off by default: not shown to pay).
+///
+/// Measured, same diagnostics build, late world lines: off (run 7) 123,000-
+/// 126,000 views, memory calls of the remaps 0.57-0.80 ms each, the GPU's
+/// mappings 0.66-0.99 ms a page; on (run 8) 97,700-99,800 views, 0.43-0.57
+/// ms a call, but joining adds calls and the GPU's mappings took 0.54-0.97
+/// ms a page; wineserver stayed one core busy and frame times moved within
+/// the runs' noise. Fewer views needs joins that last (the title cuts them
+/// again) or a different home for the pages.
+///
+/// Under Wine a view's mapping and unmapping cost grows with the views the
+/// process holds (a standalone bench under Proton Experimental, unmapping
+/// a page view and mapping another page there as `map` does: one page
+/// remapped in 14 us with 100 views, 192 us with 40,000, 569 us with 63,000), and the title
+/// maps its pages one at a time (`XMemMapPhysicalPages` of one page,
+/// `CopyPageMappingsBatchX` page by page): run 6 of the frame study held
+/// 123,000-128,000 views, its 2,000-4,400 remapping calls a frame took
+/// 0.6-0.9 ms each, 1.2-2.7 s a frame, and the mapping lock they hold is
+/// what the submitting thread waits for. Joining costs an unmapping of the
+/// neighbour and a coalescing of placeholders now, and makes cutting the
+/// joined view later dearer (it is unmapped whole and what stays mapped
+/// again, `unmap`); views are joined up to [`JOIN_MAX`].
+fn join_views() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_VIEW_JOIN").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// The most bytes a joined view grows to.
+const JOIN_MAX: usize = 16 * PAGE;
+
+/// [`map`], joining the view to the views on either side of it that show
+/// the slices just before and after it ([`join_views`]) if `may_join`.
+/// Only the GPU's page mappings join (`map_alias`): a neighbour is unmapped
+/// for a moment, and a title thread writing it then would fault. The GPU's
+/// mappings are of its tiled heap, which the title's code does not touch;
+/// our own reads of it in place wait for the mapping lock the caller holds,
+/// and our reads through the kernel fail softly. Physical pages the title
+/// maps (`XMemMapPhysicalPages`, its streaming pools) are only counted.
+fn map_joined(physical: &mut Physical, base: usize, len: usize, slice: Slice, may_join: bool) -> bool {
+    let left = physical
+        .views
+        .range(..base)
+        .next_back()
+        .filter(|(at, (size, s))| {
+            *at + size == base
+                && Arc::ptr_eq(&s.section, &slice.section)
+                && s.index + size / PAGE == slice.index
+                && size + len <= JOIN_MAX
+        })
+        .map(|(at, (size, s))| (*at, *size, s.clone()));
+    let right = physical
+        .views
+        .get(&(base + len))
+        .filter(|(size, s)| {
+            Arc::ptr_eq(&s.section, &slice.section)
+                && s.index == slice.index + len / PAGE
+                && size + len + left.as_ref().map_or(0, |l| l.1) <= JOIN_MAX
+        })
+        .map(|(size, _)| *size);
+    if left.is_none() && right.is_none() {
+        return map(physical, base, len, slice);
+    }
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::view_join(0);
+    if !may_join || !join_views() {
+        return map(physical, base, len, slice);
+    }
+    let from = left.as_ref().map_or(base, |l| l.0);
+    let to = base + len + right.unwrap_or(0);
+    let first = left.as_ref().map_or_else(|| slice.clone(), |l| l.2.clone());
+    // The neighbours go back to placeholders (their bytes stay in the
+    // section), the new range is cut out of its placeholder, and the
+    // placeholders become one.
+    if let Some(l) = &left {
+        unmap(physical, l.0, l.1);
+    }
+    if let Some(size) = right {
+        unmap(physical, base + len, size);
+    }
+    // SAFETY: placeholders only: the split fails harmlessly if the range is
+    // a whole placeholder; the coalescing spans whole placeholders.
+    let coalesced = unsafe {
+        VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        VirtualFree(from as *mut c_void, to - from, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0
+    };
+    if coalesced && map(physical, from, to - from, first) {
+        #[cfg(feature = "diagnostics")]
+        victory_gpu::view_join(1);
+        return true;
+    }
+    // Each part as it was, on its own placeholder (if the coalescing went
+    // through, they are cut out of it again by `map`'s split).
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::view_join(2);
+    if let Some(l) = left {
+        map(physical, l.0, l.1, l.2);
+    }
+    if let Some(size) = right {
+        let index = slice.index + len / PAGE;
+        map(physical, base + len, size, Slice { index, ..slice.clone() });
+    }
+    map(physical, base, len, slice)
+}
+
+/// `MEM_COALESCE_PLACEHOLDERS` (winnt.h): adjacent placeholders become one.
+const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
@@ -740,6 +905,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
+    #[cfg(feature = "diagnostics")]
+    let calling = std::time::Instant::now();
     let view = unsafe {
         VirtualFree(
             base as *mut c_void,
@@ -758,6 +925,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             0,
         )
     };
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::remap_call(calling.elapsed().as_micros() as u64);
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -781,6 +950,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         shown.push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::views_alive(physical.views.len());
     true
 }
 
@@ -869,6 +1040,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
+        #[cfg(feature = "diagnostics")]
+        let calling = std::time::Instant::now();
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -879,6 +1052,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        victory_gpu::remap_call(calling.elapsed().as_micros() as u64);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

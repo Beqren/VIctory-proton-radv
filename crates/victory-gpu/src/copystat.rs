@@ -226,6 +226,14 @@ pub(crate) enum C {
     BackOpenUs,
     BackWriteUs,
     BackWriteCalls,
+    /// The copy-back's race with a refresh (`crate::shadow::back_retry`):
+    /// pieces found guarded again between opening and writing (refused by
+    /// the kernel and opened again, seen read-only before a user-mode
+    /// write, or faulting in one); bytes left out because title memory
+    /// was not mapped; bytes refused and lost.
+    BackRaced,
+    BackUnmappedBytes,
+    BackDroppedBytes,
 }
 
 /// What became of a copy of a physical page: 0 made, 1 taken away the
@@ -295,8 +303,8 @@ pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
     add(s, same);
     add(t, us);
 }
-const COUNTERS: usize = 128;
-const _: () = assert!((C::BackWriteCalls as usize) < COUNTERS);
+const COUNTERS: usize = 160;
+const _: () = assert!((C::BackDroppedBytes as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1362,7 +1370,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copy back per frame: {:.0} pieces differed, {:.1} MB from the first to the last byte the card wrote, \
          {:.1} MB of it in 4 KiB pages the title's bytes changed in, {:.1} MB written in {:.0} write calls; \
-         {:.1} ms reading title memory, {:.1} ms opening its guards, {:.1} ms writing",
+         {:.1} ms reading title memory, {:.1} ms opening its guards, {:.1} ms writing; raced with a refresh \
+         (guarded again before the write) {:.1}, {:.3} MB left out where title memory was not mapped, {:.3} MB refused and lost",
         c[C::BackPieces as usize],
         mb(c[C::BackSpanBytes as usize]),
         mb(c[C::BackPageBytes as usize]),
@@ -1371,6 +1380,9 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackReadUs as usize]),
         ms(c[C::BackOpenUs as usize]),
         ms(c[C::BackWriteUs as usize]),
+        c[C::BackRaced as usize],
+        mb(c[C::BackUnmappedBytes as usize]),
+        mb(c[C::BackDroppedBytes as usize]),
     );
     // The write watch and the guards taken apart, and the locks around
     // them; and what the process did from a present to the first list call.

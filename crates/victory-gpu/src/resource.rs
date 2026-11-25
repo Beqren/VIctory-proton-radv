@@ -1438,8 +1438,10 @@ pub(crate) fn room() -> bool {
     if filled < FLOOR {
         return true;
     }
+    // What the copies of title buffers on the card may still take
+    // (`VICTORY_CARD_BUFFERS_RESERVE_MB`) counts as in use.
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
+        Some([budget, used, ..]) => used + crate::shadow::card_reserve_left() < budget / 10 * 9,
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1470,7 +1472,7 @@ pub(crate) fn reserve_room(asked: bool) -> bool {
     }
     let percent = if asked { 99 } else { percent };
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * percent,
+        Some([budget, used, ..]) => used + crate::shadow::card_reserve_left() < budget / 100 * percent,
         None => false,
     }
 }

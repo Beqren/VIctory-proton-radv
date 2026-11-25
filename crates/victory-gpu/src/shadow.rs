@@ -190,17 +190,20 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(size: u64) -> Result<ID3D12Resource, Refused> {
     if !cards() {
-        return None;
+        return Err(Refused::Off);
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
-        return None;
+    if size < least {
+        return Err(Refused::Floor);
     }
-    let host = host()?;
+    if size >= 1 << 30 {
+        return Err(Refused::Huge);
+    }
+    let host = host().ok_or(Refused::NotReady)?;
     if !host.card_ready() {
-        return None;
+        return Err(Refused::NotReady);
     }
     // Only while the card has room: with this copy on it, a fifth of the
     // budget the system gives us must still be free. Copies are made when
@@ -208,21 +211,113 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // Or within a reserve of their own that the textures leave free
+    // ([`card_reserve`]), as long as the card stays within its budget.
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
+        && !(CARD_BYTES[0].load(Ordering::Relaxed) + size <= card_reserve() && used + size <= budget)
     {
-        return None;
+        return Err(Refused::Room { budget, used });
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+        let alive = CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed) - size;
+        return Err(Refused::Cap { alive });
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    buffer.ok_or(Refused::NoBuffer)
 }
+
+/// Bytes of the card's budget kept for copies of title buffers on the card
+/// (`VICTORY_CARD_BUFFERS_RESERVE_MB`; 0, the default, none): the texture
+/// queue's rules (`resource::room`, `resource::reserve_room`) count what of
+/// it the copies have not taken yet as in use, and [`card_for`] makes a
+/// copy past four fifths of the budget while the copies' bytes stay within
+/// it (and the card within its budget).
+///
+/// Why: copies are made when a buffer is first used, and in the world that
+/// is after the textures have filled the card. Run 1 of the copy-back study
+/// (2026-11-25, viewtree Proton, diagnostics, `VICTORY_CARD_BUFFERS_MIN_MB=1`,
+/// late prologue frames): of the copies whose shaders' writes were looked
+/// for on the CPU, 71 of 1 MiB or more (619 MB, the largest 90, 50, 36,
+/// 25 MB) were all refused for room, made with the card at 94-99% of its
+/// budget (12.4-12.9 of 12.4-13.6 GB in use); 309 more were under the
+/// floor (28 MB together); none met the cap. Only the 174 MB heap, made
+/// before the textures, was on the card. Those copies cost 744 MB of
+/// snapshots (~50 ms a frame) and of compares on the CPU (~29 ms) a frame.
+///
+/// Measured (run 3 against run 1, same diagnostics build and settings, late
+/// prologue frames, with 1024): 97 copies on the card, 941 MB (from 1, 174
+/// MB: 767 MB more of the card's budget); snapshots 52-54 -> 1.6-1.7 ms a
+/// frame (752 -> 26 MB), finding the pieces 45-50 -> 0.9-1.0 ms; preparing
+/// 144-148 -> 92-96 ms, copying back 182-195 -> 126-131 ms; but on the GPU
+/// 96-104 -> 145-148 ms (125 MB sent up to the card sides and 100 MB of
+/// 1,540 pieces fetched a frame, against 18 and 3.6), and the frame did not
+/// move (median 251.6 -> 251.1 ms). Again with frame capture (run 5 against
+/// run 4): frame 245.5 -> 274.2 ms, the waits for the card 126 ms a frame,
+/// and `tools/shots.py` judged the pictures a little worse (edges 16.4 ->
+/// 15.1% over 41 matched shots). Off until the frame gains.
+pub(crate) fn card_reserve() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        if !cards() {
+            return 0;
+        }
+        std::env::var("VICTORY_CARD_BUFFERS_RESERVE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// What of [`card_reserve`] the copies on the card have not taken yet.
+pub(crate) fn card_reserve_left() -> u64 {
+    card_reserve().saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+}
+
+/// Why [`card_for`] gave a copy no card side.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // the fields are for the diagnostics' log
+pub(crate) enum Refused {
+    /// `VICTORY_CARD_BUFFERS=0`.
+    Off,
+    /// Under `VICTORY_CARD_BUFFERS_MIN_MB`.
+    Floor,
+    /// 1 GiB or more (the compare counts in 32 bits).
+    Huge,
+    /// No host yet, or the compare could not be made.
+    NotReady,
+    /// The card past four fifths of its budget with the copy on it.
+    Room { budget: u64, used: u64 },
+    /// Card copies' bytes alive would pass `VICTORY_CARD_BUFFERS_MB`.
+    Cap { alive: u64 },
+    /// The buffer could not be made.
+    NoBuffer,
+}
+
+impl Refused {
+    #[cfg(feature = "diagnostics")]
+    fn index(self) -> usize {
+        match self {
+            Refused::Off => 0,
+            Refused::Floor => 1,
+            Refused::Huge => 2,
+            Refused::NotReady => 3,
+            Refused::Room { .. } => 4,
+            Refused::Cap { .. } => 5,
+            Refused::NoBuffer => 6,
+        }
+    }
+}
+
+/// Diagnostics: copies of title buffers without a card side, by their start:
+/// their bytes and why ([`Refused::index`]; 7: on the card).
+#[cfg(feature = "diagnostics")]
+static CARD_REFUSED: Mutex<BTreeMap<u64, (u64, usize)>> = Mutex::new(BTreeMap::new());
+
+/// Diagnostics: copies of title buffers whose declared ranges were looked
+/// through on the CPU since the last line, by start.
+#[cfg(feature = "diagnostics")]
+static CPU_LOOKED: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
 
 /// The most bytes of windows outside buffers whose copies go to the card's
 /// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
@@ -961,6 +1056,7 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE, VirtualQuery,
     };
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     let end = at + bytes.len();
     let Some(_mapped) = crate::watch::title_memory_reading_now(at, bytes.len()) else {
         return false;
@@ -973,13 +1069,25 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
         if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0
             || info.State != MEM_COMMIT
             || info.Protect & PAGE_GUARD != 0
-            || !matches!(info.Protect & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
         {
             return false;
         }
         let stop = (info.BaseAddress as usize).saturating_add(info.RegionSize);
         if stop <= p {
             return false;
+        }
+        match info.Protect & 0xff {
+            PAGE_READWRITE | PAGE_EXECUTE_READWRITE => {}
+            // Guarded again by a copy's refresh since the guards were
+            // opened (the race of [`back_retry`]): the write faults into
+            // the guards' handler, which opens the block and notes it
+            // written. Handed to the kernel's write it would fail.
+            PAGE_READONLY if back_retry() && crate::watch::guarded_by_us(p, stop.min(end)) => {
+                crate::watch::card_raced();
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackRaced, 1);
+            }
+            _ => return false,
         }
         p = stop;
     }
@@ -1239,11 +1347,145 @@ fn probe_write(at: usize, bytes: &[u8], read: &[u8]) {
     }
 }
 
+/// Whether a write of what shaders wrote that finds its destination guarded
+/// again is opened again and written again, not dropped (on by default;
+/// `VICTORY_BACK_RETRY=0` drops it without a word, as before).
+///
+/// The race: [`put_back`] opens the guards at the destination
+/// (`crate::watch::writing_from_card`, which notes the blocks written),
+/// then writes. A copy's refresh on another thread (the copy-back runs on
+/// the relay thread while the next submission is prepared) can come in
+/// between: it takes the mark, copies the title's old bytes into its host
+/// copy, makes the block read-only again and calls it clean. The kernel's
+/// write then fails on the read-only page (under Wine a wineserver request
+/// writing with `process_vm_writev`, which honours the protection:
+/// `STATUS_PARTIAL_COPY`, see `crate::host::write_mapped`), which went on
+/// to the next piece: the shader's bytes were lost from title memory, and
+/// the copies of it held the bytes from before. [`write_user`] saw the
+/// page read-only and handed it to the kernel's write, with the same end.
+///
+/// With the switch a refused piece whose block is ours again is opened
+/// again (noted written, so the refresh that ran is followed by one that
+/// sees the bytes) and written again, up to [`BACK_TRIES`] times;
+/// [`write_user`] writes into such a block and the write faults into the
+/// guards' handler, which opens it. A piece refused for another reason is
+/// counted: not mapped (left alone, as always), or committed and refused
+/// (warned once: [`BACK_DROPPED`]). No lock is held across the write: the
+/// title's threads already wait 40-45 ms a frame in the fault handler for
+/// the guards' lock, and the kernel's writes take ~21 ms a frame.
+///
+/// shortcut: a page of more than `crate::watch::MANY_VIEWS` views (or
+/// `VICTORY_VIEW_GUARD=0`) is guarded at each view by itself, so a refresh
+/// at another view does not make this one read-only, the write lands, and
+/// that view can stay clean with the bytes from before (review finding;
+/// as before the fix, and as for every write of ours with one view opened).
+pub(crate) fn back_retry() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_RETRY").is_none_or(|v| v != "0"))
+}
+
+/// Writes of a raced piece ([`back_retry`]) before it counts as dropped.
+const BACK_TRIES: usize = 8;
+
+/// Bytes of what shaders wrote that could not be put into committed title
+/// memory, since the start (warned once).
+pub(crate) static BACK_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// `n` bytes at `at` of what shaders wrote are not in title memory: not
+/// mapped (as always, left alone), or refused and so lost (counted, and
+/// warned once).
+fn back_left_out(at: usize, n: usize, why: &str) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let known = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } != 0;
+    if known && info.State != MEM_COMMIT {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackUnmappedBytes, n as u64);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::BackDroppedBytes, n as u64);
+    if BACK_DROPPED.fetch_add(n as u64, Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            "what shaders wrote could not be put into title memory: {n} bytes at {at:#x} {why} \
+             (protection {:#x}, state {:#x}); counted from now on, not warned again",
+            info.Protect,
+            info.State,
+        );
+    }
+}
+
+/// Writes `bytes` (what shaders wrote, merged) into title memory at `at`,
+/// after `crate::watch::writing_from_card` opened the guards there.
+fn write_back(at: usize, bytes: &[u8]) {
+    if back_user() {
+        let (written, raced) = crate::watch::as_card_write(|| write_user(at, bytes));
+        if written {
+            if raced {
+                told_after(at, bytes.len());
+            }
+            return;
+        }
+    }
+    let mut failed = crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+    if failed.is_empty() || !back_retry() {
+        return;
+    }
+    let mut raced = false;
+    for _ in 0..BACK_TRIES {
+        if failed.is_empty() {
+            break;
+        }
+        let mut again = Vec::new();
+        for (a, n) in failed {
+            if crate::watch::reopen_for_card(a, n) {
+                raced = true;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackRaced, 1);
+            } else if !crate::watch::writable(a) {
+                back_left_out(a, n, "refused (not guarded by us)");
+                continue;
+            }
+            // Ours again and now opened, or opened meanwhile by a title
+            // write's fault (which noted it written; review finding):
+            // written again.
+            again.extend(crate::host::write_mapped(a as *mut u8, bytes[a - at..].as_ptr(), n));
+        }
+        failed = again;
+    }
+    for (a, n) in failed {
+        back_left_out(a, n, "still refused after it was opened again 8 times");
+    }
+    if raced {
+        told_after(at, bytes.len());
+    }
+}
+
+/// With [`back_retry`], after a raced write: the texture side is told of
+/// the write after it as well as before (`crate::watch::writing_from_card`):
+/// a texture pass between the two took the bytes from before (review
+/// finding on the race fix: a raced write that lands by a fault told
+/// nobody).
+///
+/// Only raced writes: telling it after every write (~1,750 a frame) went
+/// with a changed picture in both title runs that did (runs 4 and 5: the
+/// diner's tall glass drawn as chrome, the phone dark), against clear glass
+/// in the control without the fix (run 6) and in earlier captures. Not
+/// proven the cause, and the narrowed form was not run in the title.
+fn told_after(at: usize, len: usize) {
+    if back_retry() {
+        crate::descriptor::host::remapped(at, len);
+    }
+}
+
 /// Puts `merged` (the title's bytes at `address` with what shaders wrote
 /// put in) into title memory; `read` is title memory as it was read
-/// before the merge, `runs` ([`merged_runs`]) are the pages that differ
+/// before the merge (only [`back_exact`] and [`back_probe`] look at it:
+/// empty otherwise), `runs` ([`merged_runs`]) are the pages that differ
 /// from it. Returns the bytes written.
-fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)]) -> usize {
+pub(crate) fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)]) -> usize {
     if runs.is_empty() {
         return 0;
     }
@@ -1274,14 +1516,14 @@ fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)])
             probe_write(at, bytes, &read[lo..hi]);
         }
         crate::watch::writing_from_card(at, bytes.len());
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::watch::card_between(at, bytes.len());
         #[cfg(feature = "diagnostics")]
         let writing = {
             crate::copystat::add(crate::copystat::C::BackOpenUs, opening.elapsed().as_micros() as u64);
             std::time::Instant::now()
         };
-        if !(back_user() && write_user(at, bytes)) {
-            crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
-        }
+        write_back(at, bytes);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackWriteUs, writing.elapsed().as_micros() as u64);
         written += bytes.len();
@@ -1415,6 +1657,26 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+/// Threads kept for [`wide`]: a quarter of the processor's, 2 to 6, unless
+/// `VICTORY_WIDE_THREADS` says how many (1 to 32). The submitting thread's
+/// snapshots and the relay thread's compares share them.
+///
+/// Measured (run 2 with 12 against run 1 with 4, on 16 processor threads):
+/// snapshots 52-54 ms a frame either way (memory-bound), finding the pieces
+/// 45-50 -> 32-42 ms, but preparing 144-148 -> 168-227 ms and frames
+/// noisier (204-287 ms; median 237 against 252, within the runs' noise);
+/// run 2 also lost the device once (0x887A0005, cause not known). Left at
+/// the default.
+fn wide_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6), |n| n.clamp(1, 32))
+    })
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1423,7 +1685,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1675,6 +1937,42 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    // Which of those copies could have had the card look, and why they did
+    // not get a card side when they were made.
+    #[cfg(feature = "diagnostics")]
+    {
+        let looked = std::mem::take(&mut *CPU_LOOKED.lock().unwrap_or_else(|e| e.into_inner()));
+        let refused = CARD_REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        const WHY: [&str; 8] = ["off", "floor", "1 GiB or more", "not ready", "room (4/5 of the budget)", "cap", "no buffer", "on the card"];
+        let mut by = [(0u64, 0u64, 0u64); 8];
+        let mut biggest: Vec<u64> = Vec::new();
+        for start in &looked {
+            let Some(&(len, why)) = refused.get(start) else {
+                continue;
+            };
+            let small = len < 1 << 20;
+            by[why].0 += 1;
+            by[why].1 += len;
+            if small {
+                by[why].2 += 1;
+            } else {
+                biggest.push(len);
+            }
+        }
+        biggest.sort_unstable_by(|a, b| b.cmp(a));
+        let parts: Vec<String> = by
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.0 > 0)
+            .map(|(i, b)| format!("{}: {} copies {:.1} MB ({} under 1 MiB)", WHY[i], b.0, mb(b.1 as f64), b.2))
+            .collect();
+        let sizes: Vec<String> = biggest.iter().take(24).map(|&b| format!("{:.1}", mb(b as f64))).collect();
+        tracing::info!(
+            "copies looked through on the CPU since the last line, by why they have no card side: {}; of 1 MiB or more, MB: [{}]",
+            parts.join(", "),
+            sizes.join(" "),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2429,7 +2727,12 @@ impl Shadow {
     /// the frame line's counts.
     fn compared(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+        {
+            crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+            if !self.window {
+                CPU_LOOKED.lock().unwrap_or_else(|e| e.into_inner()).insert(self.start);
+            }
+        }
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
@@ -3284,7 +3587,24 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let refused = card_for(size);
+        #[cfg(feature = "diagnostics")]
+        {
+            let why = match &refused {
+                Ok(_) => 7,
+                Err(why) => why.index(),
+            };
+            CARD_REFUSED.lock().unwrap_or_else(|e| e.into_inner()).insert(key.0, (len, why));
+            if len >= 1 << 20 {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "a buffer's host copy: card side {:?}",
+                    refused.as_ref().map(|_| "made"),
+                );
+            }
+        }
+        let (buffer, card) = match refused.ok() {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(

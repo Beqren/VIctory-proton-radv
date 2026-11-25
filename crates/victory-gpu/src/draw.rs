@@ -412,6 +412,11 @@ fn asked_wide() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ASKED_WIDE").is_some_and(|v| v == "1"))
 }
 
+/// Diagnostics: title descriptor handles a fresh copy of a table makes
+/// null (`State::skin_no_blend`).
+#[cfg(feature = "diagnostics")]
+static NULLED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
 /// Since the start: slots draws asked for (`State::note_asked`), and
 /// textures made for such slots on a full card.
 pub(crate) static HEAP_TEXTURES_ASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2289,12 +2294,11 @@ impl State {
                     continue;
                 };
                 let handle = table + u64::from(u.table_offset_dwords) * 4;
-                let Some((address, len)) = crate::descriptor::view(handle)
-                    .as_ref()
-                    .and_then(crate::descriptor::host::buffer_range)
-                else {
+                let view = crate::descriptor::view(handle);
+                let Some((address, len)) = view.as_ref().and_then(crate::descriptor::host::buffer_range) else {
                     continue;
                 };
+                let desc: String = format!("{view:?}").chars().take(160).collect();
                 let mut title = vec![0u8; len.min(64 << 10) as usize & !3];
                 if title.is_empty() || !crate::host::read_into(address as *const u8, &mut title) {
                     continue;
@@ -2309,7 +2313,7 @@ impl State {
                     "host copy not readable".to_owned()
                 };
                 text.push_str(&format!(
-                    "\n    {:?} s{}+{} {address:#x}+{len:#x} (copy {:?}): title {}; {differ}",
+                    "\n    {:?} s{}+{} {address:#x}+{len:#x} (copy {:?}) view {desc}: title {}; {differ}",
                     u.kind,
                     u.slot,
                     u.table_offset_dwords,
@@ -2325,8 +2329,94 @@ impl State {
         );
     }
 
+    /// Diagnostics, `VICTORY_CULL_KEEP_ALL=1`: at a dispatch of the title's
+    /// meshlet culling of pre-skinned meshes (`CS_BatchCullPreSkinnedMeshlets`
+    /// and its variants), the textures its tables hold are shown as null
+    /// views. Its only texture is the depth pyramid (1024x512 R32_FLOAT,
+    /// table 0 dword 16 of 9f017d9011377efa); the program keeps a meshlet
+    /// when its nearest depth is at least the pyramid's (a larger depth is
+    /// nearer: `v_cmp_ge_f32` against the min of `image_gather4_l` reads),
+    /// so zeros there keep every meshlet the occlusion test sees. A test:
+    /// the slot stays null for every reader until the title writes it.
+    #[cfg(feature = "diagnostics")]
+    fn cull_keep_all(&self, p: &HostPipeline) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_CULL_KEEP_ALL").is_some_and(|v| v == "1")) {
+            return;
+        }
+        if !crate::pipeline::holds_name(self.pipeline as This, b"CS_BatchCullPreSkinnedMeshlets") {
+            return;
+        }
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                if u.root != RootType::Table || u.kind != ResourceType::Srv {
+                    continue;
+                }
+                let Some(Root::Table(table)) = self.compute.get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(view) = crate::descriptor::view(handle) else {
+                    continue;
+                };
+                if crate::descriptor::host::buffer_range(&view).is_some() {
+                    continue;
+                }
+                let Some((host, index)) = self.heap_of(handle).and_then(|h| Some((h.host()?, h.index(handle)?))) else {
+                    continue;
+                };
+                host.null_slot(index, &view);
+                once!(index, "culling keep-all test: the pre-skinned culling's texture shown as a null view");
+            }
+        }
+    }
+
+
+    /// Diagnostics, `VICTORY_SKIN_NO_BLEND=1`: before a dispatch of the
+    /// head's skinning (`CS_PedStandardSkinning_11`, 36e010b53acffd77), the
+    /// buffer views of its table 1 (the blend-shape output it adds to the
+    /// rest pose: s1+0 this frame's, s1+24 the last frame's) are shown as
+    /// null views, so the head is skinned without its blend shapes. A test
+    /// of whether the blend-shape output is what puts the head's meshlets
+    /// outside the culling (run skin-12: the three blend-shape programs
+    /// skipped left the buffer as it was, and the head stayed culled).
+    #[cfg(feature = "diagnostics")]
+    fn skin_no_blend(&self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_SKIN_NO_BLEND").is_some_and(|v| v == "1")) {
+            return;
+        }
+        if !crate::pipeline::holds_name(self.pipeline as This, b"CS_PedStandardSkinning_11") {
+            return;
+        }
+        let Some(Root::Table(table)) = self.compute.get(1) else {
+            return;
+        };
+        for dwords in [0u64, 6] {
+            let handle = table + dwords * 4;
+            let Some(view) = crate::descriptor::view(handle) else {
+                continue;
+            };
+            if crate::descriptor::host::buffer_range(&view).is_none() {
+                continue;
+            }
+            // Table 1 holds constants: the draw gets a fresh copy of it
+            // (`tables`), which reads this.
+            let mut nulled = NULLED.lock().unwrap_or_else(|e| e.into_inner());
+            if !nulled.contains(&handle) {
+                if nulled.len() > 4096 {
+                    nulled.clear();
+                }
+                nulled.push(handle);
+            }
+            once!(handle, "skinning without blend shapes test: the blend-shape output shown as a null view");
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        self.skin_no_blend();
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2365,7 +2455,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let bound = self.bind(list, p, true);
+        // Only this dispatch's tables were to be made with null entries.
+        #[cfg(feature = "diagnostics")]
+        NULLED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2378,6 +2472,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_blendshapes(p);
+        #[cfg(feature = "diagnostics")]
+        self.cull_keep_all(p);
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -2885,6 +2981,11 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                #[cfg(feature = "diagnostics")]
+                if NULLED.lock().unwrap_or_else(|e| e.into_inner()).contains(&(table + u64::from(k) * 32)) {
+                    host.make_null(index);
+                    continue;
+                }
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -3338,6 +3439,10 @@ impl State {
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        if ran && kind == DISPATCH {
+            self.cull_keep_all(p);
+        }
         if !ran {
             crate::indirect::done(list, &bounded);
             why("prepare failed");

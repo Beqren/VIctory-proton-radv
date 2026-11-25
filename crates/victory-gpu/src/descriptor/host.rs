@@ -1754,6 +1754,15 @@ impl HostHeap {
         };
     }
 
+    /// Diagnostics: host slot `index` shows a null view of the kind `view`
+    /// is (reads give zeros), whatever it showed; it stays so until the
+    /// title writes the slot again. For a test of the meshlet culling
+    /// (`State::cull_keep_all`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn null_slot(&self, index: u32, view: &View) {
+        null_for(view, self.cpu(index));
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
@@ -2178,12 +2187,33 @@ fn left_null(why: &'static str, unordered: bool, address: u64, len: u64, element
     }
 }
 
+/// Test, `VICTORY_SNORM16_BITS=1`: typed buffer views of 16-bit normalized
+/// formats (R16_UNORM, R16_SNORM) are made as R16_UINT, so that a typed
+/// load returns the 16 bits as they are. The head's blend-shape program
+/// (970c4fbb3b017c0e) loads its deltas through an R16_SNORM view
+/// (`buffer_load_format_x`) and reads the result as the low half of an f16
+/// (`v_fma_mix_f32 ... sel_lo`): with the value converted to f32 the low
+/// half is noise, and the heads in the opening were culled away (runs
+/// skin-11 to skin-15: with that output null the head is drawn). Run
+/// skin-17 with it on: the heads were still missing; a guess, kept off.
+fn snorm16_bits(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_SNORM16_BITS").is_some_and(|v| v == "1"))
+        && (format == DXGI_FORMAT_R16_SNORM || format == DXGI_FORMAT_R16_UNORM)
+    {
+        DXGI_FORMAT_R16_UINT
+    } else {
+        format
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    desc.Format = snorm16_bits(desc.Format);
     let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).

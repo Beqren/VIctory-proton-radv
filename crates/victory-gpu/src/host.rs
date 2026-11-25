@@ -1824,6 +1824,108 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 }
 
 #[cfg(test)]
+mod fetch_mark_tests {
+    use super::mark_value;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+
+    /// A mark is never 0 (a buffer the card never wrote) and never the
+    /// fetch before's (its leftover).
+    #[test]
+    fn marks_differ_from_nothing_and_from_the_last() {
+        for sent in [1u64, 2, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x1_0000_0000, u64::MAX - 1] {
+            assert_ne!(mark_value(sent), 0);
+            assert_ne!(mark_value(sent), mark_value(sent + 1), "{sent:#x}");
+        }
+    }
+
+    /// On the host's own GPU (skipped without one): a list that copies
+    /// into a buffer of the fetch's kind and then writes the mark leaves
+    /// the mark readable once its fence is reached, behind the copied
+    /// bytes, as `Host::relay_card_back` reads it.
+    #[test]
+    fn the_mark_is_written_behind_the_copies() {
+        // SAFETY: plain D3D12 objects of the test's own, waited for.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            let device = device.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let shared = |size: u64, pool| {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: pool,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let mut buffer: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                    .unwrap();
+                let buffer = buffer.unwrap();
+                let mut data = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut data)).unwrap();
+                (buffer, data as *mut u8)
+            };
+            let (source, src) = shared(4096, D3D12_MEMORY_POOL_L0);
+            for i in 0..4096 {
+                *src.add(i) = (i * 7 + 3) as u8;
+            }
+            let (fetch, data) = shared(16 << 20, D3D12_MEMORY_POOL_L0);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            // Made open: closed, as the host's lists are between uses.
+            list.Close().unwrap();
+            let total = 1001u64;
+            let mark = total.next_multiple_of(4);
+            for sent in 1..=3u64 {
+                allocator.Reset().unwrap();
+                list.Reset(&allocator, None).unwrap();
+                list.CopyBufferRegion(&fetch, 0, &source, 5, total);
+                let write = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                    Dest: fetch.GetGPUVirtualAddress() + mark,
+                    Value: mark_value(sent),
+                }];
+                list.cast::<ID3D12GraphicsCommandList2>()
+                    .unwrap()
+                    .WriteBufferImmediate(1, write.as_ptr(), Some([D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT].as_ptr()));
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+                queue.Signal(&fence, sent).unwrap();
+                fence.SetEventOnCompletion(sent, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+                let seen = std::ptr::read_volatile(data.add(mark as usize) as *const u32);
+                assert_eq!(seen, mark_value(sent), "fetch {sent}");
+                for i in 0..total as usize {
+                    assert_eq!(*data.add(i), *src.add(i + 5), "byte {i}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
@@ -2321,6 +2423,36 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
+/// Whether the relay's fetch of pieces of copies in the card's memory
+/// ([`Host::relay_card_back`]) writes a mark behind its copies and the
+/// merge goes ahead only if the mark is there (`VICTORY_FETCH_MARK=0`
+/// turns it off).
+///
+/// Why: run heads.log (2026-11-25, `VICTORY_RELAY=2`, the card's copies).
+/// The kernel log has a GPU page fault in that process at 06:57:10 and a
+/// gfx ring reset at 06:57:12; the frame then took 2.2 s, and at 06:57:12.9
+/// a title thread crashed on a null owner (+0xc) of the record its upload
+/// ring keeps in the last 0x18 bytes of each 64 KiB chunk (`0xad2ffe8`, in
+/// the 174 MB heap whose copy is on the card), the record all zeros, and
+/// the layer had reported no removal. Not proven, but the likely way: the
+/// fetch's fence completed with the device lost and before the removal was
+/// reported, the copy into the fetch buffer had not run, and its bytes
+/// (zeros, or an earlier fetch's) were merged into title memory as what
+/// shaders wrote. Three later runs that lost the device (tail-1, tail-2,
+/// pairoff-1) ended at the removal check in [`Host::relay_land`] instead:
+/// it saw the removal in time there.
+fn fetch_mark() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_MARK").is_none_or(|v| v != "0"))
+}
+
+/// The mark fetch number `sent` writes ([`fetch_mark`]): never 0, so a
+/// buffer the card never wrote does not pass, and never the mark of the
+/// fetch before, so that one's leftover does not pass either.
+fn mark_value(sent: u64) -> u32 {
+    (sent as u32) | 0x8000_0000
+}
+
 struct RelayFetch {
     list: Prelude,
     fence: ID3D12Fence,
@@ -3289,8 +3421,11 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
+        // The fetch's mark ([`fetch_mark`]) goes behind the pieces.
+        let mark = fetch_mark().then(|| total.next_multiple_of(4));
+        let need = mark.map_or(total, |m| m + 4);
+        if f.buffer.as_ref().is_none_or(|b| b.2 < need) {
+            let size = need.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
@@ -3308,6 +3443,17 @@ impl Host {
                 list.Reset(&allocator, None)?;
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                if let Some(mark) = mark {
+                    let write = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                        Dest: buffer.GetGPUVirtualAddress() + mark,
+                        Value: mark_value(sent),
+                    }];
+                    list.cast::<ID3D12GraphicsCommandList2>()?.WriteBufferImmediate(
+                        1,
+                        write.as_ptr(),
+                        Some([D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT].as_ptr()),
+                    );
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -3328,6 +3474,18 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        if let Some(mark) = mark {
+            // SAFETY: the mapping holds `need` bytes; the fence was waited for.
+            let seen = unsafe { std::ptr::read_volatile((data + mark as usize) as *const u32) };
+            if seen != mark_value(sent) {
+                fail(format_args!(
+                    "the card did not run the fetch of what shaders wrote to its memory (its mark reads {seen:#x}, \
+                     not {:#x}): the device was lost and its fence completed all the same; nothing fetched is merged \
+                     (VICTORY_RELAY=1)",
+                    mark_value(sent)
+                ));
+            }
+        }
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {

@@ -377,6 +377,18 @@ time (f8016e0); first halves of interpolations evaluated as pairs only in a prog
 refused for one, with the second translation made in `emit` so that the offline
 tools get it too (8dfd60d, a22290d). With these the scan reaches the counts above.
 
+Ports from upstream (branch d16-pack, 2026-11-25): 16-bit typed buffer data through
+integer views passes as bits (after 4243a96: the 63 compute_graph_ops programs, the
+face network; the host's table by heap slot carries the view's format kind), the same
+packing for tbuffer d16 loads (c430b1d; no program of the pack has one), and
+normalized buffer codes converted from integers (da82e44; on this card the host's
+division gave 16-bit code 257 back as 256, a test under Proton showed it). In the
+title the waitress's red face and the red streaks on the heroine's neck were gone in
+the d16 run; they are intermittent (one of two runs with the normalized fix showed
+them again). The eyes still glow: their lighting program reads no d16 data.
+Quad reads through quad reads in pixel programs (upstream 4015a18, the same lowering
+as 8487caf; branch d16-pack-quad) made skin plastic and glossy again: not merged.
+
 ## What was tried for the frame time
 
 Frames were slow because of the view list (see "The patched Proton"). Before that

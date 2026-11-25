@@ -824,6 +824,15 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// (Wine's SRW lock lets no reader in while a writer waits, and the writer
 /// does not wait: it comes back while the reader is being woken), so a
 /// read waited out runs of changes that never touched its texture.
+///
+/// Measured (same diagnostics build, off-screen, late world lines; run 1
+/// off, run 2 on, victory-remap findings): reads in place waited 85-377 ms
+/// a frame (median 202) off, 0.0 ms on, and none of them met a change of
+/// its own range (the whole wait was the lock's unfairness); the texture
+/// refreshes' wait for the lock 86-363 ms off, 0 on. Frame time did not
+/// move (runstat median 2,402 against 2,436 ms): the frame waits for the
+/// changes themselves, not for the lock. Off by default until a run
+/// shows a gain.
 fn by_range() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_RANGES").is_some_and(|v| v == "1"))

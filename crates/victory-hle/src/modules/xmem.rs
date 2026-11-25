@@ -880,6 +880,20 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// GPU's results copied back), do not reach the other side. Diagnostics
 /// builds compare each copy with the page when it is unmapped and count
 /// those that differ (the frame line's "copies ... differed").
+///
+/// Measured (same diagnostics build, `VICTORY_MAP_RANGES=1` in both, late
+/// world lines; run 3 off, run 4 on): runstat median world frame 1,830 ms
+/// off, 840 on; the remaps held the mapping lock 1,499 ms a frame (median)
+/// off, 256 on; the GPU's mappings 620-770 ms a frame off, 22-216 on; Wine
+/// views 122-129k off, 83-86k on. But NOT CORRECT: of the copies taken
+/// away, 98-997 a frame still matched their page and 34-622 did not, so
+/// the title or the GPU writes these pages through one side and reads
+/// them through the other. It stays off; it shows what taking the GPU's
+/// mappings out of Wine's view list is worth, which a true alias without
+/// a Wine view (a mapping of shared memory made below Wine) would give.
+/// A bench under the same Proton (one 64 KiB page "remapped"): as a view
+/// 23.6 us with 100 views alive, 83 with 10,000, 252 with 40,000, 552 with
+/// 125,000; as a copy 14-24 us whatever the views.
 fn copy_aliases() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_ALIAS_COPY").is_some_and(|v| v == "1"));
     *ON

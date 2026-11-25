@@ -5929,10 +5929,7 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
-            #[cfg(feature = "diagnostics")]
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
-            #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -5959,14 +5956,11 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
-            #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
             list.ResourceBarrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                 transition(
@@ -5976,6 +5970,9 @@ impl Host {
                 ),
             ]);
             copy.close();
+            // What a saved frame costs: the wait for the card (the present
+            // is not sent ahead then) and the encoding (`frames.tsv`).
+            let since = std::time::Instant::now();
             match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
@@ -5983,9 +5980,8 @@ impl Host {
                 }
                 None => self.execute(&[copy]),
             }
-            #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::save_read_back(frame, &buffer, &footprint, since);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);

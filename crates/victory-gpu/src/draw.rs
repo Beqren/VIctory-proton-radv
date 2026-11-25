@@ -576,6 +576,38 @@ const GRAPH_PROGRAMS: [&str; 65] = [
     "f3a16846866f61ab", "f42156fd1b46c292", "f8425d3c03df62a0", "fcbb2e25040a325b", "fd49b6d7aca608d3",
 ];
 
+/// The f32 an f16's bits stand for (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn half(h: u16) -> f32 {
+    let (sign, exp, man) = (u32::from(h >> 15), u32::from(h >> 10 & 0x1f), u32::from(h & 0x3ff));
+    let mag = match exp {
+        0 => man as f32 / (1 << 24) as f32,
+        31 if man == 0 => f32::INFINITY,
+        31 => f32::NAN,
+        e => f32::from_bits((e + 112) << 23 | man << 13),
+    };
+    if sign == 1 { -mag } else { mag }
+}
+
+/// Bytes read as f16s: how many are NaN or infinite, larger than 64 and
+/// than 4 in magnitude, and not zero (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn half_stats(bytes: &[u8]) -> String {
+    let (mut bad, mut big, mut over4, mut nz) = (0usize, 0usize, 0usize, 0usize);
+    for h in bytes.chunks_exact(2) {
+        let x = half(u16::from_le_bytes([h[0], h[1]]));
+        if !x.is_finite() {
+            bad += 1;
+        } else if x.abs() > 64.0 {
+            big += 1;
+        } else if x.abs() > 4.0 {
+            over4 += 1;
+        }
+        nz += usize::from(x != 0.0);
+    }
+    format!("as halves: {nz} not zero, {bad} NaN/inf, {big} over 64, {over4} over 4")
+}
+
 fn bake_probe(p: &HostPipeline) -> bool {
     let Some(stage) = p.stages.iter().find(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())) else {
         return false;
@@ -2697,22 +2729,41 @@ impl State {
                     format!("{} of {start:#x}+{size:#x}", s.id())
                 });
                 text.push_str(&format!(
-                    "\n    {label} {address:#x}+{len:#x} (copy {span:?}) view {desc}: title {} hash {:016x}; {differ}",
+                    "\n    {label} {address:#x}+{len:#x} (copy {span:?}) view {desc}: title {} hash {:016x}; {} {differ}",
                     stats(&title),
-                    fnv(&title)
+                    fnv(&title),
+                    half_stats(&title)
                 ));
             }
         }
         if !full {
             // The once-a-frame line: each view's hash, and for the extract
-            // the face network's output (table 0 dword 16) whole.
+            // the face network's output (table 0 dword 16) whole, as halves,
+            // and the halves the extract's first thread reads (from constant
+            // word 15 of table 0 dword 56 on, three a vertex).
             if which == 0
                 && let Some(&(_, (out, len))) = ranges.iter().find(|(k, _)| *k == (0, 16))
             {
                 let mut b = vec![0u8; len.min(4 << 20) as usize & !1];
                 if crate::host::read_into(out as *const u8, &mut b) {
                     let nz = b.chunks_exact(2).filter(|h| h != &[0u8, 0]).count();
-                    compact.push_str(&format!(" network output {nz} halves not zero, hash {:016x}", fnv(&b)));
+                    compact.push_str(&format!(
+                        " network output {nz} halves not zero, hash {:016x}, {}",
+                        fnv(&b),
+                        half_stats(&b)
+                    ));
+                    let first = constants
+                        .iter()
+                        .find(|(k, _)| *k == (0, 56))
+                        .and_then(|(_, w)| w.get(15).copied())
+                        .unwrap_or(0) as usize;
+                    let read: Vec<f32> = b
+                        .chunks_exact(2)
+                        .skip(first)
+                        .take(24)
+                        .map(|h| half(u16::from_le_bytes([h[0], h[1]])))
+                        .collect();
+                    compact.push_str(&format!(" read from half {first}: {read:?}"));
                 }
             }
             tracing::info!("blend-shape probe {} frame {frame} compact:{compact}", String::from_utf8_lossy(name));

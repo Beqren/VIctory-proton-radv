@@ -79,6 +79,9 @@ struct Grave {
     at: u64,
     recording: u64,
     ms: u64,
+    /// What it is and its bytes, as far as [`weigh`] knows.
+    kind: &'static str,
+    bytes: u64,
     #[allow(dead_code)] // held to be dropped
     object: Retired,
 }
@@ -253,13 +256,38 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    let boxed: Box<dyn std::any::Any> = Box::new(object);
+    let (kind, bytes) = weigh(boxed.as_ref());
     let grave = Grave {
         at: started,
         recording: if retire_lists() { RECORDED.load(Ordering::Acquire) } else { 0 },
         ms: now_ms(),
-        object: Retired(Box::new(object)),
+        kind,
+        bytes,
+        object: Retired(boxed),
     };
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(grave);
+}
+
+/// What a retired object is, and its bytes on the card where known.
+fn weigh(object: &dyn std::any::Any) -> (&'static str, u64) {
+    if let Some(t) = object.downcast_ref::<std::sync::Arc<crate::resource::HostTexture>>() {
+        return ("host texture", t.bytes());
+    }
+    if let Some(s) = object.downcast_ref::<std::sync::Arc<crate::shadow::Shadow>>() {
+        return ("copy", s.span().1);
+    }
+    if let Some(r) = object.downcast_ref::<ID3D12Resource>() {
+        // SAFETY: a plain query of a live resource.
+        let d = unsafe { r.GetDesc() };
+        let bytes = if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+            d.Width
+        } else {
+            d.Width * u64::from(d.Height) * u64::from(d.DepthOrArraySize.max(1)) * 4
+        };
+        return ("resource (a slot's)", bytes);
+    }
+    ("other", 0)
 }
 
 /// Whether retired objects wait for the list recordings begun before
@@ -444,6 +472,79 @@ pub(crate) fn log_removal_context() {
     tracing::error!("when the host device went: {}", removal_context());
     tracing::error!("when the host device went, the graveyard: {}", graveyard_report());
     tracing::error!("when the host device went, the last textures swept: {}", crate::resource::swept_report());
+    vamap::report();
+}
+
+/// GPU address ranges of the host's textures and copies, live and lately
+/// freed (`VICTORY_VA_MAP`, on by default; textures have an address only
+/// with `VICTORY_TEXTURE_VA=1`, which places each in a heap of its own),
+/// printed at a device removal so that the kernel's fault address can be
+/// matched to an object afterwards (the layer cannot read the kernel log).
+pub(crate) mod vamap {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::Mutex;
+
+    struct Live {
+        end: u64,
+        kind: &'static str,
+        what: String,
+        made: u64,
+    }
+
+    static LIVE: Mutex<BTreeMap<u64, Live>> = Mutex::new(BTreeMap::new());
+    /// Freed: start, end, kind, what, made, freed (the last 8,192).
+    static FREED: Mutex<VecDeque<(u64, u64, &'static str, String, u64, u64)>> = Mutex::new(VecDeque::new());
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_VA_MAP").is_none_or(|v| v != "0"))
+    }
+
+    /// `[start, start + len)` is a new object of `kind`.
+    pub(crate) fn made(start: u64, len: u64, kind: &'static str, what: impl FnOnce() -> String) {
+        if !on() || start == 0 {
+            return;
+        }
+        let made = super::now_ms();
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(start, Live { end: start + len, kind, what: what(), made });
+    }
+
+    /// The object at `start` is freed.
+    pub(crate) fn freed(start: u64) {
+        if !on() || start == 0 {
+            return;
+        }
+        let Some(l) = LIVE.lock().unwrap_or_else(|e| e.into_inner()).remove(&start) else {
+            return;
+        };
+        let mut f = FREED.lock().unwrap_or_else(|e| e.into_inner());
+        if f.len() >= 8192 {
+            f.pop_front();
+        }
+        f.push_back((start, l.end, l.kind, l.what, l.made, super::now_ms()));
+    }
+
+    /// Every live range and every lately freed one, one line each, for the
+    /// removal report.
+    pub(crate) fn report() {
+        if !on() {
+            return;
+        }
+        let now = super::now_ms();
+        let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let freed = FREED.lock().unwrap_or_else(|e| e.into_inner());
+        tracing::error!(live = live.len(), freed = freed.len(), "va map at the device removal (va-live / va-freed lines follow)");
+        for (start, l) in live.iter() {
+            tracing::error!("va-live {start:#x} {:#x} {} age_ms={} {}", l.end, l.kind, now.saturating_sub(l.made), l.what);
+        }
+        for (start, end, kind, what, made, gone) in freed.iter() {
+            tracing::error!(
+                "va-freed {start:#x} {end:#x} {kind} age_ms={} freed_ms_ago={} {what}",
+                now.saturating_sub(*made),
+                now.saturating_sub(*gone)
+            );
+        }
+    }
 }
 
 /// The graveyard's state for the removal report ([`retire`]): objects
@@ -463,6 +564,16 @@ fn graveyard_report() -> String {
         )
     };
     let now = now_ms();
+    let by_kind = {
+        let g = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by: std::collections::BTreeMap<&'static str, (u64, u64)> = std::collections::BTreeMap::new();
+        for x in g.iter() {
+            let e = by.entry(x.kind).or_default();
+            e.0 += 1;
+            e.1 += x.bytes;
+        }
+        by.iter().map(|(k, (n, b))| format!("{k}: {n} ({} MB)", b >> 20)).collect::<Vec<_>>().join(", ")
+    };
     let (n, under_1s, under_5s, older, oldest_ms, newest_rec) = {
         let g = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         let ages: Vec<u64> = g.iter().map(|g| now.saturating_sub(g.ms)).collect();
@@ -479,7 +590,7 @@ fn graveyard_report() -> String {
         "rule {}; {n} objects waiting ({under_1s} under 1 s, {under_5s} 1-5 s, {older} older; the oldest {oldest_ms} ms), \
          waiting for recordings up to {newest_rec}; recordings begun {recorded}, the oldest outstanding {}, \
          {outstanding} outstanding ({unsent} not yet sent), {unused} empty; submissions started {started} finished {finished}; \
-         dropped at the ceiling so far {}",
+         dropped at the ceiling so far {}; by kind: {by_kind}",
         if retire_lists() { "lists" } else { "submissions" },
         if oldest == u64::MAX { "none".to_owned() } else { oldest.to_string() },
         RETIRED_AT_CEILING.load(Ordering::Relaxed),

@@ -127,6 +127,33 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// Submissions since the last reset: a list submitted again without a
+    /// reset has given its recording to the first ([`detach`]).
+    submitted: std::sync::atomic::AtomicU32,
+}
+
+/// Counts a submission of `this` since its reset; a second one (the title
+/// runs a recorded list again without recording it again) is noted: the
+/// host side went with the first, so the second runs nothing.
+#[cfg(windows)]
+fn note_submission(this: This) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // SAFETY: the title passes one of our lists.
+    let k = unsafe { &(*this.cast::<List>()).submitted }.fetch_add(1, Ordering::Relaxed);
+    if k == 0 {
+        return;
+    }
+    static AGAIN: AtomicU64 = AtomicU64::new(0);
+    let n = AGAIN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 10 || n.is_power_of_two() {
+        tracing::warn!(
+            list = ?this,
+            times = k + 1,
+            again = n,
+            frame = crate::frame::current(),
+            "a list submitted again without a reset (its recording went with its first submission)"
+        );
+    }
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -391,6 +418,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
+        note_submission(this);
         let Some(fresh) = fresh_list() else {
             continue;
         };
@@ -463,6 +491,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
+        note_submission(this);
         let Some(fresh) = fresh_list() else {
             continue;
         };
@@ -593,6 +622,7 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        submitted: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -641,6 +671,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    // SAFETY: as above.
+    unsafe { &(*this.cast::<List>()).submitted }.store(0, std::sync::atomic::Ordering::Relaxed);
     // The parts of a recording that was cut and never submitted go with it
     // (a submission takes the parts it runs).
     #[cfg(windows)]

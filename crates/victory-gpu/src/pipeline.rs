@@ -428,7 +428,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -448,7 +448,11 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The shader of `p` that `VICTORY_SKIP_PIPELINES` names, if any: its draws
+/// and dispatches are dropped (in every build: a play session on a release
+/// build tells which pass a device loss comes from). Each such hash is
+/// logged the first time a draw or dispatch of it is dropped.
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -458,10 +462,16 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
-        .iter()
-        .find(|shader| hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
+    let hit = p.shaders.iter().find(|shader| hashes.contains(&shader.hash)).map(|shader| shader.hash.as_str());
+    if let Some(hash) = hit {
+        static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+        if !logged.iter().any(|h| h == hash) {
+            logged.push(hash.to_owned());
+            tracing::warn!(hash, "VICTORY_SKIP_PIPELINES: draws and dispatches of this shader are dropped");
+        }
+    }
+    hit
 }
 
 /// The shader hashes of the title's pipeline `this`, as `[stage hash, ...]`
@@ -484,7 +494,7 @@ pub(crate) fn holds_name(this: This, name: &[u8]) -> bool {
     !this.is_null() && pipeline(this).shaders.iter().any(|s| s.container.windows(name.len()).any(|w| w == name))
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }

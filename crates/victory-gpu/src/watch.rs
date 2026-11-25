@@ -844,7 +844,7 @@ pub fn write_title_memory(at: usize, data: &[u8]) -> TitleWrite {
     }
     let mut reguarded = false;
     {
-        let _mapped = title_memory_reading();
+        let _mapped = title_memory_reading(at, len);
         {
             let g = guards();
             let mut p = at;

@@ -3679,6 +3679,49 @@ pub(crate) fn view_writes() -> Option<u64> {
     mark_bitmap().map(|b| b.gpu)
 }
 
+/// Read marks (`victory_shader::emit::read_marks`): the read-slots bitmap
+/// on the card (a bit per view-heap slot, `VIEW_READ_BITS`) and a buffer of
+/// zeros as long, which clears it. Copied down and cleared behind each
+/// submission with the page marks (`Host::marks_take`).
+pub(crate) fn read_bitmap() -> Option<&'static MarkBitmap> {
+    static BITMAP: std::sync::OnceLock<Option<MarkBitmap>> = std::sync::OnceLock::new();
+    BITMAP
+        .get_or_init(|| {
+            if !victory_shader::emit::read_marks() {
+                return None;
+            }
+            let bytes = u64::from(victory_shader::emit::VIEW_READ_BITS / 8);
+            // Device-local, made zeroed (committed resources are).
+            let bitmap = host()?.uav_buffer(bytes)?;
+            let zeros = host()?.uav_buffer(bytes)?;
+            crate::host::name(&bitmap, || "view slots shaders read by index".into());
+            crate::host::name(&zeros, || "zeros for the read slots".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
+            Some(MarkBitmap { bitmap, zeros, gpu })
+        })
+        .as_ref()
+}
+
+/// Read marks: the bitmap's GPU address, for the root UAV of shaders that
+/// mark their texture reads.
+pub(crate) fn view_reads() -> Option<u64> {
+    read_bitmap().map(|b| b.gpu)
+}
+
+/// Read marks: the words of the read-slots bitmap a copy-down takes: as many
+/// as the largest view heap has slots (0 before one is made: all of them).
+pub(crate) static READ_WORDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Read marks: [`READ_WORDS`], at most the bitmap's.
+pub(crate) fn read_words() -> usize {
+    let most = (victory_shader::emit::VIEW_READ_BITS / 32) as usize;
+    match READ_WORDS.load(Ordering::Relaxed) {
+        0 => most,
+        n => n.min(most),
+    }
+}
+
 /// Page marks, since the last frame-rate line: bytes of declared ranges
 /// not compared because nothing marked them; ranges cut to their marked
 /// pieces, and compared whole (a writer that does not mark); with `check`,

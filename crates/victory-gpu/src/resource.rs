@@ -1477,6 +1477,23 @@ pub(crate) fn reserve_room(asked: bool) -> bool {
     }
 }
 
+/// Read marks' eviction (`draw.rs`, `evict_textures`): past nine tenths of
+/// the card's budget (the line [`room`] stops making textures at), the
+/// bytes to give up to come back to 85% of it (upstream 69d1e8e: past 90%,
+/// the least recently used until 85%); 0 under the line or without a
+/// budget. What the copies of title buffers may still take counts as in
+/// use, as for [`room`].
+#[cfg(windows)]
+pub(crate) fn over_budget_line() -> u64 {
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => {
+            let used = used + crate::shadow::card_reserve_left();
+            if used >= budget / 10 * 9 { used - budget / 100 * 85 } else { 0 }
+        }
+        None => 0,
+    }
+}
+
 /// The last host textures the sweep let go: when, the title texture, and a
 /// weak handle that says whether the graveyard still holds it
 /// ([`swept_report`], in the removal report).

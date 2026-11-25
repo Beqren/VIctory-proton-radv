@@ -1098,6 +1098,255 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
     true
 }
 
+/// Whether a refresh copies the title's writes under a range that an
+/// earlier list of the same submission declared shaders write
+/// (`VICTORY_BUSY_REFRESH=0`: left alone, as before).
+///
+/// Why: upstream ed0dbfd (Marvisak/VIctory): skipped, the title's constants
+/// there (sizes, counts, addresses) stayed stale in the copy for the whole
+/// submission, and a dispatch read its sizes as zeros and looped until the
+/// device was removed. Here the losses of 2026-11-25 were GPU read faults
+/// (the texture unit at high addresses, the scalar cache at 0x0 and
+/// 0xb000), which a stale size or address under such a range fits.
+fn busy_refresh_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUSY_REFRESH").is_none_or(|v| v != "0"))
+}
+
+/// Whether busy ranges are refreshed ([`busy_refresh_on`]): only with
+/// nothing in the air. Then every declared range is this submission's,
+/// whose shaders have not run. Behind flights a range may be one a flight's
+/// shaders are writing now (into a copy in the PC's memory, directly): the
+/// title's bytes there go in beside theirs (`merge_under_writes`) or the
+/// flights are settled first. Not with kept snapshots, whose pieces say
+/// which bytes are current.
+fn busy_refresh(on: bool, keeps: bool, flying: bool) -> bool {
+    on && !keeps && !flying
+}
+
+/// The snapshot of a busy range after its refresh ([`Shadow::update_busy`])
+/// takes the copy's bytes there: no shader has run, so the copy is what
+/// the card starts from.
+fn busy_snapshot(snapshot: &mut [u8], copy: &[u8]) {
+    snapshot.copy_from_slice(copy);
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::{busy_refresh, busy_snapshot, changed_runs};
+
+    #[test]
+    fn busy_ranges_are_refreshed_only_with_nothing_in_the_air() {
+        assert!(busy_refresh(true, false, false));
+        assert!(!busy_refresh(true, false, true));
+        assert!(!busy_refresh(true, true, false));
+        assert!(!busy_refresh(false, false, false));
+    }
+
+    /// A model of a copy in the PC's memory: list A declares a range
+    /// (snapshot taken), the title then writes a size under it, list B of
+    /// the same submission refreshes it. B's dispatch must read the title's
+    /// size; the shaders' writes go back; the title's later write stays.
+    #[test]
+    fn a_title_write_under_a_busy_range_reaches_the_copy_and_is_not_undone() {
+        const N: usize = 64;
+        let base: Vec<u8> = (0..N as u32).map(|i| i as u8).collect();
+        let (mut copy, mut title) = (base.clone(), base.clone());
+        // A declares [0, N): its snapshot.
+        let mut snapshot = copy.clone();
+        // The title writes a size at 16..20.
+        title[16..20].copy_from_slice(&[0x40, 0, 0, 0]);
+        // B's refresh, with nothing in the air: the changed runs go into
+        // the copy, then the snapshot takes the copy's bytes.
+        for (at, n) in changed_runs(&title, &copy) {
+            copy[at..at + n].copy_from_slice(&title[at..at + n]);
+        }
+        busy_snapshot(&mut snapshot, &copy);
+        assert_eq!(&copy[16..20], &[0x40, 0, 0, 0], "the dispatch reads the title's size");
+        // The card runs: a shader writes 40..44.
+        copy[40..44].copy_from_slice(&[9, 9, 9, 9]);
+        // The title writes 16 again after the refresh.
+        title[16] = 0x80;
+        // The copy-back: the card's byte where the copy differs from the
+        // snapshot, else the title's.
+        for i in 0..N {
+            if copy[i] != snapshot[i] {
+                title[i] = copy[i];
+            }
+        }
+        assert_eq!(&title[40..44], &[9, 9, 9, 9], "the shader's write goes back");
+        assert_eq!(title[16], 0x80, "the title's later write stays");
+        assert_eq!(&title[17..20], &[0, 0, 0]);
+    }
+}
+
+/// Whether the copy-back writes into title memory only the 8-byte words
+/// where what shaders wrote changes the title's bytes
+/// (`VICTORY_BACK_EXACT=1`; off by default: everything from the first to
+/// the last byte the card wrote, or the pages of [`back_pages`]).
+///
+/// Why it might matter: the title's bytes in between were read from title
+/// memory moments before (`read_title`), and the title's threads keep
+/// running while we merge (on the relay's thread, at any time). Written
+/// back whole, a span puts those older bytes over whatever the title wrote
+/// meanwhile. Shortcut: not on by default, because the probe
+/// ([`back_probe`]) found no such write in about 564,000 (runs probeold-1,
+/// probeold-2, tail-1, 2026-11-25), and its cost in kernel write calls is
+/// not measured. It does not help with run heads.log's crash (the title
+/// read a null owner at +0xc of the record its upload ring keeps in the
+/// last 0x18 bytes of each chunk, `0xad2ffe8` in the 174 MB heap whose
+/// copy is on the card): the probe saw the card's zeros merged over such
+/// words, which this writes as well.
+pub(crate) fn back_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_EXACT").is_some_and(|v| v == "1"))
+}
+
+/// Whether each write of the copy-back first looks whether the title
+/// wrote, since we read it, bytes the write would put older bytes over
+/// (`VICTORY_BACK_PROBE=1`; off by default; one more read of title memory
+/// per write). Each such write is logged (the first 200), and a count is
+/// logged every 2,000 writes.
+fn back_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_PROBE").is_some_and(|v| v == "1"))
+}
+
+/// Title memory as read before a merge, for [`put_back`]: kept only when
+/// [`back_exact`] or [`back_probe`] looks at it (a copy of every piece,
+/// 63-77 MB a frame, otherwise).
+fn kept_read(title: &[u8]) -> Vec<u8> {
+    if back_exact() || back_probe() { title.to_vec() } else { Vec::new() }
+}
+
+/// The word size of [`exact_runs`]: the title's own stores of pointers and
+/// counters are 8-byte aligned words, so a word the card left alone is
+/// never written, and a word it changed is written whole.
+const EXACT_WORD: usize = 8;
+
+/// The parts of `merged` (to go to title address `address`) that differ
+/// from `read` (title memory as read before the merge), widened to whole
+/// words of title memory aligned to [`EXACT_WORD`] and joined where they
+/// touch, as offsets `[lo, hi)`.
+fn exact_runs(address: usize, merged: &[u8], read: &[u8]) -> Vec<(usize, usize)> {
+    let n = merged.len().min(read.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut lo = 0;
+    while lo < n {
+        let hi = ((address + lo) / EXACT_WORD + 1) * EXACT_WORD - address;
+        let hi = hi.min(n);
+        if merged[lo..hi] != read[lo..hi] {
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+        lo = hi;
+    }
+    runs
+}
+
+/// [`back_probe`]: before a write of `bytes` to `at`, where title memory
+/// read `read` and the merge left `bytes` (the card's bytes put in):
+/// bytes the title has changed since that the write would put older
+/// bytes over (those where `bytes` is the title's old byte, not the
+/// card's).
+fn probe_write(at: usize, bytes: &[u8], read: &[u8]) {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    static UNDOING: AtomicU64 = AtomicU64::new(0);
+    static UNDONE_BYTES: AtomicU64 = AtomicU64::new(0);
+    let mut now = vec![0u8; bytes.len()];
+    if crate::host::read_into(at as *const u8, &mut now) {
+        let mut undone = 0usize;
+        let mut first = None;
+        for i in 0..bytes.len() {
+            if now[i] != read[i] && bytes[i] == read[i] {
+                undone += 1;
+                first.get_or_insert(i);
+            }
+        }
+        if let Some(i) = first {
+            let k = UNDOING.fetch_add(1, Ordering::Relaxed);
+            UNDONE_BYTES.fetch_add(undone as u64, Ordering::Relaxed);
+            if k < 200 {
+                let w = (at + i) & !7;
+                let word = |v: &[u8]| {
+                    let o = w - at;
+                    let mut b = [0u8; 8];
+                    for (j, x) in b.iter_mut().enumerate() {
+                        *x = v.get(o + j).copied().unwrap_or(0);
+                    }
+                    u64::from_le_bytes(b)
+                };
+                tracing::warn!(
+                    at = format_args!("{:#x}", at),
+                    len = bytes.len(),
+                    undone,
+                    first = format_args!("{:#x}", at + i),
+                    title_now = format_args!("{:#x}", if w >= at { word(&now) } else { 0 }),
+                    would_be = format_args!("{:#x}", if w >= at { word(bytes) } else { 0 }),
+                    "copy-back probe: the title wrote bytes since we read them that this write puts older bytes over"
+                );
+            }
+        }
+    }
+    // What the merge took from the card: bytes it puts zero over the
+    // title's nonzero bytes, and words of the last 0x18 bytes of a 64 KiB
+    // block it changes, where the title's upload ring keeps a chunk's
+    // record (run heads.log). Counted, and a line a second while any are.
+    static ZEROED: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+    static TAIL_LINES: AtomicU64 = AtomicU64::new(0);
+    static LINE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let zeroed = bytes.iter().zip(read).filter(|&(b, r)| *b == 0 && *r != 0).count();
+    ZEROED.fetch_add(zeroed as u64, Ordering::Relaxed);
+    let mut block = (at | 0xffff) + 1;
+    while block - 0x18 < at + bytes.len() {
+        for w in (block - 0x18..block).step_by(8) {
+            if w < at || w + 8 > at + bytes.len() {
+                continue;
+            }
+            let (b, r) = (&bytes[w - at..w + 8 - at], &read[w - at..w + 8 - at]);
+            if b != r {
+                TAILS.fetch_add(1, Ordering::Relaxed);
+                let word = |v: &[u8]| u64::from_le_bytes(v.try_into().unwrap_or([0; 8]));
+                // A record's owner: a title address, written over.
+                let owner = (0x1_0000..0x8000_0000_0000).contains(&word(r)) && word(r) % 8 == 0;
+                if owner && TAIL_LINES.fetch_add(1, Ordering::Relaxed) < 100 {
+                    tracing::warn!(
+                        word = format_args!("{:#x}", w),
+                        read = format_args!("{:#x}", word(r)),
+                        written = format_args!("{:#x}", word(b)),
+                        "copy-back probe: card bytes put over an address-like word in the last 0x18 bytes of a 64 KiB block"
+                    );
+                }
+            }
+        }
+        block += 0x1_0000;
+    }
+    {
+        let mut line = LINE_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if line.is_none_or(|t| now.duration_since(t).as_secs() >= 1) {
+            *line = Some(now);
+            let (z, t) = (ZEROED.swap(0, Ordering::Relaxed), TAILS.swap(0, Ordering::Relaxed));
+            if z != 0 || t != 0 {
+                tracing::info!(zeroed_bytes = z, tail_words = t, "copy-back probe: card zeros over title bytes since the last line");
+            }
+        }
+    }
+    let w = WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+    if w % 2000 == 0 {
+        tracing::info!(
+            writes = w,
+            undoing = UNDOING.load(Ordering::Relaxed),
+            undone_bytes = UNDONE_BYTES.load(Ordering::Relaxed),
+            exact = back_exact(),
+            "copy-back probe"
+        );
+    }
+}
+
 /// Whether a write of what shaders wrote that finds its destination guarded
 /// again is opened again and written again, not dropped (on by default;
 /// `VICTORY_BACK_RETRY=0` drops it without a word, as before).
@@ -1232,9 +1481,11 @@ fn told_after(at: usize, len: usize) {
 }
 
 /// Puts `merged` (the title's bytes at `address` with what shaders wrote
-/// put in) into title memory; `runs` ([`merged_runs`]) are the parts that
-/// differ from what title memory held. Returns the bytes written.
-pub(crate) fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
+/// put in) into title memory; `read` is title memory as it was read
+/// before the merge (only [`back_exact`] and [`back_probe`] look at it:
+/// empty otherwise), `runs` ([`merged_runs`]) are the pages that differ
+/// from it. Returns the bytes written.
+pub(crate) fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)]) -> usize {
     if runs.is_empty() {
         return 0;
     }
@@ -1246,12 +1497,24 @@ pub(crate) fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -
         add(C::BackPageBytes, runs.iter().map(|&(lo, hi)| (hi - lo) as u64).sum());
     }
     let whole = [(0, merged.len())];
-    let parts: &[(usize, usize)] = if back_pages() { runs } else { &whole };
+    let exact;
+    let parts: &[(usize, usize)] = if back_exact() {
+        exact = exact_runs(address, merged, read);
+        &exact
+    } else if back_pages() {
+        runs
+    } else {
+        &whole
+    };
+    let probe = back_probe();
     let mut written = 0;
     for &(lo, hi) in parts {
         let (at, bytes) = (address + lo, &merged[lo..hi]);
         #[cfg(feature = "diagnostics")]
         let opening = std::time::Instant::now();
+        if probe {
+            probe_write(at, bytes, &read[lo..hi]);
+        }
         crate::watch::writing_from_card(at, bytes.len());
         #[cfg(any(test, feature = "test-hooks"))]
         crate::watch::card_between(at, bytes.len());
@@ -1268,6 +1531,38 @@ pub(crate) fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackWrittenBytes, written as u64);
     written
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::exact_runs;
+
+    /// Only the words the merge changed are written: a word the title
+    /// wrote meanwhile and the card did not (the allocator's record at a
+    /// chunk's end, run heads.log) keeps the title's bytes.
+    #[test]
+    fn only_words_the_card_changed_are_written() {
+        // A span that starts 3 bytes into a word, as the merge's spans do.
+        let address = 0xad2_ffe8 - 0x45;
+        let read: Vec<u8> = (0..0x5du32).map(|i| (i * 11 + 1) as u8).collect();
+        let mut merged = read.clone();
+        // The card wrote one byte of the first (partial) word, two words
+        // that touch, and the span's last byte, which is in the record.
+        for at in [1usize, 0x15, 0x16, 0x1d, 0x5c] {
+            merged[at] ^= 0x5a;
+        }
+        let runs = exact_runs(address, &merged, &read);
+        assert_eq!(runs, vec![(0, 5), (0x15, 0x25), (0x55, 0x5d)]);
+        // Each run is whole words of title memory, but for the span's ends.
+        for &(lo, hi) in &runs {
+            assert!(lo == 0 || (address + lo) % 8 == 0);
+            assert!(hi == merged.len() || (address + hi) % 8 == 0);
+        }
+        // The record's first two words (0x45..0x55 of the span) are not
+        // written: the title's bytes there stay whatever they are now.
+        assert!(runs.iter().all(|&(lo, hi)| hi <= 0x45 || lo >= 0x55));
+        assert!(exact_runs(address, &read, &read).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2397,6 +2692,7 @@ impl Shadow {
                 if !read_title(start + at, title) {
                     continue;
                 }
+                let read = kept_read(title);
                 // Title memory with the GPU's bytes put in; the copy takes
                 // the title's bytes in turn.
                 // Without a branch, so the loop runs many bytes at a time:
@@ -2414,7 +2710,7 @@ impl Shadow {
                     }
                     differs != 0
                 });
-                written += put_back(start + at, title, &runs);
+                written += put_back(start + at, title, &read, &runs);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -2502,8 +2798,9 @@ impl Shadow {
         if !read_title(start + at, title) {
             return 0;
         }
+        let read = kept_read(title);
         let runs = merged_runs(start + at, n, |lo, hi| merge_piece(&now[lo..hi], &mut held[lo..hi], &mut title[lo..hi]));
-        put_back(start + at, title, &runs)
+        put_back(start + at, title, &read, &runs)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -2831,10 +3128,15 @@ impl Shadow {
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
+            let refresh_busy = busy_refresh(busy_refresh_on(), keeps(), crate::host::flying());
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if refresh_busy && e > a.max(at) {
+                    bytes += self.update_busy(a.max(at), e);
                 }
                 at = at.max(e);
             }
@@ -2844,6 +3146,33 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of `[from, to)`, which an earlier list of the
+    /// submission being prepared declared shaders write, with nothing in
+    /// the air ([`busy_refresh`]): none of those shaders has run, so the
+    /// title's writes there are copied as anywhere else, and the snapshot
+    /// takes the same bytes, so that the copy-back neither takes them for
+    /// the shaders' nor puts them back over a later title write.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        let copied = self.update_free(from, to);
+        if copied == 0 || self.card.is_some() {
+            // A copy in the card's memory has no snapshot: its CPU side,
+            // which the refresh wrote, is the reference, and the changed
+            // runs go up before the lists.
+            return copied;
+        }
+        let (a, e) = self.inside(from, to - from);
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(snapshot) = before.as_mut()
+            && e <= snapshot.len()
+        {
+            // SAFETY: inside the mapping (`inside`); nothing of ours writes
+            // the copy here meanwhile (the submission's preparing).
+            let now = unsafe { std::slice::from_raw_parts(self.data.add(a), e - a) };
+            busy_snapshot(&mut snapshot[a..e], now);
+        }
+        copied
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -3018,6 +3347,7 @@ impl Shadow {
         title.resize(n, 0);
         let mut written = 0;
         if read_title(start + at, title) {
+            let read = kept_read(title);
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let runs = merged_runs(start + at, n, |lo, hi| {
@@ -3031,7 +3361,7 @@ impl Shadow {
                 }
                 differs != 0
             });
-            written = put_back(start + at, title, &runs);
+            written = put_back(start + at, title, &read, &runs);
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
@@ -3093,6 +3423,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = read_title(start + at, title);
+        let read = if mapped { kept_read(title) } else { Vec::new() };
         let mut runs = Vec::new();
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -3106,7 +3437,7 @@ impl Shadow {
         if !mapped {
             return 0;
         }
-        put_back(start + at, title, &runs)
+        put_back(start + at, title, &read, &runs)
     }
 }
 

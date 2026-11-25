@@ -3461,8 +3461,20 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
+            // With `VICTORY_NULL_CBV_ZEROS=1` (off: not yet run in the
+            // title): 64 KiB of zeros, not location 0. Runs grave-10 and
+            // armA-3 (2026-11-25) lost the device on scalar reads at GPU
+            // address 0; whether vkd3d-proton's descriptor heaps make a zero
+            // location a null view that reads nothing is not checked here.
+            static ZEROS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let on = *ZEROS.get_or_init(|| std::env::var_os("VICTORY_NULL_CBV_ZEROS").is_some_and(|v| v == "1"));
+            let zeros = on.then(crate::draw::zero_root).flatten();
+            let desc = match zeros {
+                Some(gpu) => D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu, SizeInBytes: 64 << 10 },
+                None => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
+            };
+            // SAFETY: a slot of our heap; zeros of ours, or a zero
+            // location (a null view).
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
         _ => return null_view(at),

@@ -1489,7 +1489,8 @@ pub(crate) fn reserve_room(asked: bool) -> bool {
 /// - only the host copy holds the host texture: no descriptor slot views
 ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
 ///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+/// - nothing asked for it for 5 s and 4 frames (`VICTORY_SWEEP_IDLE=long`:
+///   120 s and 300 frames).
 ///
 /// The next use makes the host copy anew and uploads the title's memory
 /// again (its staging state goes with it). The title resource stays: its
@@ -1503,8 +1504,12 @@ pub(crate) fn reserve_room(asked: bool) -> bool {
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 5_000;
-    const IDLE_FRAMES: u64 = 4;
+    // `VICTORY_SWEEP_IDLE=long`: upstream's idle rule (Marvisak/VIctory
+    // 69d1e8e: 120 s and 300 frames; shorter gave up textures read again
+    // within a minute). Default: 5 s and 4 frames.
+    static LONG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let long = *LONG.get_or_init(|| std::env::var_os("VICTORY_SWEEP_IDLE").is_some_and(|v| v == "long"));
+    let (idle_ms, idle_frames) = if long { (120_000u64, 300u64) } else { (5_000, 4) };
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -1536,7 +1541,7 @@ pub(crate) fn let_go_idle() {
             }
             let chosen = mark != 0 && !used_since;
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                (chosen || crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES))
+                (chosen || crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames))
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -1572,6 +1577,10 @@ pub(crate) fn let_go_idle() {
                 release_evicted(host, twin);
             } else {
                 crate::host::retire(host);
+                // The twin too: dropped here, a list may still read it.
+                if let Some(twin) = twin {
+                    crate::host::retire(twin);
+                }
             }
         }
     }
@@ -1661,8 +1670,12 @@ pub(crate) fn placed_copies() -> [u64; 4] {
 /// that could use the texture belongs here.
 #[cfg(windows)]
 fn release_evicted(host: std::sync::Arc<HostTexture>, twin: Option<std::sync::Arc<Twin>>) {
+    // Both through the graveyard (`crate::host::retire`): a list being
+    // recorded may still read either.
     crate::host::retire(host);
-    drop(twin);
+    if let Some(twin) = twin {
+        crate::host::retire(twin);
+    }
 }
 
 /// The eviction chose the host copies of these title textures: the next

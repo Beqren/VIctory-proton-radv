@@ -2235,7 +2235,7 @@ mod tests {
             assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]), "the refresh takes the mark");
         });
         let merged = *b"what shaders wrote";
-        crate::shadow::put_back(one + 8, &merged, &[(0, merged.len())]);
+        crate::shadow::put_back(one + 8, &merged, &[], &[(0, merged.len())]);
         *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // SAFETY: our view, readable.
         assert_eq!(unsafe { std::slice::from_raw_parts((one + 8) as *const u8, merged.len()) }, &merged, "the write landed");
@@ -2264,7 +2264,7 @@ mod tests {
             assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]), "the other view's refresh");
         });
         let merged = *b"what shaders wrote";
-        crate::shadow::put_back(one + 8, &merged, &[(0, merged.len())]);
+        crate::shadow::put_back(one + 8, &merged, &[], &[(0, merged.len())]);
         *CARD_BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // SAFETY: the other view, readable.
         assert_eq!(unsafe { std::slice::from_raw_parts((two + 8) as *const u8, merged.len()) }, &merged, "the write landed");

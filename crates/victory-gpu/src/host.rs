@@ -71,7 +71,21 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+static RETIRED: Mutex<Vec<Grave>> = Mutex::new(Vec::new());
+
+/// An object in [`RETIRED`]: the submission count it waits for, and the
+/// frame and moment (ms) it was retired at, until its hold is over
+/// ([`grave_step`]).
+struct Grave {
+    at: u64,
+    frame: u64,
+    ms: u64,
+    /// The hold of frames is over and `at` was set again to the
+    /// submissions started then.
+    held: bool,
+    #[allow(dead_code)] // held to be dropped
+    object: Retired,
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -145,37 +159,143 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    // Graves whose frames have passed move on even when no submission
+    // finishes (`retire`).
+    bury(FINISHED.load(Ordering::Acquire));
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
+/// The one way to let go of a host object (a texture, a buffer, a staging
+/// buffer, a slot's old resource) that a command list may name: instead of
+/// dropping it, hand it here. It is dropped once
+/// 1. [`RETIRE_FRAMES`] frames have begun since and at least
+///    [`RETIRE_MS`] passed (so every list the title had recorded or was
+///    recording when it was let go, which may name it through a descriptor
+///    and holds no reference, has been submitted), and then
+/// 2. every submission started by that moment has finished on the card
+///    (flights sent ahead and the relay's included: `FINISHED` moves only
+///    as they land).
+///
+/// `VICTORY_RETIRE_FRAMES=0` is the rule before: only (2), counted from
+/// the call, and at once when nothing runs.
+///
+/// Why: every device loss of 2026-11-25 (runs tail-1, tail-2, pairoff-1,
+/// bcb-1, race/run2, blend-4, tex-off) was a GPU page fault on a READ by
+/// the texture unit, in the submission begun just after a texture sweep
+/// (`resource::let_go_idle`) had dropped hundreds of host textures at once
+/// (no submission running, so nothing waited). With the sweep off
+/// (`VICTORY_TEXTURE_SWEEP=0`) no run of six lost the device, against 4 of
+/// 14 with it. The sweep's "no list, no slot" test counts references, and
+/// a list being recorded on a title thread names textures through
+/// descriptors without holding them. shortcut: the hold is counted in
+/// frames and time, not proven against every recording thread.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
+    if retire_frames() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    let grave = Grave {
+        at: started,
+        frame: crate::frame::current(),
+        ms: now_ms(),
+        held: retire_frames() == 0,
+        object: Retired(Box::new(object)),
+    };
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(grave);
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// Frames a retired object is held before its submissions are counted
+/// ([`retire`]; `VICTORY_RETIRE_FRAMES`, default 4: the title records a
+/// frame's lists within the frame and submits them by the next).
+pub(crate) fn retire_frames() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_RETIRE_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
+/// The least time a retired object is held with its frames ([`retire`]).
+const RETIRE_MS: u64 = 1_000;
+/// Held this long, its frames are taken as passed even if the title waits
+/// for no frame (a loading screen): memory let go is not kept for ever.
+const RETIRE_MS_MOST: u64 = 10_000;
+
+/// What happens to a grave now: `None` dropped, else kept (with `at` and
+/// `held` as they now are). `started` and `finished` are the submission
+/// counts, `frame` and `ms` the present ones; `frames` is
+/// [`retire_frames`].
+fn grave_step(at: u64, held: bool, since: (u64, u64), now: (u64, u64), started: u64, finished: u64, frames: u64) -> Option<(u64, bool)> {
+    let (frame0, ms0) = since;
+    let (frame, ms) = now;
+    if !held {
+        let waited = ms.saturating_sub(ms0);
+        if (frame.saturating_sub(frame0) >= frames && waited >= RETIRE_MS) || waited >= RETIRE_MS_MOST {
+            // Every list recorded when it was let go has been submitted by
+            // now: wait for what was started up to here (read after the
+            // frame and the time). Never dropped in the same look.
+            return Some((started, true));
+        }
+        return Some((at, held));
+    }
+    if at <= finished { None } else { Some((at, held)) }
+}
+
+#[cfg(test)]
+mod grave_tests {
+    use super::{RETIRE_MS, RETIRE_MS_MOST, grave_step};
+
+    #[test]
+    fn a_retired_object_waits_for_its_frames_then_for_the_submissions_begun_by_then() {
+        // Retired at frame 10, 0 ms, with submissions 1..=5 started and 5
+        // finished (nothing running): not dropped at once.
+        let since = (10, 0);
+        assert_eq!(grave_step(5, false, since, (10, 0), 5, 5, 4), Some((5, false)));
+        // Three frames later, 2 s: still held (four frames).
+        assert_eq!(grave_step(5, false, since, (13, 2000), 9, 9, 4), Some((5, false)));
+        // Four frames, but under a second: held.
+        assert_eq!(grave_step(5, false, since, (14, RETIRE_MS - 1), 9, 9, 4), Some((5, false)));
+        // Four frames and a second: it now waits for submission 12, the
+        // last started, which the card has not finished.
+        assert_eq!(grave_step(5, false, since, (14, RETIRE_MS), 12, 9, 4), Some((12, true)));
+        // Not before 12 has finished, whatever the frame.
+        assert_eq!(grave_step(12, true, since, (40, 60_000), 20, 11, 4), Some((12, true)));
+        assert_eq!(grave_step(12, true, since, (40, 60_000), 20, 12, 4), None);
+        // No frames at all (a loading screen): the time bound passes them.
+        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST - 1), 7, 7, 4), Some((5, false)));
+        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST), 7, 7, 4), Some((7, true)));
+        assert_eq!(grave_step(7, true, since, (10, RETIRE_MS_MOST), 8, 7, 4), None);
+        // With the rule off (held from the start): the submissions running
+        // when it was retired, as before.
+        assert_eq!(grave_step(5, true, since, (10, 0), 6, 4, 0), Some((5, true)));
+        assert_eq!(grave_step(5, true, since, (10, 0), 6, 5, 0), None);
+    }
+}
+
+/// Drops what [`grave_step`] says is done with, `finished` being the
+/// submissions finished.
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
+    let done: Vec<Grave> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
+        let (now, frames) = ((crate::frame::current(), now_ms()), retire_frames());
+        let started = STARTED.load(Ordering::Acquire);
+        let mut done = Vec::new();
+        let mut keep = Vec::with_capacity(retired.len());
+        for mut g in std::mem::take(&mut *retired) {
+            match grave_step(g.at, g.held, (g.frame, g.ms), now, started, finished, frames) {
+                Some((at, held)) => {
+                    g.at = at;
+                    g.held = held;
+                    keep.push(g);
+                }
+                None => done.push(g),
+            }
+        }
         *retired = keep;
         done
     };
@@ -1824,6 +1944,108 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 }
 
 #[cfg(test)]
+mod fetch_mark_tests {
+    use super::mark_value;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+
+    /// A mark is never 0 (a buffer the card never wrote) and never the
+    /// fetch before's (its leftover).
+    #[test]
+    fn marks_differ_from_nothing_and_from_the_last() {
+        for sent in [1u64, 2, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x1_0000_0000, u64::MAX - 1] {
+            assert_ne!(mark_value(sent), 0);
+            assert_ne!(mark_value(sent), mark_value(sent + 1), "{sent:#x}");
+        }
+    }
+
+    /// On the host's own GPU (skipped without one): a list that copies
+    /// into a buffer of the fetch's kind and then writes the mark leaves
+    /// the mark readable once its fence is reached, behind the copied
+    /// bytes, as `Host::relay_card_back` reads it.
+    #[test]
+    fn the_mark_is_written_behind_the_copies() {
+        // SAFETY: plain D3D12 objects of the test's own, waited for.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            let device = device.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let shared = |size: u64, pool| {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: pool,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: size,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let mut buffer: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                    .unwrap();
+                let buffer = buffer.unwrap();
+                let mut data = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut data)).unwrap();
+                (buffer, data as *mut u8)
+            };
+            let (source, src) = shared(4096, D3D12_MEMORY_POOL_L0);
+            for i in 0..4096 {
+                *src.add(i) = (i * 7 + 3) as u8;
+            }
+            let (fetch, data) = shared(16 << 20, D3D12_MEMORY_POOL_L0);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            // Made open: closed, as the host's lists are between uses.
+            list.Close().unwrap();
+            let total = 1001u64;
+            let mark = total.next_multiple_of(4);
+            for sent in 1..=3u64 {
+                allocator.Reset().unwrap();
+                list.Reset(&allocator, None).unwrap();
+                list.CopyBufferRegion(&fetch, 0, &source, 5, total);
+                let write = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                    Dest: fetch.GetGPUVirtualAddress() + mark,
+                    Value: mark_value(sent),
+                }];
+                list.cast::<ID3D12GraphicsCommandList2>()
+                    .unwrap()
+                    .WriteBufferImmediate(1, write.as_ptr(), Some([D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT].as_ptr()));
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+                queue.Signal(&fence, sent).unwrap();
+                fence.SetEventOnCompletion(sent, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+                let seen = std::ptr::read_volatile(data.add(mark as usize) as *const u32);
+                assert_eq!(seen, mark_value(sent), "fetch {sent}");
+                for i in 0..total as usize {
+                    assert_eq!(*data.add(i), *src.add(i + 5), "byte {i}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
@@ -2016,7 +2238,7 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
 }
 
 /// Whether anything is in the air.
-fn flying() -> bool {
+pub(crate) fn flying() -> bool {
     if !late() {
         return false;
     }
@@ -2321,6 +2543,36 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
+/// Whether the relay's fetch of pieces of copies in the card's memory
+/// ([`Host::relay_card_back`]) writes a mark behind its copies and the
+/// merge goes ahead only if the mark is there (`VICTORY_FETCH_MARK=0`
+/// turns it off).
+///
+/// Why: run heads.log (2026-11-25, `VICTORY_RELAY=2`, the card's copies).
+/// The kernel log has a GPU page fault in that process at 06:57:10 and a
+/// gfx ring reset at 06:57:12; the frame then took 2.2 s, and at 06:57:12.9
+/// a title thread crashed on a null owner (+0xc) of the record its upload
+/// ring keeps in the last 0x18 bytes of each 64 KiB chunk (`0xad2ffe8`, in
+/// the 174 MB heap whose copy is on the card), the record all zeros, and
+/// the layer had reported no removal. Not proven, but the likely way: the
+/// fetch's fence completed with the device lost and before the removal was
+/// reported, the copy into the fetch buffer had not run, and its bytes
+/// (zeros, or an earlier fetch's) were merged into title memory as what
+/// shaders wrote. Three later runs that lost the device (tail-1, tail-2,
+/// pairoff-1) ended at the removal check in [`Host::relay_land`] instead:
+/// it saw the removal in time there.
+fn fetch_mark() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_MARK").is_none_or(|v| v != "0"))
+}
+
+/// The mark fetch number `sent` writes ([`fetch_mark`]): never 0, so a
+/// buffer the card never wrote does not pass, and never the mark of the
+/// fetch before, so that one's leftover does not pass either.
+fn mark_value(sent: u64) -> u32 {
+    (sent as u32) | 0x8000_0000
+}
+
 struct RelayFetch {
     list: Prelude,
     fence: ID3D12Fence,
@@ -3227,6 +3479,22 @@ impl Host {
         }
     }
 
+    /// Ends the run if the host device is gone: a query of the removal
+    /// reason, and the host fence, which a lost device completes with
+    /// `u64::MAX`. Before anything that came back from the card reaches
+    /// title memory or the title's fences: run bcb-1 (2026-11-25) lost the
+    /// device and a title thread crashed on a null pointer 150 ms after
+    /// vkd3d-proton marked the device removed, before our checks had
+    /// looked again.
+    fn alive_or_fail(&self, at: &str) {
+        // SAFETY: plain queries.
+        let (removed, completed) =
+            unsafe { (self.device.GetDeviceRemovedReason().is_err(), self.fence.GetCompletedValue()) };
+        if removed || completed == u64::MAX {
+            fail(format_args!("host GPU device removed ({at})"));
+        }
+    }
+
     /// [`relay`], on the thread that lands flights: for the plans of the
     /// flights being landed (the card has run them), the pieces their
     /// compares flagged are fetched, once each, with a list and a wait of
@@ -3289,8 +3557,11 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
+        // The fetch's mark ([`fetch_mark`]) goes behind the pieces.
+        let mark = fetch_mark().then(|| total.next_multiple_of(4));
+        let need = mark.map_or(total, |m| m + 4);
+        if f.buffer.as_ref().is_none_or(|b| b.2 < need) {
+            let size = need.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
@@ -3308,6 +3579,17 @@ impl Host {
                 list.Reset(&allocator, None)?;
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                if let Some(mark) = mark {
+                    let write = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                        Dest: buffer.GetGPUVirtualAddress() + mark,
+                        Value: mark_value(sent),
+                    }];
+                    list.cast::<ID3D12GraphicsCommandList2>()?.WriteBufferImmediate(
+                        1,
+                        write.as_ptr(),
+                        Some([D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT].as_ptr()),
+                    );
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -3328,6 +3610,21 @@ impl Host {
             Ok(after) => after,
             Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
+        // Review finding (with the mark off): the fence may complete on a
+        // lost device; nothing fetched is merged then.
+        self.alive_or_fail("after the relay's fetch of what shaders wrote to the card's memory");
+        if let Some(mark) = mark {
+            // SAFETY: the mapping holds `need` bytes; the fence was waited for.
+            let seen = unsafe { std::ptr::read_volatile((data + mark as usize) as *const u32) };
+            if seen != mark_value(sent) {
+                fail(format_args!(
+                    "the card did not run the fetch of what shaders wrote to its memory (its mark reads {seen:#x}, \
+                     not {:#x}): the device was lost and its fence completed all the same; nothing fetched is merged \
+                     (VICTORY_RELAY=1)",
+                    mark_value(sent)
+                ));
+            }
+        }
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
         {
@@ -3410,6 +3707,10 @@ impl Host {
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
         }
+        // The device may have been lost while this landing ran (the fence
+        // completes on a lost device before anything reports it): nothing
+        // read back, written or signalled may reach the title from it.
+        self.alive_or_fail("before the read-backs and signals of flights (VICTORY_RELAY=1)");
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
@@ -3545,6 +3846,7 @@ impl Host {
             if let Err(e) = ran {
                 fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e})"));
             }
+            self.alive_or_fail("after the fetch of what shaders wrote to the card's memory");
             {
                 use crate::shadow::CARD_STATS;
                 CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -3810,6 +4112,7 @@ impl Host {
                 hand_back(&back);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            self.alive_or_fail("before the read-backs and signals of flights settled together");
             // In the order given: what tells the title the card is done.
             let mut last = 0;
             let mut landed = Vec::new();
@@ -4130,6 +4433,7 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.alive_or_fail("before the read-backs of a submission waited for");
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.

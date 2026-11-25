@@ -992,22 +992,24 @@ fn write_user(at: usize, bytes: &[u8]) -> bool {
 
 /// Whether the copy-back writes into title memory only the 8-byte words
 /// where what shaders wrote changes the title's bytes
-/// (`VICTORY_BACK_EXACT=0`: everything from the first to the last byte
-/// the card wrote, as before, or the pages of [`back_pages`]).
+/// (`VICTORY_BACK_EXACT=1`; off by default: everything from the first to
+/// the last byte the card wrote, or the pages of [`back_pages`]).
 ///
-/// Why: the title's bytes in between were read from title memory moments
-/// before (`read_title`), and the title's own threads keep running while
-/// we merge (on the relay's thread, at any time). Written back whole, a
-/// span puts those older bytes over whatever the title wrote meanwhile.
-/// Run heads.log (2026-11-25, `VICTORY_RELAY=2`, the card's copies): the
-/// title crashed reading a null owner at +0xc of a fence record its
-/// allocator keeps in the last 0x18 bytes of each chunk of its upload ring
-/// (`0xad2ffe8`, in the 174 MB heap whose copy is on the card); the record
-/// was all zeros, the title had written it at the chunk's last
-/// acquisition, and no shader writes there.
+/// Why it might matter: the title's bytes in between were read from title
+/// memory moments before (`read_title`), and the title's threads keep
+/// running while we merge (on the relay's thread, at any time). Written
+/// back whole, a span puts those older bytes over whatever the title wrote
+/// meanwhile. Shortcut: not on by default, because the probe
+/// ([`back_probe`]) found no such write in about 564,000 (runs probeold-1,
+/// probeold-2, tail-1, 2026-11-25), and its cost in kernel write calls is
+/// not measured. It does not help with run heads.log's crash (the title
+/// read a null owner at +0xc of the record its upload ring keeps in the
+/// last 0x18 bytes of each chunk, `0xad2ffe8` in the 174 MB heap whose
+/// copy is on the card): the probe saw the card's zeros merged over such
+/// words, which this writes as well.
 pub(crate) fn back_exact() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_EXACT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_EXACT").is_some_and(|v| v == "1"))
 }
 
 /// Whether each write of the copy-back first looks whether the title
@@ -1091,29 +1093,50 @@ fn probe_write(at: usize, bytes: &[u8], read: &[u8]) {
             }
         }
     }
-    // What the merge took from the card for the last 0x18 bytes of a
-    // 64 KiB block, where the title's upload ring keeps a chunk's record
-    // (run heads.log): no shader should write there.
+    // What the merge took from the card: bytes it puts zero over the
+    // title's nonzero bytes, and words of the last 0x18 bytes of a 64 KiB
+    // block it changes, where the title's upload ring keeps a chunk's
+    // record (run heads.log). Counted, and a line a second while any are.
+    static ZEROED: AtomicU64 = AtomicU64::new(0);
     static TAILS: AtomicU64 = AtomicU64::new(0);
-    let mut i = 0;
-    while i < bytes.len() {
-        let a = at + i;
-        if a & 0xffff >= 0x1_0000 - 0x18 && bytes[i] != read[i] {
-            let w = a & !7;
-            let lo = w.max(at) - at;
-            let hi = (w + 8).min(at + bytes.len()) - at;
-            if TAILS.fetch_add(1, Ordering::Relaxed) < 300 {
-                tracing::warn!(
-                    word = format_args!("{:#x}", w),
-                    read = ?&read[lo..hi],
-                    written = ?&bytes[lo..hi],
-                    "copy-back probe: card bytes put into the last 0x18 bytes of a 64 KiB block"
-                );
+    static TAIL_LINES: AtomicU64 = AtomicU64::new(0);
+    static LINE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let zeroed = bytes.iter().zip(read).filter(|&(b, r)| *b == 0 && *r != 0).count();
+    ZEROED.fetch_add(zeroed as u64, Ordering::Relaxed);
+    let mut block = (at | 0xffff) + 1;
+    while block - 0x18 < at + bytes.len() {
+        for w in (block - 0x18..block).step_by(8) {
+            if w < at || w + 8 > at + bytes.len() {
+                continue;
             }
-            i = hi;
-            continue;
+            let (b, r) = (&bytes[w - at..w + 8 - at], &read[w - at..w + 8 - at]);
+            if b != r {
+                TAILS.fetch_add(1, Ordering::Relaxed);
+                let word = |v: &[u8]| u64::from_le_bytes(v.try_into().unwrap_or([0; 8]));
+                // A record's owner: a title address, written over.
+                let owner = (0x1_0000..0x8000_0000_0000).contains(&word(r)) && word(r) % 8 == 0;
+                if owner && TAIL_LINES.fetch_add(1, Ordering::Relaxed) < 100 {
+                    tracing::warn!(
+                        word = format_args!("{:#x}", w),
+                        read = format_args!("{:#x}", word(r)),
+                        written = format_args!("{:#x}", word(b)),
+                        "copy-back probe: card bytes put over an address-like word in the last 0x18 bytes of a 64 KiB block"
+                    );
+                }
+            }
         }
-        i += 1;
+        block += 0x1_0000;
+    }
+    {
+        let mut line = LINE_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if line.is_none_or(|t| now.duration_since(t).as_secs() >= 1) {
+            *line = Some(now);
+            let (z, t) = (ZEROED.swap(0, Ordering::Relaxed), TAILS.swap(0, Ordering::Relaxed));
+            if z != 0 || t != 0 {
+                tracing::info!(zeroed_bytes = z, tail_words = t, "copy-back probe: card zeros over title bytes since the last line");
+            }
+        }
     }
     let w = WRITES.fetch_add(1, Ordering::Relaxed) + 1;
     if w % 2000 == 0 {
@@ -1158,12 +1181,10 @@ fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)])
         let (at, bytes) = (address + lo, &merged[lo..hi]);
         #[cfg(feature = "diagnostics")]
         let opening = std::time::Instant::now();
-        crate::watch::writing_from_card(at, bytes.len());
-        // After the guards' opening, which may wait for their lock: the
-        // probe's look covers the whole time since the read.
         if probe {
             probe_write(at, bytes, &read[lo..hi]);
         }
+        crate::watch::writing_from_card(at, bytes.len());
         #[cfg(feature = "diagnostics")]
         let writing = {
             crate::copystat::add(crate::copystat::C::BackOpenUs, opening.elapsed().as_micros() as u64);

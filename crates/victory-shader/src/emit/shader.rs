@@ -84,12 +84,35 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
 
+/// Page marks (`super::page_marks`; module notes, "Page marks"): the root
+/// SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`], the view-mark table of
+/// the bound view heap: per heap slot two dwords, the first bit of the
+/// unordered buffer view there in the written-pages bitmap
+/// ([`VIEW_MARK_NONE`]: writes through it are not marked) and, in dword 1,
+/// the title address of the view's first byte within its 64 KiB page (bits
+/// 0-15) and a typed view's element bytes (bits 16-23).
+pub const SLOT_VIEW_MARKS: u8 = 252;
+/// Page marks: the root UAV `u<SLOT_VIEW_WRITES>` in [`ROOT_CBV_SPACE`], the
+/// written-pages bitmap of [`VIEW_WRITE_BITS`] bits (a bit per 64 KiB title
+/// page of each host copy shaders write through views).
+pub const SLOT_VIEW_WRITES: u8 = 251;
+/// Entries of the [`SLOT_VIEW_MARKS`] table: heap indices are clamped to it.
+pub const VIEW_MARK_SLOTS: u32 = 1 << 21;
+/// A view-mark table entry's first bit for a slot whose writes are not
+/// marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits of the [`SLOT_VIEW_WRITES`] bitmap; marks past it set its last bit,
+/// which no copy owns.
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
@@ -181,6 +204,10 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// Page marks (`super::page_marks`): the heap index of each handle of
+    /// an unordered buffer view made from the heap, whose writes are marked
+    /// by that index's view-mark entry. Empty without the switch.
+    pub view_index: std::collections::HashMap<V, V>,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -235,6 +262,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            view_index: std::collections::HashMap::new(),
             lds: None,
             main,
             entry,
@@ -465,7 +493,13 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Unordered typed, raw and structured buffers (kinds 10-12): what
+        // is written through them is marked by their slot (page marks).
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) && super::page_marks() {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.
@@ -492,6 +526,17 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+        }
+        // UAVs outside pixel and compute programs (upstream a1a2077): the
+        // flag the validator wants when a vertex, geometry or mesh program
+        // declares a UAV range. With page marks only, which bring the
+        // bitmap's root UAV to such programs; without them the output stays
+        // as it was.
+        // shortcut: root UAVs of such programs without page marks still
+        // leave the flag out.
+        let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
+        if super::page_marks() && !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
         }
         let mut resources = None;
         let mut bindings = Vec::new();
@@ -812,6 +857,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
+        }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;

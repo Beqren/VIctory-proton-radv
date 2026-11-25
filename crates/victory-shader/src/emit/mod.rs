@@ -114,9 +114,42 @@ pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_INTEGER, SLOT_MEMORY, SLOT_SIGNED,
-    SLOT_STRIDE_BITS, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDE_BITS, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, VIEW_MARK_NONE,
+    VIEW_MARK_SLOTS, VIEW_WRITE_BITS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
+
+/// Page marks (`VICTORY_PAGE_MARKS`, off by default; ported from upstream
+/// cd94d35 and 940d32f, "page marks"): every store or atomic through an
+/// unordered buffer view taken from the view heap (tables, the heap itself,
+/// title memory by address through its copies' slots) also sets the bits of
+/// the 64 KiB title pages its first and last byte fall in, in the bitmap
+/// `u<SLOT_VIEW_WRITES>`, so the host compares only those pages of a copy
+/// after the submission. The slot's entry in the table
+/// `t<SLOT_VIEW_MARKS>` gives the view's first bit, the offset of its first
+/// byte in its page and a typed view's element bytes (see
+/// [`SLOT_VIEW_MARKS`]); bit `first + ((offset + byte) >> 16)`, at most
+/// [`VIEW_WRITE_BITS`] - 1, for byte `byte` of the view. The bitmap word is
+/// read first and the atomic OR made only where the bit is clear (most
+/// writes find their page marked). Root UAVs (root descriptors, no heap
+/// slot) are not marked: the host takes what they write for unmarked.
+/// `1` or `check` turn it on (`check` is the host's: everything is still
+/// compared, and differences on pages no shader marked are counted). Part
+/// of the translation: the shader cache keys on it (`victory-gpu`'s does).
+pub fn page_marks() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PAGE_MARKS_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_MARKS").is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`page_marks`] for this thread, whatever the environment says.
+    pub(crate) static PAGE_MARKS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

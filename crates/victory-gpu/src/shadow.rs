@@ -255,7 +255,10 @@ fn card_for(size: u64) -> Result<ID3D12Resource, Refused> {
 /// 144-148 -> 92-96 ms, copying back 182-195 -> 126-131 ms; but on the GPU
 /// 96-104 -> 145-148 ms (125 MB sent up to the card sides and 100 MB of
 /// 1,540 pieces fetched a frame, against 18 and 3.6), and the frame did not
-/// move (median 251.6 -> 251.1 ms). Off until the frame gains.
+/// move (median 251.6 -> 251.1 ms). Again with frame capture (run 5 against
+/// run 4): frame 245.5 -> 274.2 ms, the waits for the card 126 ms a frame,
+/// and `tools/shots.py` judged the pictures a little worse (edges 16.4 ->
+/// 15.1% over 41 matched shots). Off until the frame gains.
 pub(crate) fn card_reserve() -> u64 {
     static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MB.get_or_init(|| {

@@ -1507,9 +1507,14 @@ pub(crate) fn let_go_idle() {
     // `VICTORY_SWEEP_IDLE=long`: upstream's idle rule (Marvisak/VIctory
     // 69d1e8e: 120 s and 300 frames; shorter gave up textures read again
     // within a minute). Default: 5 s and 4 frames.
-    static LONG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let long = *LONG.get_or_init(|| std::env::var_os("VICTORY_SWEEP_IDLE").is_some_and(|v| v == "long"));
-    let (idle_ms, idle_frames) = if long { (120_000u64, 300u64) } else { (5_000, 4) };
+    // `eager` (a reproducer, not for play): 200 ms and 1 frame, so that the
+    // sweep lets go constantly.
+    static IDLE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (idle_ms, idle_frames) = *IDLE.get_or_init(|| match std::env::var("VICTORY_SWEEP_IDLE").ok().as_deref() {
+        Some("long") => (120_000, 300),
+        Some("eager") => (200, 1),
+        _ => (5_000, 4),
+    });
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;

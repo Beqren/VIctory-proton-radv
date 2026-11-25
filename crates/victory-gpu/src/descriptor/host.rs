@@ -4031,8 +4031,16 @@ impl HostHeap {
             (None, Some(_)) => "uploaded, looked at again".into(),
             (None, None) => "not queued".into(),
         };
+        drop(textures);
         let host = if made != 0 { "made".to_string() } else { format!("null tint={tint:?}") };
-        format!("{queue} host_slot={host}")
+        // Read marks: frames since a mark named it; and whether evicted.
+        let marked = self.marked.get(index as usize).map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+        let marked = match marked {
+            None => "-".to_string(),
+            Some(0) => "never".to_string(),
+            Some(s) => format!("{}", (frame as u32).wrapping_add(1).wrapping_sub(s)),
+        };
+        format!("{queue} host_slot={host} marked_frames_ago={marked} evicted={}", self.is_evicted(index))
     }
 
     /// Host slot `index`, null and shown in a [`Tint`] colour, shows the

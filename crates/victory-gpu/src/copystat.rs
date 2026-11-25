@@ -203,6 +203,38 @@ pub(crate) enum C {
     /// Reads in place that met a change of mapping under way over their
     /// range and waited for it (`VICTORY_MAP_RANGES=1`, `watch::Span`).
     ReadingMet,
+    /// The GPU's page mappings as copies (`VICTORY_ALIAS_COPY=1`): pages
+    /// copied, copies taken away that still held what their page holds and
+    /// those that did not, copies written again with their page, copies
+    /// taken away with no view of their page to compare with.
+    CopyMade,
+    CopySame,
+    CopyDiffered,
+    CopyRewritten,
+    CopyUnchecked,
+}
+
+/// What became of a copy of a physical page: 0 made, 1 taken away the
+/// same as its page, 2 taken away different, 3 written again with its
+/// page, 4 taken away unchecked.
+pub fn alias_copy_event(what: u8) {
+    add(
+        match what {
+            0 => C::CopyMade,
+            1 => C::CopySame,
+            2 => C::CopyDiffered,
+            3 => C::CopyRewritten,
+            _ => C::CopyUnchecked,
+        },
+        1,
+    );
+}
+
+/// Copies of physical pages alive now (a gauge).
+static COPIES: AtomicU64 = AtomicU64::new(0);
+
+pub fn copies_alive(n: usize) {
+    COPIES.store(n as u64, Relaxed);
 }
 
 /// A mapping could join a neighbouring view (0), did (1), or failed to (2).
@@ -250,7 +282,7 @@ pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
     add(t, us);
 }
 const COUNTERS: usize = 120;
-const _: () = assert!((C::ReadingMet as usize) < COUNTERS);
+const _: () = assert!((C::CopyUnchecked as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1327,7 +1359,8 @@ pub(crate) fn log(frames: f64) {
          {:.1} ms ({:.1} ms waiting for the guards' lock); the GPU's page mappings by kind: {:.0} pages \
          in runs, {:.0} one pool page over many ({:.0} of them a page of zeros), {:.0} unmapped, {:.0} \
          left; views of physical pages alive {} (at most {}; the GPU's mappings' {}); mappings that could join a neighbouring \
-         view {:.0}, joined {:.0}, joins failed {:.0}",
+         view {:.0}, joined {:.0}, joins failed {:.0}; copies of physical pages alive {}, made {:.0}, \
+         taken away {:.0} the same as their page and {:.0} differed ({:.0} unchecked), written again {:.0}",
         c[C::KernelCalls as usize],
         ms(c[C::KernelUs as usize]),
         mb(c[C::KernelBytes as usize]),
@@ -1374,6 +1407,12 @@ pub(crate) fn log(frames: f64) {
         c[C::JoinCould as usize],
         c[C::JoinDone as usize],
         c[C::JoinFailed as usize],
+        COPIES.load(Relaxed),
+        c[C::CopyMade as usize],
+        c[C::CopySame as usize],
+        c[C::CopyDiffered as usize],
+        c[C::CopyUnchecked as usize],
+        c[C::CopyRewritten as usize],
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

@@ -421,6 +421,10 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
+    /// Blocks of title memory that hold a copy of a physical page in
+    /// private memory instead of a view of it (`xmem` `copy_aliases`):
+    /// guarded as views are.
+    copies: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -428,6 +432,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    copies: BTreeSet::new(),
 });
 
 impl Guards {
@@ -599,7 +604,7 @@ fn is_view(start: usize, end: usize) -> bool {
         let Some(info) = query(at) else {
             return false;
         };
-        if info.Type == MEM_MAPPED {
+        if info.Type == MEM_MAPPED || (info.State == MEM_COMMIT && guards().copies.contains(&(at / BLOCK))) {
             return true;
         }
         // Committed memory that is no view (the title's heaps, ours), or
@@ -1050,6 +1055,20 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+}
+
+/// The runtime put a copy of a physical page at `[at, at + len)` in
+/// private memory (`alive`), or took it away: such memory is guarded as
+/// view memory is (`xmem` `copy_aliases`).
+pub fn title_memory_copy(at: usize, len: usize, alive: bool) {
+    let mut g = guards();
+    for block in at / BLOCK..at.saturating_add(len).div_ceil(BLOCK) {
+        if alive {
+            g.copies.insert(block);
+        } else {
+            g.copies.remove(&block);
+        }
     }
 }
 

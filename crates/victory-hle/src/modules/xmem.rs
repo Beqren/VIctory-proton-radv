@@ -378,6 +378,11 @@ struct Physical {
     alias_now: bool,
     #[cfg(feature = "diagnostics")]
     alias_views: std::collections::HashSet<usize>,
+    /// With [`copy_aliases`]: pages of title memory that hold a copy of a
+    /// physical page instead of a view of it (the GPU's page mappings), by
+    /// address, and where each physical page is copied.
+    copies: BTreeMap<usize, Slice>,
+    copied: HashMap<(usize, usize), Vec<usize>>,
 }
 
 impl Physical {
@@ -631,17 +636,29 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
-        written(slice, *n);
+        written(slice, *n, view.at.Value as usize);
     }
     true
 }
 
-/// After writes into `n` pages from `slice` on through a view of our own:
-/// where the title sees those pages, the GPU side has to copy them again (it
-/// does not see such writes).
-fn written(slice: &Slice, n: usize) {
+/// After writes into `n` pages from `slice` on through a view of our own
+/// at `at`: where the title sees those pages, the GPU side has to copy them
+/// again (it does not see such writes), and where they are copied
+/// ([`copy_aliases`]) the copies take the new bytes.
+fn written(slice: &Slice, n: usize, at: usize) {
     let mut shown: Vec<usize> = {
         let physical = physical();
+        for k in 0..n {
+            for &copy in physical.copied.get(&slice.key(k)).into_iter().flatten() {
+                victory_gpu::kernel_will_write(copy, PAGE);
+                // SAFETY: our view of the page, and a copy page committed
+                // read-write (unguarded just above) that stays so while
+                // `physical` is held.
+                unsafe { std::ptr::copy_nonoverlapping((at + k * PAGE) as *const u8, copy as *mut u8, PAGE) };
+                #[cfg(feature = "diagnostics")]
+                victory_gpu::alias_copy_event(3);
+            }
+        }
         (0..n)
             .filter_map(|k| physical.shown.get(&slice.key(k)))
             .flatten()
@@ -666,7 +683,7 @@ pub(crate) struct PageWindow {
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        written(&self.slice, self.view.len / PAGE);
+        written(&self.slice, self.view.len / PAGE, self.view.at.Value as usize);
     }
 }
 
@@ -824,14 +841,132 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
                 index: s.index + (at - base) / PAGE,
                 section: s.section.clone(),
             })
+            .or_else(|| physical.copies.get(&(at - at % PAGE)).cloned())
         else {
             return false;
         };
+        if copy_aliases() {
+            if !copy_page(&mut physical, to + k, at - at % PAGE, slice) {
+                return false;
+            }
+            continue;
+        }
         if !map_joined(&mut physical, to + k, PAGE, slice, true) {
             return false;
         }
     }
     true
+}
+
+/// Whether the GPU's page mappings (`map_alias`) copy the page into
+/// private memory at the destination instead of mapping a view of it
+/// there (`VICTORY_ALIAS_COPY=1`; off by default).
+///
+/// Why: under Wine every view mapping and unmapping is a wineserver
+/// request that walks the process's list of views from one end
+/// (`server/mapping.c`: `map_view` checks the new view against every view
+/// for overlap in `is_valid_view_addr`, `unmap_view` looks its view up in
+/// `find_mapped_view`; Proton experimental_11.0), while ntdll holds the
+/// process's virtual memory lock across the request, so every
+/// `VirtualProtect`, `VirtualQuery` and write-watch call of every thread
+/// waits as well. The frame study held 123,000-126,000 views and paid
+/// 0.55-0.8 ms a call. Private memory in place of a placeholder is ntdll's
+/// alone: no request, no list.
+///
+/// What it changes: the destination holds the page's bytes as they were
+/// when mapped, not the page. Later writes to the page through our own
+/// views (DirectStorage, `written`) reach every copy; writes to it by the
+/// title through its pool view, or to the copy (by the title, or the
+/// GPU's results copied back), do not reach the other side. Diagnostics
+/// builds compare each copy with the page when it is unmapped and count
+/// those that differ (the frame line's "copies ... differed").
+fn copy_aliases() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_ALIAS_COPY").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// Puts a copy of the physical page `slice`, read at `from` (a view or a
+/// copy of it), at the page `at`, which must be a placeholder of one page
+/// or lie in one ([`copy_aliases`]).
+fn copy_page(physical: &mut Physical, at: usize, from: usize, slice: Slice) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let calling = std::time::Instant::now();
+    // SAFETY: splits the placeholder around the page (failing harmlessly
+    // when it is the whole placeholder), then commits private memory in
+    // its place; both act only on placeholders.
+    let done = unsafe {
+        VirtualFree(at as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            at as *const c_void,
+            PAGE,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        ) as usize
+            == at
+    };
+    if !done {
+        tracing::warn!(
+            address = format_args!("{at:#x}"),
+            error = %std::io::Error::last_os_error(),
+            "copying a physical page failed (not a placeholder?)"
+        );
+        return false;
+    }
+    // SAFETY: `from` is a page of ours mapped (or copied) while `physical`
+    // is held, readable whatever the guards made of it; `at` is the page
+    // just committed read-write.
+    unsafe { std::ptr::copy_nonoverlapping(from as *const u8, at as *mut u8, PAGE) };
+    #[cfg(feature = "diagnostics")]
+    {
+        victory_gpu::remap_call(calling.elapsed().as_micros() as u64);
+        victory_gpu::alias_copy_event(0);
+    }
+    victory_gpu::title_memory_remapped(at, PAGE);
+    victory_gpu::title_memory_copy(at, PAGE, true);
+    physical.copied.entry(slice.key(0)).or_default().push(at);
+    physical.copies.insert(at, slice);
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::copies_alive(physical.copies.len());
+    true
+}
+
+/// Returns the copy at `at` ([`copy_page`]) to a placeholder.
+fn uncopy(physical: &mut Physical, at: usize) {
+    let Some(slice) = physical.copies.remove(&at) else {
+        return;
+    };
+    if let std::collections::hash_map::Entry::Occupied(mut o) = physical.copied.entry(slice.key(0)) {
+        o.get_mut().retain(|&c| c != at);
+        if o.get().is_empty() {
+            o.remove();
+        }
+    }
+    // Diagnostics: does the copy still hold what the page holds?
+    #[cfg(feature = "diagnostics")]
+    match physical.shown.get(&slice.key(0)).and_then(|v| v.first()) {
+        Some(&view) => {
+            // SAFETY: both pages are ours and mapped while `physical` is held.
+            let same = unsafe {
+                std::slice::from_raw_parts(at as *const u8, PAGE) == std::slice::from_raw_parts(view as *const u8, PAGE)
+            };
+            victory_gpu::alias_copy_event(if same { 1 } else { 2 });
+        }
+        None => victory_gpu::alias_copy_event(4),
+    }
+    victory_gpu::title_memory_remapped(at, PAGE);
+    victory_gpu::title_memory_copy(at, PAGE, false);
+    #[cfg(feature = "diagnostics")]
+    let calling = std::time::Instant::now();
+    // SAFETY: a copy page we committed; it becomes a placeholder again.
+    unsafe { VirtualFree(at as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+    #[cfg(feature = "diagnostics")]
+    {
+        victory_gpu::remap_call(calling.elapsed().as_micros() as u64);
+        victory_gpu::copies_alive(physical.copies.len());
+    }
 }
 
 /// Whether a page mapped next to a view that shows the pages just before
@@ -1062,6 +1197,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
+    if !physical.copies.is_empty() {
+        let hit: Vec<usize> = physical.copies.range(base.saturating_sub(PAGE - 1)..end).map(|(at, _)| *at).collect();
+        for at in hit {
+            uncopy(physical, at);
+        }
+    }
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical

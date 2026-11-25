@@ -41,6 +41,8 @@ pub(crate) struct Pending {
     /// no host pipeline and never will. Kept apart from `made`, whose
     /// initialisation that worker left running for ever.
     died: AtomicBool,
+    /// A dispatch's wait for it, or its drop, has been logged ([`ready`]).
+    noted: AtomicBool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -113,6 +115,7 @@ impl Pending {
             left_out,
             begun: OnceLock::new(),
             died: AtomicBool::new(false),
+            noted: AtomicBool::new(false),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -230,9 +233,85 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
             return None;
         }
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        let started = Instant::now();
+        let waits = p.computes() && compute_waits(p);
+        if waits {
+            wait_long(p);
+        } else {
+            wait(p, crate::frame::current());
+        }
+        // Once per pipeline: a dispatch that had to wait for its pipeline,
+        // and one dropped for want of it (a pass the title runs once is
+        // then lost for the session).
+        if p.computes() && !p.noted.swap(true, Ordering::Relaxed) {
+            let hash = p.shaders.first().map_or("", |s| s.hash.as_str());
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if matches!(p.made.get(), Some(Some(_))) {
+                tracing::info!(hash, ms, unbounded = waits, "a dispatch waited for its compute pipeline");
+            } else {
+                tracing::info!(hash, ms, unbounded = waits, "a dispatch dropped: its compute pipeline is not made");
+            }
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// The longest a dispatch waits for its pipeline outside the frame's
+/// budget ([`compute_waits`]): well inside the title's GPU watchdog (30 s a
+/// frame). The ones that take longer (AMD's compiler takes 5 to 9 s for
+/// some of the title's programs, one took 85 s) are dropped as before.
+const COMPUTE_WAIT_MOST: Duration = Duration::from_secs(20);
+
+/// Whether a dispatch of compute pipeline `p` waits for it outside the
+/// frame's budget (`VICTORY_COMPUTE_WAIT`: `0` none, `all`, or shader hash
+/// prefixes separated by commas). A dropped draw loses one frame's
+/// picture; a dropped dispatch the title issues once loses its output for
+/// the session. The head blend-shape mapping (CS_ComputeBlendshapeMappings,
+/// 61e54e90adccaf6a) runs once per head at the world's first frame, while
+/// hundreds of pipelines are being made: dropped there, its maps stayed at
+/// the title's 0xffffffff fill, every vertex of the blend-shape program
+/// (970c4fbb3b017c0e) went to one point and the culling kept no meshlet of
+/// any head (runs skin-1 to skin-17, blend-1 to blend-3). Run blend-5
+/// (only that program waiting) brought the heads back; run blend-6 (all,
+/// the default) waited 679 times, 657 ms over the run (longest 19 ms),
+/// where before 335 compute programs had their first dispatch dropped
+/// (98 of them `scattering_transmittance_system`). The wait is in the
+/// recording thread before the dispatch is recorded, so it keeps its
+/// place in the list.
+fn compute_waits(p: &Pending) -> bool {
+    static WHICH: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    let which = WHICH.get_or_init(|| {
+        match std::env::var("VICTORY_COMPUTE_WAIT").ok().as_deref().map(str::trim) {
+            Some("0") => Some(Vec::new()),
+            Some("all") | None => None,
+            Some(list) => Some(list.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()),
+        }
+    });
+    match which {
+        None => true,
+        Some(list) => p.shaders.iter().any(|s| list.iter().any(|h| s.hash.starts_with(h.as_str()))),
+    }
+}
+
+/// Waits for `p` until it is made, its worker ended, or
+/// [`COMPUTE_WAIT_MOST`] passed.
+fn wait_long(p: &Pending) {
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() && !p.died.load(Ordering::Relaxed) {
+        let rest = COMPUTE_WAIT_MOST.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done
+            .wait_timeout(held, rest.min(Duration::from_millis(250)))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    drop(held);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, started.elapsed().as_micros() as u64);
 }
 
 /// Has `p` made if it is not made yet and waits for it, however long it

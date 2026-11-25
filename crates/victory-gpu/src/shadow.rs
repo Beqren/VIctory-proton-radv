@@ -2099,9 +2099,206 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Whether [`Shadow::merge_under_writes`] reads and compares a range's pages
+/// on threads of its own and compares 64 bytes at a time with AVX2
+/// (`VICTORY_UNDER_WIDE=1`; off by default until measured). After the
+/// sibling fork VIctory-7900XTX b620284 ("title bytes under flights' writes
+/// compared with AVX2 on threads of their own": 14 ms of a frame to 4-7
+/// there), re-made here: their compare is by dwords, this one by bytes as
+/// [`changed_runs`] is, because the snapshot case writes the runs into the
+/// copy while the card may be writing the bytes beside them.
+fn under_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNDER_WIDE").is_some_and(|v| v == "1"))
+}
+
+/// [`changed_runs`], the same runs, 64 bytes at a time where the processor
+/// has AVX2.
+fn changed_runs_fast(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs(now, was)
+}
+
+/// # Safety
+/// The processor has AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len().min(was.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    // Runs that meet across blocks are one.
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((a, m)) if *a + *m == from => *m += len,
+        _ => runs.push((from, len)),
+    };
+    let mut i = 0;
+    while i + 64 <= n {
+        // SAFETY: inside both slices (`i + 64 <= n`), unaligned loads.
+        let same = unsafe {
+            let a = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(now.as_ptr().add(i).cast::<__m256i>()),
+                _mm256_loadu_si256(was.as_ptr().add(i).cast::<__m256i>()),
+            );
+            let b = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(now.as_ptr().add(i + 32).cast::<__m256i>()),
+                _mm256_loadu_si256(was.as_ptr().add(i + 32).cast::<__m256i>()),
+            );
+            u64::from(_mm256_movemask_epi8(a) as u32) | u64::from(_mm256_movemask_epi8(b) as u32) << 32
+        };
+        let mut differ = !same;
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 64 {
+                break;
+            }
+            differ &= u64::MAX << (first + count);
+        }
+        i += 64;
+    }
+    while i < n {
+        if now[i] != was[i] {
+            push(i, 1);
+        }
+        i += 1;
+    }
+    runs
+}
+
+/// A piece of work for [`each_under`]'s threads: `f` for every index below
+/// `n` not yet taken.
+struct UnderJob {
+    /// Borrowed for the call: [`each_under`] returns only when every thread
+    /// it handed the job to is done with it.
+    f: &'static (dyn Fn(usize) + Sync),
+    n: usize,
+    next: Arc<std::sync::atomic::AtomicUsize>,
+    left: Arc<(Mutex<usize>, std::sync::Condvar)>,
+}
+
+/// Threads for [`each_under`] (`VICTORY_UNDER_THREADS`, 4 unless set, 1 to
+/// 16). Not [`wide`]'s: the thread that waits there takes any job queued,
+/// a landing's among them, and that takes the copy's locks that
+/// [`Shadow::merge_under_writes`] holds while its pages are compared.
+fn under_threads() -> &'static Mutex<Vec<std::sync::mpsc::Sender<UnderJob>>> {
+    static THREADS: std::sync::OnceLock<Mutex<Vec<std::sync::mpsc::Sender<UnderJob>>>> = std::sync::OnceLock::new();
+    THREADS.get_or_init(|| {
+        let n = std::env::var("VICTORY_UNDER_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let mut senders = Vec::new();
+        for i in 0..n {
+            let (tx, rx) = std::sync::mpsc::channel::<UnderJob>();
+            let spawned = std::thread::Builder::new().name(format!("victory-under-{i}")).spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    // Whatever happens in `f`, the caller is told this
+                    // thread is done with the job.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        loop {
+                            let i = job.next.fetch_add(1, Ordering::Relaxed);
+                            if i >= job.n {
+                                break;
+                            }
+                            (job.f)(i);
+                        }
+                    }));
+                    let mut left = job.left.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *left -= 1;
+                    if *left == 0 {
+                        job.left.1.notify_all();
+                    }
+                }
+            });
+            if spawned.is_ok() {
+                senders.push(tx);
+            }
+        }
+        Mutex::new(senders)
+    })
+}
+
+/// Calls `f` for `0..n`, on this thread and [`under_threads`]; returns when
+/// every call is done. `f` reads and compares memory; it takes no lock that
+/// a caller of this may hold.
+fn each_under(n: usize, f: &(dyn Fn(usize) + Sync)) {
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let left = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
+    // SAFETY: the reference is used only by the threads handed the job
+    // below, and this function returns only after each has said it is done
+    // with it (`left` back at 0).
+    let shared: &'static (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync), _>(f) };
+    {
+        let senders = under_threads().lock().unwrap_or_else(|e| e.into_inner());
+        for tx in senders.iter().take(n.saturating_sub(1)) {
+            let mut count = left.0.lock().unwrap_or_else(|e| e.into_inner());
+            let job = UnderJob {
+                f: shared,
+                n,
+                next: next.clone(),
+                left: left.clone(),
+            };
+            if tx.send(job).is_ok() {
+                *count += 1;
+            }
+        }
+    }
+    loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= n {
+            break;
+        }
+        f(i);
+    }
+    let mut count = left.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *count > 0 {
+        count = left.1.wait(count).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, changed_runs_fast};
+
+    /// The fast compare finds exactly the runs [`changed_runs`] finds, at
+    /// every length and offset (blocks of 64 and the tail, runs across
+    /// blocks).
+    #[test]
+    fn fast_runs_are_the_changed_runs() {
+        let mut seed = 7u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for round in 0..2000 {
+            let n = random() as usize % 700;
+            let was: Vec<u8> = (0..n).map(|_| random() as u8).collect();
+            let mut now = was.clone();
+            for _ in 0..random() % 40 {
+                if n == 0 {
+                    break;
+                }
+                let at = random() as usize % n;
+                let len = (random() as usize % 140).min(n - at);
+                for b in &mut now[at..at + len] {
+                    *b ^= (random() as u8) | 1;
+                }
+            }
+            if round % 7 == 0 {
+                // All different.
+                now.iter_mut().for_each(|b| *b = !*b);
+            }
+            assert_eq!(changed_runs_fast(&now, &was), changed_runs(&now, &was), "round {round} n {n}");
+        }
+        assert!(changed_runs_fast(&[], &[]).is_empty());
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -3129,6 +3326,12 @@ impl Shadow {
                     .map(|(page, _)| page)
                     .collect()
             };
+            if under_wide() && stale.len() > 2 {
+                if self.merge_pages_wide(&stale, (a, e), now, runs_left) {
+                    return true;
+                }
+                continue;
+            }
             for page in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
@@ -3198,6 +3401,104 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// Of [`Shadow::merge_under_writes`] with [`under_wide`]: the pages
+    /// `stale` of the busy range `[a, e)`, read and compared with the
+    /// reference on several threads ([`each_under`]), then put in here in
+    /// page order exactly as the one-by-one loop does, all under one hold of
+    /// the reference's lock (from before the first read to after the last
+    /// write, which is what the per-page hold kept: no landing in between).
+    /// `now` is the journal's mark for the pages taken. Whether the caller
+    /// must settle (no snapshot, or `runs_left` ran out); pages put in
+    /// before that stay put in.
+    fn merge_pages_wide(&self, stale: &[usize], (a, e): (usize, usize), now: u64, runs_left: &mut usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let card = self.card.is_some();
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // The reference: the copy's CPU side, or the snapshot.
+        let held = if card {
+            self.data as usize
+        } else {
+            match before.as_mut() {
+                Some(snapshot) => snapshot.as_mut_ptr() as usize,
+                None => return true,
+            }
+        };
+        // Per page: title memory as read now and its changed runs; none for
+        // a page that is not there (left as it is, and looked at again).
+        type Read = Option<(Vec<u8>, Vec<(usize, usize)>)>;
+        let done: Vec<Mutex<Read>> = stale.iter().map(|_| Mutex::new(None)).collect();
+        let one = |i: usize| {
+            let page = stale[i];
+            let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+            if lo >= hi {
+                return;
+            }
+            let mut title = vec![0u8; hi - lo];
+            if !crate::host::read_into(lo as *const u8, &mut title) {
+                return;
+            }
+            // SAFETY: the reference holds the copy's bytes at the copy's
+            // offsets and these are in a declared range; nothing writes it
+            // while the lock above is held (the CPU side: only the
+            // submitting thread, which is waiting here).
+            let reference = unsafe { std::slice::from_raw_parts((held as *const u8).add(lo - start), hi - lo) };
+            let runs = changed_runs_fast(&title, reference);
+            *done[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((title, runs));
+        };
+        each_under(stale.len(), &one);
+        let (mut pages, mut count, mut bytes) = (0u64, 0u64, 0u64);
+        let mut taken = Vec::new();
+        let mut over = false;
+        for (i, read) in done.into_iter().enumerate() {
+            let Some((title, runs)) = read.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                continue;
+            };
+            let page = stale[i];
+            let lo = (page * PAGE).max(a);
+            let at = lo - start;
+            pages += 1;
+            if card && runs.len() > *runs_left {
+                over = true;
+                break;
+            }
+            if card {
+                *runs_left -= runs.len();
+            }
+            for &(r, m) in &runs {
+                // SAFETY: inside the copy's mapping and the reference, as
+                // above. The card may be writing the copy beside these
+                // bytes; they are written here and nothing around them.
+                unsafe {
+                    if !card {
+                        std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m);
+                    }
+                    std::ptr::copy_nonoverlapping(title.as_ptr().add(r), (held as *mut u8).add(at + r), m);
+                }
+                if card {
+                    self.card_changed(at + r, at + r + m);
+                }
+                bytes += m as u64;
+            }
+            count += runs.len() as u64;
+            // Taken, if the range holds all of the page that is in the copy.
+            if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                taken.push(page);
+            }
+        }
+        drop(before);
+        for (i, n) in [pages, count, bytes].into_iter().enumerate() {
+            MERGED[i].fetch_add(n, Ordering::Relaxed);
+        }
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for page in taken {
+            if let Some(at) = copied.get_mut(page - base) {
+                *at = now;
+            }
+        }
+        over
     }
 
     /// At submission: copies what changed of `[address, address + len)`

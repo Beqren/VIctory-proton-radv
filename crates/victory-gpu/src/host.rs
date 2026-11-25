@@ -2631,6 +2631,30 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     None
 }
 
+/// The parts of a submission's preparing, in microseconds since the last
+/// frame-rate line: its lists' steps (refreshes, copies, snapshots of
+/// ranges shaders write: the frame line's "copies" and "textures" and
+/// more), the title's bytes put in under flights' writes
+/// ([`stale_under_flights`]), the snapshots taken together
+/// (`crate::shadow::take_snapshots`), the card copies' plan
+/// ([`Host::card_before`]) and the page marks' sorting. What the frame
+/// line's "preparing" holds beyond them is the rest (settles inside it are
+/// left out of both). Run base15 gave 155 ms of preparing and named only
+/// 56 ms of copies and 5 of textures.
+static PREP_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn prep_part(i: usize, since: std::time::Instant) {
+    PREP_PARTS[i].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// [`stale_under_flights`], timed for [`PREP_PARTS`].
+fn timed_under_flights(runs: &[&HostList]) -> bool {
+    let started = std::time::Instant::now();
+    let stale = stale_under_flights(runs);
+    prep_part(1, started);
+    stale
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -4698,17 +4722,18 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && timed_under_flights(runs) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && timed_under_flights(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        let part = std::time::Instant::now();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -4719,15 +4744,16 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        prep_part(0, part);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
-            #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+            prep_part(2, snapshots);
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
@@ -4738,13 +4764,17 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        let part = std::time::Instant::now();
         let card = self.card_before(runs, flown);
+        prep_part(3, part);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         // Page marks: this submission's, copied down and cleared behind its
         // lists. Without them every copy it writes is compared whole.
+        let part = std::time::Instant::now();
         let (mut unmarked, marking, writers) = marked_writes(runs);
+        prep_part(4, part);
         let marks = if marking { self.marks_take() } else { None };
         if marking && marks.is_none() {
             for list in runs {
@@ -6533,6 +6563,16 @@ impl Meter {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
+        {
+            let [steps, under, snaps, plan, marks] =
+                [0, 1, 2, 3, 4].map(|i| PREP_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            tracing::info!(
+                "preparing per frame, by part: {cpu:.1} ms, of it the lists' steps {steps:.1} (refreshes, copies, snapshots \
+                 one by one, textures), title bytes put in under flights' writes {under:.1}, snapshots taken together {snaps:.1}, \
+                 the card copies' plan {plan:.1}, page marks {marks:.1}, the rest {:.1}",
+                (cpu - steps - under - snaps - plan - marks).max(0.0)
+            );
+        }
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });

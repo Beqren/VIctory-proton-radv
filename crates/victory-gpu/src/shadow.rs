@@ -3455,18 +3455,28 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let old = buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // Registered again at the same address: its old copy through the
+    // graveyard, not dropped at once (as fork Belobug 40b8b9b): a list being
+    // recorded may name it by a root view's address, which holds nothing.
+    if let Some(shadow) = old.and_then(|e| e.shadow) {
+        crate::host::retire(shadow);
+    }
 }
 
-/// The title released it; lists that still hold its copy keep it alive.
+/// The title released it; lists that still hold its copy keep it alive,
+/// and the graveyard keeps it for those being recorded.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let old = buffers().remove(&(start, resource));
+    if let Some(shadow) = old.and_then(|e| e.shadow) {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making

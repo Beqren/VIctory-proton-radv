@@ -1380,6 +1380,16 @@ impl State {
                         ));
                     }
                     if !root_address_ok(gpu) {
+                        // The arithmetic that came out small: the copy's base
+                        // and the title's offset into it.
+                        let base = crate::shadow::find(address, 1).map(|s| (s.gpu(address), s.left(address)));
+                        once!(
+                            address = format_args!("{address:#x}"),
+                            gpu = format_args!("{gpu:#x}"),
+                            biased,
+                            copy = ?base,
+                            "a root view's host address came out below 1 MiB"
+                        );
                         bind_null_root(l, param, compute, if srv { RootKind::Shader } else { RootKind::Constant }, &p.name, slot, address, NullRoot::NearZero);
                         continue;
                     }

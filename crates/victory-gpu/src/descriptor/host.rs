@@ -2174,16 +2174,7 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
-        // The table's dword: the stride, with the format kind of a typed
-        // view of an integer format (`view_kind`).
-        let word = stride.map_or(0, |s| s | view.map_or(0, view_kind));
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
-        }
+        self.slot_word(index, view);
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -2221,6 +2212,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        // The table by slot follows the slot: a table the draw's own copy
+        // was made of (dynamic slots) is read through it as the title's
+        // slots are (strides, and the format kind 16-bit typed accesses
+        // need: the face network's tables, 0aa7934094794dbf and the rest
+        // of the `compute_graph_ops`, are all made here).
+        self.slot_word(index, Some(view));
         let kept = make(view, self.cpu(index));
         let mark = MADE_MARK.take();
         if kept.is_none() {
@@ -2230,8 +2227,23 @@ impl HostHeap {
         self.set_mark(index, mark);
     }
 
+    /// Enters slot `index`'s dword in the table by slot: the view's stride
+    /// with the format kind of a typed view of an integer format
+    /// (`view_kind`), 0 for none or not a buffer view.
+    fn slot_word(&self, index: u32, view: Option<&View>) {
+        let word = view.and_then(view_stride).map_or(0, |s| s | view.map_or(0, view_kind));
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.slot_word(index, None);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -2360,6 +2372,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        self.slot_word(index, None);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -4001,6 +4014,48 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    /// Typed buffer views of integer formats carry their kind in the table
+    /// by slot; float, normalized, raw and structured ones do not.
+    #[test]
+    fn integer_typed_buffer_views_are_marked_in_the_slot_table() {
+        use victory_shader::emit::{SLOT_INTEGER, SLOT_SIGNED};
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        assert_eq!(view_kind(&uav(12, 0, 0)), SLOT_INTEGER, "R16G16B16A16_UINT");
+        assert_eq!(view_kind(&uav(57, 0, 0)), SLOT_INTEGER, "R16_UINT");
+        assert_eq!(view_kind(&uav(59, 0, 0)), SLOT_INTEGER | SLOT_SIGNED, "R16_SINT");
+        assert_eq!(view_kind(&uav(10, 0, 0)), 0, "R16G16B16A16_FLOAT");
+        assert_eq!(view_kind(&uav(58, 0, 0)), 0, "R16_SNORM");
+        assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
+        assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
+    }
+
+    /// A table's copy in dynamic slots (every table a draw or dispatch
+    /// binds) gets its entries' words in the table by slot, as the title's
+    /// own slots do: the face network (`compute_graph_ops`) binds its
+    /// R16_UINT views through tables, and its 16-bit integers became 0
+    /// while the dynamic slots' words stayed 0.
+    #[test]
+    fn a_tables_dynamic_slots_carry_their_views_words() {
+        use victory_shader::emit::SLOT_INTEGER;
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let heap = HostHeap::new(false, 64).expect("a view heap");
+        let index = heap.dynamic(2).expect("dynamic slots");
+        let (_, _, data) = heap.strides.as_ref().expect("the table by slot");
+        let word = |i: u32| {
+            // SAFETY: inside the table's mapping.
+            unsafe { (*data as *const u32).add(i as usize).read_volatile() }
+        };
+        heap.make_at(index, &View::Unordered(0, 0, Some([57, 1, 0, 0, 64, 0, 0, 0, 0, 0])));
+        assert_eq!(word(index), 2 | SLOT_INTEGER, "R16_UINT");
+        heap.make_at(index + 1, &View::Unordered(0, 0, Some([10, 1, 0, 0, 64, 0, 0, 0, 0, 0])));
+        assert_eq!(word(index + 1), 8, "R16G16B16A16_FLOAT");
+        heap.make_null(index);
+        assert_eq!(word(index), 0, "null");
     }
 
     /// The texture that stands for missing ones can be made and viewed.

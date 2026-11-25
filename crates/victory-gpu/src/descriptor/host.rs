@@ -1081,6 +1081,23 @@ fn integer_format(format: u32) -> Option<bool> {
     }
 }
 
+/// Whether the slots a draw's table copies are made in (dynamic slots) get
+/// their words in the table by slot (`VICTORY_TABLE_SLOT_WORDS=1`; off by
+/// default; always in tests). With it the 16-bit integer path reaches the
+/// face network (`compute_graph_ops`, bound through tables): in run face-4
+/// (2026-11-25) its output came alive, 196,000-267,000 of 532,480 halves
+/// not zero and changing every frame where it had been all zero, and faces
+/// moved, but grossly: mouths agape, lips and jaw torn out of shape. Some
+/// other stage of the network or its inputs is still wrong, and the still,
+/// neutral faces look better until it is found.
+fn table_slot_words() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_SLOT_WORDS").is_some_and(|v| v == "1"))
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -2390,7 +2407,9 @@ impl HostHeap {
         // slots are (strides, and the format kind 16-bit typed accesses
         // need: the face network's tables, 0aa7934094794dbf and the rest
         // of the `compute_graph_ops`, are all made here).
-        self.slot_word(index, Some(view));
+        if table_slot_words() {
+            self.slot_word(index, Some(view));
+        }
         let kept = make(view, self.cpu(index));
         let mark = MADE_MARK.take();
         if kept.is_none() {
@@ -2416,7 +2435,9 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
-        self.slot_word(index, None);
+        if table_slot_words() {
+            self.slot_word(index, None);
+        }
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -2545,7 +2566,9 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.slot_word(index, None);
+        if table_slot_words() {
+            self.slot_word(index, None);
+        }
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -2674,6 +2697,14 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(view);
+            }
+            if !later && !self.sampler && publish_later(&view) {
+                // Not now: a submission in the air may read this slot, and
+                // the texture's memory is newer than it ([`publish_later`]).
+                // The slot keeps what it shows; the write comes again with
+                // nothing in the air (`super::publish_deferred`).
+                super::defer_publish(handle);
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
@@ -3210,6 +3241,50 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
+/// Whether a slot write that shows texture `view` waits for a moment with
+/// no submission in the air (`VICTORY_PUBLISH_SAFE`, on): it does while
+/// submissions are in the air and the texture's host copy was made less
+/// than [`FRESH_MS`] ago (or is made now, for this view).
+///
+/// Why: run play-va1 (2026-11-25, `VICTORY_TEXTURE_VA=1`) lost the device
+/// on texture-unit reads inside a LIVE host texture (a 4096x4096 BC1, at
+/// +0x21000 to +0x26000 of mip 0, permission fault: page table entry not
+/// valid) made 2,084 ms before the removal was detected, the moment the hung
+/// job began. Shaders read descriptors from the heap when they run, so a
+/// slot written while a submission is in the air changes what that running
+/// submission reads; a texture whose memory is newer than the submission is
+/// one the kernel may not have made valid for it. Every device loss of the
+/// day came a few seconds after new content (new textures) arrived.
+/// shortcut: "fresh" is counted in time, not against each submission's
+/// send.
+fn publish_later(view: &View) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PUBLISH_SAFE").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let texture = match view {
+        View::Shader(r, _) if !view.is_buffer() => *r,
+        View::Placed(false, ..) => match placed_texture(view) {
+            Some(View::Shader(r, _)) => r,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if !crate::host::flying() {
+        return false;
+    }
+    match crate::resource::host_age_ms(texture as crate::object::This) {
+        Some(age) => age < FRESH_MS,
+        None => false,
+    }
+}
+
+/// How new a texture's host copy is for [`publish_later`] (ms).
+const FRESH_MS: u64 = 3_000;
+
+/// Slot writes [`publish_later`] put off, and published since the start.
+pub(crate) static PUBLISH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// A texture view's description, for [`view_fits`].
 enum ViewRange<'a> {
     Shader(&'a mut D3D12_SHADER_RESOURCE_VIEW_DESC),
@@ -3244,7 +3319,8 @@ fn view_fits(texture: &ID3D12Resource, view: &mut ViewRange) -> bool {
     let (mips, slices) = (u32::from(d.MipLevels.max(1)), u32::from(d.DepthOrArraySize.max(1)));
     let dim = d.Dimension;
     let before = view_summary(view);
-    let result = fit_range(dim, mips, slices, view);
+    let planes = format_planes(d.Format.0 as u32);
+    let result = fit_range(dim, mips, slices, view).filter(|_| plane_fits(view, planes));
     match result {
         Some(false) => {}
         Some(true) => {
@@ -3280,7 +3356,7 @@ fn view_summary(view: &ViewRange) -> String {
             ViewRange::Shader(v) => match v.ViewDimension {
                 D3D12_SRV_DIMENSION_TEXTURE1D => format!("1d mips {}+{}", v.Anonymous.Texture1D.MostDetailedMip, v.Anonymous.Texture1D.MipLevels as i32),
                 D3D12_SRV_DIMENSION_TEXTURE1DARRAY => { let t = v.Anonymous.Texture1DArray; format!("1d array mips {}+{} slices {}+{}", t.MostDetailedMip, t.MipLevels as i32, t.FirstArraySlice, t.ArraySize) }
-                D3D12_SRV_DIMENSION_TEXTURE2D => format!("2d mips {}+{}", v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels as i32),
+                D3D12_SRV_DIMENSION_TEXTURE2D => format!("2d mips {}+{} plane {} format {}", v.Anonymous.Texture2D.MostDetailedMip, v.Anonymous.Texture2D.MipLevels as i32, v.Anonymous.Texture2D.PlaneSlice, v.Format.0),
                 D3D12_SRV_DIMENSION_TEXTURE2DARRAY => { let t = v.Anonymous.Texture2DArray; format!("2d array mips {}+{} slices {}+{}", t.MostDetailedMip, t.MipLevels as i32, t.FirstArraySlice, t.ArraySize) }
                 D3D12_SRV_DIMENSION_TEXTURE3D => format!("3d mips {}+{}", v.Anonymous.Texture3D.MostDetailedMip, v.Anonymous.Texture3D.MipLevels as i32),
                 D3D12_SRV_DIMENSION_TEXTURECUBE => format!("cube mips {}+{}", v.Anonymous.TextureCube.MostDetailedMip, v.Anonymous.TextureCube.MipLevels as i32),
@@ -3297,6 +3373,36 @@ fn view_summary(view: &ViewRange) -> String {
             },
         }
     }
+}
+
+/// Planes of a host texture format: 2 for the depth-stencil families (the
+/// stencil plane is plane 1), else 1.
+fn format_planes(format: u32) -> u32 {
+    if matches!(format, 19..=22 | 44..=47 | 118..=121) { 2 } else { 1 }
+}
+
+/// Whether a shader view's plane lies in the texture: a view of plane 1
+/// (the stencil) of a texture without one is refused. Run play-fault5
+/// (2026-11-25) lost the device on a texture-unit read at GPU address 0
+/// while a button prompt drawn with FTexTGCxformEAlphaDepthStencilOccluded
+/// (91cbe89832eb575b) appeared: that program loads the scene's depth and
+/// stencil by `image_load` at screen coordinates; a view of a plane the
+/// image does not have has no memory behind it.
+fn plane_fits(view: &ViewRange, planes: u32) -> bool {
+    // Union reads: the member the dimension names.
+    let plane = match view {
+        ViewRange::Shader(v) => match v.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => unsafe { v.Anonymous.Texture2D.PlaneSlice },
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => unsafe { v.Anonymous.Texture2DArray.PlaneSlice },
+            _ => 0,
+        },
+        ViewRange::Unordered(v) => match v.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => unsafe { v.Anonymous.Texture2D.PlaneSlice },
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => unsafe { v.Anonymous.Texture2DArray.PlaneSlice },
+            _ => 0,
+        },
+    };
+    plane < planes
 }
 
 /// Mips `most`, `levels` (`u32::MAX`: all) against a texture of `mips`:

@@ -2144,6 +2144,7 @@ pub(crate) fn log_va() -> bool {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        crate::host::vamap::freed(self.gpu);
         if log_va() {
             tracing::info!(
                 gpu = format_args!("{:#x}", self.gpu),
@@ -2478,6 +2479,7 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        crate::host::vamap::made(gpu, len, "copy", || format!("title {start:#x} len {len:#x}"));
         if log_va() {
             tracing::info!(
                 gpu = format_args!("{gpu:#x}"),

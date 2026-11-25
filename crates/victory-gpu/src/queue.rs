@@ -807,12 +807,11 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    crate::capture::frame_drew(frame, crate::draw::drawn());
     #[cfg(all(windows, feature = "diagnostics"))]
-    {
-        crate::capture::frame_drew(frame, crate::draw::drawn());
-        if crate::capture::listed(frame) {
-            crate::capture::dump_targets(frame);
-        }
+    if crate::capture::listed(frame) {
+        crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
     if planes > 0

@@ -1,7 +1,20 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size. Saving frames works in every build; the per-draw lists
+//! (`frame-<n>-ops.txt`), the render targets (`VICTORY_DUMP_TARGETS`) and
+//! the black-frame probe only in builds with diagnostics.
+//!
+//! `VICTORY_CAPTURE_EVERY=<k>`: in the world (from the first frame of 500
+//! draws or more on), every k-th frame too, to judge a build's picture by
+//! program (`tools/shots.py`). Each saved frame gets a line in
+//! `frames.tsv`: its number, its number after the world's first frame, the
+//! seconds since the first present and since the world's first frame, and
+//! the draws run on the host for it, so runs can be lined up by frame or by
+//! time (the opening cutscene does not fall on the same frame numbers from
+//! run to run).
+
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 
 use std::path::PathBuf;
 
@@ -12,7 +25,11 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            let folder = PathBuf::from(std::env::var_os("VICTORY_CAPTURE")?);
+            let _ = std::fs::create_dir_all(&folder);
+            Some(folder)
+        })
         .as_ref()
 }
 
@@ -47,7 +64,10 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    // `VICTORY_CAPTURE_EVERY` alone finds the world too: these stay off then
+    // (in diagnostics builds a listed frame writes its draws and targets).
+    named
+        || first != u64::MAX && world_on() && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -123,16 +143,25 @@ fn world_on() -> bool {
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
+/// When the first frame was presented and when the world's first was.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static WORLD_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// The draws run on the host for the frame being presented.
+static FRAME_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    STARTED.get_or_init(std::time::Instant::now);
     let before = LAST.swap(drawn, Relaxed);
-    if world_on()
+    FRAME_DRAWS.store(drawn.saturating_sub(before), Relaxed);
+    if (world_on() || every().is_some())
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
     {
-        tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
+        WORLD_AT.get_or_init(std::time::Instant::now);
+        tracing::info!(frame, "the first frame of 500 draws or more: the world's frames are counted from it");
         #[cfg(feature = "diagnostics")]
         if let Some(folder) = folder() {
             let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
@@ -157,13 +186,50 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first) % 8 < 2;
+    let in_world = first != u64::MAX
+        && n > first
+        && (world_on() && (n - first) % 8 < 2 || every().is_some_and(|k| (n - first).is_multiple_of(k)));
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
-/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
-pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+/// `VICTORY_CAPTURE_EVERY`: every how many frames in the world one is saved.
+fn every() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_EVERY")
+            .ok()
+            .and_then(|k| k.trim().parse().ok())
+            .filter(|&k| k > 0)
+    })
+}
+
+/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`, and
+/// its line in `frames.tsv` (`since`: when the frame's read-back was
+/// submitted, for what saving it cost).
+fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8], since: std::time::Instant) {
+    use std::io::Write;
     save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    let Some(folder) = folder() else { return };
+    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+    let after = if first == u64::MAX { -1 } else { n as i64 - first as i64 };
+    let secs = |at: Option<&std::time::Instant>| at.map_or(-1.0, |t| t.elapsed().as_secs_f64());
+    let line = format!(
+        "{n}\t{after}\t{:.2}\t{:.2}\t{}\t{:.1}\n",
+        secs(STARTED.get()),
+        secs(WORLD_AT.get()),
+        FRAME_DRAWS.load(std::sync::atomic::Ordering::Relaxed),
+        since.elapsed().as_secs_f64() * 1e3
+    );
+    // The first line of a run starts the file afresh: a folder used again
+    // must not mix two runs' lines.
+    static OPENED: std::sync::Once = std::sync::Once::new();
+    let path = folder.join("frames.tsv");
+    OPENED.call_once(|| {
+        let _ = std::fs::write(&path, "frame\tafter_world\tsecs\tsecs_world\tdraws\tms\n");
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
@@ -312,6 +378,7 @@ pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    since: std::time::Instant,
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
@@ -331,7 +398,7 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows, since);
         buffer.Unmap(0, None);
     }
 }
@@ -352,6 +419,7 @@ fn dump_on() -> bool {
 }
 
 /// Notes a title texture the frame being built renders to or writes.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;

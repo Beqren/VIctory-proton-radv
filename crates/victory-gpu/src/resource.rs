@@ -1245,6 +1245,34 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// Diagnostics: for `this`, a texture made for a view the title placed in
+/// memory that [`alias_of`] found no texture for: the title texture the
+/// host writes whose memory it lies in, if any (its start, the offset into
+/// it, and both descriptions). Such a view reads title memory, which the
+/// host's writes never reach.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn alias_miss(this: This) -> Option<(This, String)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if !r.host.placed.load(Relaxed) || !fills(&r.desc) {
+        return None;
+    }
+    let at = r.data() as u64;
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let (&start, &other) = targets.range(..=at).next_back()?;
+    let o = resource(other as This);
+    let size = footprint(&o.desc).map_or(0, |f| f.size);
+    (at < start + size).then(|| {
+        (
+            other as This,
+            format!("target {other:#x} at {start:#x} (+{:#x} of {size:#x}) {:?}; view's texture {:?}", at - start, o.desc, r.desc),
+        )
+    })
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.

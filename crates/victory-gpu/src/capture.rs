@@ -432,6 +432,22 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// Notes `resource` to be saved at the next present whatever the frame,
+/// when capturing (`VICTORY_CAPTURE`): for one pass found by its shaders
+/// (the title's decoration bake), whose frame is not known beforehand.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn dump_target(resource: crate::object::This) {
+    if resource.is_null() || folder().is_none() {
+        return;
+    }
+    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !targets.iter().any(|&(r, _)| r == resource as usize)
+        && let Some(copy) = crate::resource::host_copy(resource)
+    {
+        targets.push((resource as usize, copy));
+    }
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;

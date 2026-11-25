@@ -396,6 +396,28 @@ const BAKE_PIXEL_SHADERS: [&str; 4] =
 /// Bake draws bound so far.
 static BAKE_DRAWS: AtomicU64 = AtomicU64::new(0);
 
+/// The title textures the bake's draws render to (diagnostics).
+#[cfg(feature = "diagnostics")]
+static BAKE_TARGETS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// While the texture pass ([`State::heap_textures`]) runs.
+    static IN_TEXTURE_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets a flag back to false when dropped (the texture pass returns early
+/// in several places).
+#[cfg(feature = "diagnostics")]
+struct Reset(&'static std::thread::LocalKey<std::cell::Cell<bool>>);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Reset {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw ([`State::early_textures`]).
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -1552,8 +1574,42 @@ impl State {
     /// shader is one of the title's bake programs ([`BAKE_PIXEL_SHADERS`]).
     /// The uploads are recorded into `list` ahead of the draw being bound,
     /// as the world's pass records them.
+    /// Diagnostics of a bake draw: its render targets, where their memory
+    /// is, once each; saved at the frame's present when capturing
+    /// (`VICTORY_CAPTURE`), to see whether the bake writes skin or black.
+    #[cfg(feature = "diagnostics")]
+    fn note_bake_targets(&self) {
+        let frame = crate::frame::current();
+        for &target in &self.targets {
+            let new = {
+                let mut set = BAKE_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+                let new = !set.contains(&target);
+                if new {
+                    set.push(target);
+                }
+                new
+            };
+            if new {
+                let memory = crate::resource::texture_memory(target as This);
+                tracing::info!(
+                    frame,
+                    target = format_args!("{target:#x}"),
+                    at = ?memory.map(|m| m.0),
+                    desc = ?memory.map(|m| m.1),
+                    viewports = ?self.viewports,
+                    "a render target of the title's decoration bake"
+                );
+            }
+            crate::capture::dump_target(target as This);
+        }
+    }
+
     fn early_textures(&self, list: &HostList, p: &HostPipeline) {
         let bake = bake_probe(p);
+        #[cfg(feature = "diagnostics")]
+        if bake {
+            self.note_bake_targets();
+        }
         let (early_ms, bake_ms) = early_budgets();
         if early_ms == 0 && bake_ms == 0 {
             return;
@@ -1653,6 +1709,10 @@ impl State {
             SPENT.store(0, Ordering::Relaxed);
         }
         TEXTURE_PASS_FRAME.store(frame, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        IN_TEXTURE_PASS.set(true);
+        #[cfg(feature = "diagnostics")]
+        let _pass = Reset(&IN_TEXTURE_PASS);
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -2867,8 +2927,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let source = crate::resource::alias_of(*resource as This);
+            let aliased = source.is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            #[cfg(feature = "diagnostics")]
+            alias_probe(*resource as This, source, aliased);
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
@@ -2914,6 +2976,53 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         _ => {}
+    }
+}
+
+/// Diagnostics of a texture a shader reads (`readable`): reads of the
+/// bake's targets, directly or through a view placed in their memory
+/// (`source`: the texture [`crate::resource::alias_of`] found), and views
+/// placed in the memory of a texture the host writes that found none.
+#[cfg(feature = "diagnostics")]
+fn alias_probe(resource: This, source: Option<This>, aliased: bool) {
+    static SAID: std::sync::Mutex<Option<std::collections::HashSet<(usize, u8)>>> = std::sync::Mutex::new(None);
+    let bake = |r: This| BAKE_TARGETS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(r as usize));
+    let first = |kind: u8| {
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        let said = said.get_or_insert_with(Default::default);
+        said.len() < 400 && said.insert((resource as usize, kind))
+    };
+    let frame = crate::frame::current();
+    let in_pass = IN_TEXTURE_PASS.get();
+    if bake(resource) && first(0) {
+        tracing::info!(frame, in_pass, target = format_args!("{:#x}", resource as usize), "a shader reads a target of the decoration bake");
+    }
+    match source {
+        Some(source) => {
+            if bake(source) && first(1) {
+                tracing::info!(
+                    frame,
+                    in_pass,
+                    aliased,
+                    view = format_args!("{:#x}", resource as usize),
+                    target = format_args!("{:#x}", source as usize),
+                    "a shader reads a target of the decoration bake through a view placed in its memory"
+                );
+            }
+        }
+        None => {
+            if let Some((target, text)) = crate::resource::alias_miss(resource)
+                && first(2)
+            {
+                tracing::info!(
+                    frame,
+                    in_pass,
+                    bake = bake(target),
+                    view = format_args!("{:#x}", resource as usize),
+                    "a view placed in the memory of a texture the host writes reads title memory: {text}"
+                );
+            }
+        }
     }
 }
 

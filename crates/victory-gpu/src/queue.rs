@@ -809,10 +809,10 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     crate::capture::frame_drew(frame, crate::draw::drawn());
+    // The targets noted for this frame (`capture::note_target`, for listed
+    // frames) or for whatever frame comes (`capture::dump_target`).
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
-    }
+    crate::capture::dump_targets(frame);
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.

@@ -98,6 +98,9 @@ fn kernel_writes(first: usize, last: usize, found: &mut [usize], count: &mut usi
         add(C::KernelCalls, 1);
         add(C::KernelUs, us);
         add(C::KernelBytes, bytes);
+        if !failed {
+            prep(P_KERNEL_PAGES, *count as u64);
+        }
         if failed {
             add(C::KernelFailed, 1);
             add(C::KernelFailedUs, us);
@@ -409,6 +412,70 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Diagnostics: the guards' work taken apart, since the last frame line
+/// ([`prep_take`]). Indices: [`P_GUARD_CALLS`] and on.
+#[cfg(feature = "diagnostics")]
+static PREP: [std::sync::atomic::AtomicU64; 40] = [const { std::sync::atomic::AtomicU64::new(0) }; 40];
+/// `guard` calls, of them all clean, microseconds waiting for the guards'
+/// lock in them, microseconds in `protect` in them.
+pub(crate) const P_GUARD_CALLS: usize = 0;
+pub(crate) const P_GUARD_CLEAN: usize = 1;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const P_GUARD_LOCK_US: usize = 2;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const P_GUARD_PROTECT_US: usize = 3;
+/// Blocks `guard` reported written; 4 KiB pages the kernel reported written.
+pub(crate) const P_GUARD_WRITTEN: usize = 4;
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const P_KERNEL_PAGES: usize = 5;
+/// `VirtualProtect` calls and microseconds: read-only by `protect_here`,
+/// by `protect_alias`, read-write by `open_here`.
+pub(crate) const P_VP_HERE: usize = 6;
+pub(crate) const P_VP_ALIAS: usize = 8;
+pub(crate) const P_VP_OPEN: usize = 10;
+/// Blocks opened, by why ([`Why`]): at the block itself, then at another
+/// view of its pages.
+pub(crate) const P_OPENED: usize = 12;
+pub(crate) const P_OPENED_ALIAS: usize = 18;
+/// Blocks `guard` reported written, by why they had been opened (5: not
+/// opened by us: new, remapped, or never guarded).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const P_WRITTEN_WHY: usize = 24;
+/// Microseconds in the fault handler waiting for the guards' lock.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) const P_FAULT_LOCK_US: usize = 30;
+
+/// Why a guarded block was opened (diagnostics).
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+enum Why {
+    /// A write faulted into the guard.
+    Fault = 0,
+    /// The copy-back put what shaders wrote into title memory.
+    Card = 1,
+    /// Another write of ours or the kernel's ([`writing`]): title copies at
+    /// submission, the runtime's reads into title memory.
+    Writing = 2,
+    /// [`write_title_memory`]'s opening of every view after its write.
+    EveryView = 3,
+    /// A view of the pages was mapped ([`views_mapped`]).
+    Mapped = 4,
+}
+
+#[cfg(feature = "diagnostics")]
+fn prep(i: usize, n: u64) {
+    PREP[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn prep(_: usize, _: u64) {}
+
+/// [`PREP`], taken.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn prep_take() -> [u64; 40] {
+    std::array::from_fn(|i| PREP[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
@@ -425,6 +492,10 @@ struct Guards {
     /// private memory instead of a view of it (`xmem` `copy_aliases`):
     /// guarded as views are.
     copies: BTreeSet<usize>,
+    /// Diagnostics: why each block opened since its last guarding was
+    /// opened ([`Why`]).
+    #[cfg(feature = "diagnostics")]
+    why: BTreeMap<usize, u8>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -433,6 +504,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     copies: BTreeSet::new(),
+    #[cfg(feature = "diagnostics")]
+    why: BTreeMap::new(),
 });
 
 impl Guards {
@@ -479,7 +552,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 }
 
 /// `VirtualProtect` of the guards; timed in diagnostics builds.
-fn reprotect(at: usize, len: usize, protection: u32) -> bool {
+fn reprotect(at: usize, len: usize, protection: u32, kind: usize) -> bool {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let mut old = 0;
@@ -490,7 +563,11 @@ fn reprotect(at: usize, len: usize, protection: u32) -> bool {
         use crate::copystat::{C, add};
         add(C::ProtectCalls, 1);
         add(C::ProtectUs, started.elapsed().as_micros() as u64);
+        prep(kind, 1);
+        prep(kind + 1, started.elapsed().as_micros() as u64);
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = kind;
     done
 }
 
@@ -524,8 +601,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    prep(P_GUARD_CALLS, 1);
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
+        #[cfg(feature = "diagnostics")]
+        prep(P_GUARD_LOCK_US, waiting.elapsed().as_micros() as u64);
         let first = start / BLOCK;
         g.protected.contains(&first) || g.absent.contains(&first)
     };
@@ -533,7 +615,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
     let mut g = guards();
+    #[cfg(feature = "diagnostics")]
+    prep(P_GUARD_LOCK_US, waiting.elapsed().as_micros() as u64);
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -545,6 +631,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
+        prep(P_GUARD_CLEAN, 1);
         return Some(written);
     }
     let mut next_clean = 0;
@@ -568,6 +655,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            prep(P_GUARD_WRITTEN, 1);
+            #[cfg(feature = "diagnostics")]
+            {
+                let why = g.why.remove(&block).map_or(5, usize::from);
+                prep(P_WRITTEN_WHY + why, 1);
+            }
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
@@ -577,7 +670,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
+            #[cfg(feature = "diagnostics")]
+            let protecting = std::time::Instant::now();
             protect(&mut g, from, block);
+            #[cfg(feature = "diagnostics")]
+            prep(P_GUARD_PROTECT_US, protecting.elapsed().as_micros() as u64);
         }
     }
     Some(written)
@@ -685,7 +782,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     if g.protected.contains(&block) {
         return;
     }
-    if reprotect(block * BLOCK, BLOCK, PAGE_READONLY) {
+    if reprotect(block * BLOCK, BLOCK, PAGE_READONLY, P_VP_ALIAS) {
         g.protected.insert(block);
     }
 }
@@ -693,7 +790,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
-    let set = |from: usize, to: usize| reprotect(from * BLOCK, (to - from) * BLOCK, PAGE_READONLY);
+    let set = |from: usize, to: usize| reprotect(from * BLOCK, (to - from) * BLOCK, PAGE_READONLY, P_VP_HERE);
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
@@ -727,8 +824,8 @@ fn uncommitted_end(block: usize) -> usize {
 /// every other view of them are opened too: the write that faulted (or is
 /// ours, `crate::host::copy_mapped`) goes through one view, and every
 /// guard over the pages must copy them again.
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    let any = open_here(g, start, end);
+fn open(g: &mut Guards, start: usize, end: usize, why: Why) -> bool {
+    let any = open_here(g, start, end, why, false);
     if start >= end || g.aliased.is_empty() {
         return any;
     }
@@ -736,7 +833,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK), why, true) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -747,7 +844,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// [`open`] for one range, without the other views of its pages.
-fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
+fn open_here(g: &mut Guards, start: usize, end: usize, why: Why, alias: bool) -> bool {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     let blocks: Vec<usize> = g
         .protected
@@ -758,8 +855,11 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.protected.remove(&block);
         g.clean.remove(&block);
         // A block we made read-only.
-        reprotect(block * BLOCK, BLOCK, PAGE_READWRITE);
+        reprotect(block * BLOCK, BLOCK, PAGE_READWRITE, P_VP_OPEN);
+        #[cfg(feature = "diagnostics")]
+        g.why.insert(block, why as u8);
     }
+    prep(if alias { P_OPENED_ALIAS } else { P_OPENED } + why as usize, blocks.len() as u64);
     !blocks.is_empty()
 }
 
@@ -768,8 +868,18 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    writing_why(at, len, Why::Writing);
+}
+
+/// [`writing`] by the copy-back (what shaders wrote, into title memory):
+/// the same, counted apart in diagnostics builds.
+pub(crate) fn writing_from_card(at: usize, len: usize) {
+    writing_why(at, len, Why::Card);
+}
+
+fn writing_why(at: usize, len: usize, why: Why) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    open(&mut guards(), at, at.saturating_add(len), why);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -903,11 +1013,11 @@ fn written_at_every_view(at: usize, end: usize) {
     let mut others = Vec::new();
     {
         let mut g = guards();
-        open(&mut g, at, end);
+        open(&mut g, at, end, Why::EveryView);
         for block in at / BLOCK..end.div_ceil(BLOCK) {
             for alias in crate::inplace::pages_of(block * BLOCK) {
                 if alias / BLOCK != block {
-                    open_here(&mut g, alias, alias.saturating_add(BLOCK));
+                    open_here(&mut g, alias, alias.saturating_add(BLOCK), Why::EveryView, true);
                     others.push(alias);
                 }
             }
@@ -954,7 +1064,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     }
     let mut g = guards();
     for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
+        if open_here(&mut g, at, at.saturating_add(n), Why::Mapped, false) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1283,7 +1393,9 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if open(&mut g, at, at + 1) {
+        #[cfg(feature = "diagnostics")]
+        prep(P_FAULT_LOCK_US, started.elapsed().as_micros() as u64);
+        if open(&mut g, at, at + 1, Why::Fault) {
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1325,7 +1437,7 @@ fn fault_round_trip() {
     let first = p.div_ceil(BLOCK);
     let blocks = (p + N * BLOCK) / BLOCK - first;
     for block in first..first + blocks {
-        if reprotect(block * BLOCK, BLOCK, PAGE_READONLY) {
+        if reprotect(block * BLOCK, BLOCK, PAGE_READONLY, P_VP_HERE) {
             guards().protected.insert(block);
         }
     }

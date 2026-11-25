@@ -2093,6 +2093,15 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
     }
 }
 
+/// The resource [`texture_at`] made for a texture placed at `address` with
+/// the description `desc`, if it has made one: never made here (for the
+/// frame listing, which must not count as a use).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(address, *desc)).map(|&r| r as This)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

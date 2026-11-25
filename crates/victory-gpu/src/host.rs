@@ -5785,6 +5785,15 @@ impl Meter {
                 );
             }
             #[cfg(feature = "diagnostics")]
+            {
+                let [waiting, stale, gone, refused] =
+                    [0, 1, 2, 3].map(|i| crate::descriptor::host::TINTED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "null texture slots shown in colour (VICTORY_NULL_MAGENTA=1) since the start: {stale} cyan (stale), \
+                     {gone} green (unmapped), {refused} yellow (no room on the card); {waiting} other"
+                );
+            }
+            #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
                 slow[0] as f64 / frames,

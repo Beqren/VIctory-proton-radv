@@ -1285,6 +1285,11 @@ impl HostHeap {
         self.unmake(&mut made, index);
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).rechecks.remove(&index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            drop(made);
+            self.tint(index, Tint::Gone);
+        }
         true
     }
 
@@ -1702,10 +1707,22 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
+            #[cfg(feature = "diagnostics")]
+            let mut tinted = Vec::new();
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
                     self.unmake(&mut made, stale);
+                    #[cfg(feature = "diagnostics")]
+                    tinted.push(stale);
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if !tinted.is_empty() {
+                drop(made);
+                for stale in tinted {
+                    self.tint(stale, Tint::Stale);
+                }
+                made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             }
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
@@ -2519,16 +2536,60 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// told from one whose contents are black. False if it is to be null.
 #[cfg(feature = "diagnostics")]
 fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    let shown = tint_for(desc, at, Tint::Waiting);
+    if shown {
+        NULL_DESCS.lock().unwrap_or_else(|e| e.into_inner()).insert(at.ptr, *desc);
+        TINT_OF.lock().unwrap_or_else(|e| e.into_inner()).insert(at.ptr, Tint::Waiting);
+    }
+    shown
+}
+
+/// Why a placed texture's host slot shows nothing, as the colour it shows
+/// under `VICTORY_NULL_MAGENTA=1` (diagnostics): made null when the title
+/// wrote it and waiting for the texture pass (magenta); then taken out of
+/// the queue as stale (cyan), found unmapped (green), or passed over by
+/// the pass because the card had no room (yellow).
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tint {
+    Waiting,
+    Stale,
+    Gone,
+    Refused,
+}
+
+/// The title descriptors of host slots shown as a [`Tint`], by host slot.
+#[cfg(feature = "diagnostics")]
+static NULL_DESCS: Mutex<std::collections::BTreeMap<usize, [u32; 16]>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The [`Tint`] each host slot was shown in last, by host slot.
+#[cfg(feature = "diagnostics")]
+static TINT_OF: Mutex<std::collections::BTreeMap<usize, Tint>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Since the start: host slots shown as each [`Tint`] after the first.
+#[cfg(feature = "diagnostics")]
+pub(crate) static TINTED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`magenta_for`] in the colour of `tint`.
+#[cfg(feature = "diagnostics")]
+fn tint_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE, tint: Tint) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
         return false;
     }
-    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA.
-    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99);
+    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA;
+    // with `VICTORY_NULL_MAGENTA_ALL=1` every format a shader reads as
+    // floats (BC4 to BC6 too, one- and two-channel, 16-bit and float): a
+    // mask read as zeros clips what is drawn with it, which a texel of
+    // alpha 1 does not.
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA_ALL").is_some_and(|v| v == "1"));
+    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99)
+        || all && matches!(desc[0], 10 | 11 | 24 | 26 | 28..=29 | 31 | 34 | 35 | 41 | 49 | 51 | 54 | 56 | 61 | 63 | 79..=84 | 94..=96);
     if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
         return false;
     }
-    let (Some(host), Some(texture)) = (host(), magenta()) else {
+    let (Some(host), Some(texture)) = (host(), texel(tint)) else {
         return false;
     };
     // SAFETY: a slot of our heap and a live texture.
@@ -2536,11 +2597,60 @@ fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     true
 }
 
-/// One magenta texel, written by the processor.
+impl HostHeap {
+    /// What the queue of textures picked by index knows of title slot
+    /// `index` at `frame`, whether its host slot is made, and the colour a
+    /// null one shows (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
+        let tint = TINT_OF.lock().unwrap_or_else(|e| e.into_inner()).get(&self.cpu(index).ptr).copied();
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = match (textures.slots.get(&index), textures.rechecks.get(&index)) {
+            (Some(w), _) => format!(
+                "queued due={} written@{} looks={} part_mapped={}",
+                if w.due <= frame { "now".to_string() } else { format!("@{}", w.due) },
+                w.written,
+                w.looks,
+                w.mapped
+            ),
+            (None, Some(_)) => "uploaded, looked at again".into(),
+            (None, None) => "not queued".into(),
+        };
+        let host = if made != 0 { "made".to_string() } else { format!("null tint={tint:?}") };
+        format!("{queue} host_slot={host}")
+    }
+
+    /// Host slot `index`, null and shown in a [`Tint`] colour, shows the
+    /// colour of `tint` now (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tint(&self, index: u32, tint: Tint) {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.get(index as usize).is_none_or(|&key| key != 0) {
+            return;
+        }
+        let at = self.cpu(index);
+        let Some(desc) = NULL_DESCS.lock().unwrap_or_else(|e| e.into_inner()).get(&at.ptr).copied() else {
+            return;
+        };
+        if tint_for(&desc, at, tint) {
+            TINTED[tint as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TINT_OF.lock().unwrap_or_else(|e| e.into_inner()).insert(at.ptr, tint);
+        }
+    }
+}
+
+/// One texel of the colour of `tint`, written by the processor.
 #[cfg(feature = "diagnostics")]
-fn magenta() -> Option<&'static ID3D12Resource> {
-    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
-    TEXTURE
+fn texel(tint: Tint) -> Option<&'static ID3D12Resource> {
+    static TEXTURES: [std::sync::OnceLock<Option<ID3D12Resource>>; 4] = [const { std::sync::OnceLock::new() }; 4];
+    let texel: [u8; 4] = match tint {
+        Tint::Waiting => [255, 0, 255, 255],
+        Tint::Stale => [0, 255, 255, 255],
+        Tint::Gone => [0, 255, 0, 255],
+        Tint::Refused => [255, 255, 0, 255],
+    };
+    TEXTURES[tint as usize]
         .get_or_init(|| {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_CUSTOM,
@@ -2575,7 +2685,6 @@ fn magenta() -> Option<&'static ID3D12Resource> {
                     .ok()?;
                 let texture = texture?;
                 texture.Map(0, None, None).ok()?;
-                let texel = [255u8, 0, 255, 255];
                 texture.WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4).ok()?;
                 texture.Unmap(0, None);
                 Some(texture)

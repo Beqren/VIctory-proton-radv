@@ -791,8 +791,16 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 }
 
 /// Whether a page mapped next to a view that shows the pages just before
-/// or after it in the same section joins that view (`VICTORY_VIEW_JOIN=0`
-/// maps every mapping as a view of its own, as before).
+/// or after it in the same section joins that view (`VICTORY_VIEW_JOIN=1`;
+/// off by default: not shown to pay).
+///
+/// Measured, same diagnostics build, late world lines: off (run 7) 123,000-
+/// 126,000 views, memory calls of the remaps 0.57-0.80 ms each, the GPU's
+/// mappings 0.66-0.99 ms a page; on (run 8) 97,700-99,800 views, 0.43-0.57
+/// ms a call, but joining adds calls and the GPU's mappings took 0.54-0.97
+/// ms a page; wineserver stayed one core busy and frame times moved within
+/// the runs' noise. Fewer views needs joins that last (the title cuts them
+/// again) or a different home for the pages.
 ///
 /// Under Wine a view's mapping and unmapping cost grows with the views the
 /// process holds (`/tmp/victory-perf/viewbench`: one page remapped in 14 us
@@ -806,7 +814,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// joined view later dearer (it is unmapped whole and what stays mapped
 /// again, `unmap`); views are joined up to [`JOIN_MAX`].
 fn join_views() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_VIEW_JOIN").is_none_or(|v| v != "0"));
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_VIEW_JOIN").is_some_and(|v| v == "1"));
     *ON
 }
 

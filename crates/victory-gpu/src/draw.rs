@@ -3096,6 +3096,20 @@ impl State {
             // SAFETY: an open list with everything set.
             _ => unsafe { list.list.Dispatch(x, y, z) },
         }
+        // `VICTORY_DISPATCH_BARRIER=1` (off): a wait for every shader write
+        // after each dispatch, as if the title had put a UAV barrier between
+        // all of them. An experiment on ordering: the face network's chain
+        // of about a thousand dispatches a frame comes out torn, here and
+        // upstream, with few barriers recorded between its passes.
+        static AFTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *AFTER.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_BARRIER").is_some_and(|v| v == "1")) {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            };
+            // SAFETY: an open list; a global UAV barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 

@@ -389,6 +389,37 @@ the d16 fixes, present in one with d16 and the normalized fix, absent in one wit
 plus the quad change; none of these is shown to affect it. The eyes still glow: their
 lighting program reads no d16 data. Unverified: the integer path relies on vkd3d-proton
 passing UINT bits through the float-typed handle (upstream checked Windows AMD and WARP).
+The face network (branch face-anim, 2026-11-25). The 65 `compute_graph_ops`
+programs (a tensor library: MatMul, VecMatMul, Silu, Gather, Concat, Formula ...,
+all wave64, all bound through descriptor tables, their tensors in R16_UINT and
+R16G16B16A16_UINT views) run every frame (368 to 2,095 dispatches recorded a
+frame). Their output, the R16_UINT buffer the head extract 970c4fbb3b017c0e reads
+(`buffer_load_format_x`, low half taken as an f16 by `v_fma_mix_f32`), was all
+zero in every frame: a table's copy in dynamic slots never got its word in the
+table by slot, so the 16-bit integer path of 1adb4e0 never ran for them and the
+integers became halves, then 0. With the words written (`VICTORY_TABLE_SLOT_WORDS=1`,
+off by default) the output is alive: 180,000-270,000 of 532,480 halves not zero,
+none NaN, none over 4, changing every frame; the halves the extract reads are
+plausible-looking triples (x, y, z about -0.005, 0.023, -0.036, smooth from
+vertex to vertex). Faces then move but are torn: mouths agape, jaw and lips
+pulled out of shape, as in upstream's own build (captures upstream-5,
+frame-853). The eyes stop glowing (the rig drives the eye meshes too): the
+lavender-white eyes are this zero output, not lighting.
+
+Ruled out with tests and runs: integer bits through float-typed handles (GPU
+tests under Proton: they arrive); f16 rounding (RADV rounds `v_add_f16` to
+nearest, wave64 test); DirectStorage page lists (the hold after upstream eddde73,
+`VICTORY_DSTORAGE_HOLD`, on: its tests pass, the formula program's buffer hashes
+the same with and without, faces the same); dropped or resubmitted lists (none);
+pipeline syncs (the title never calls them); ordering between dispatches
+(`VICTORY_DISPATCH_BARRIER=1`, a UAV barrier after every dispatch: faces the
+same; the title records about 710-760 barrier groups a frame in the world).
+Not yet checked: each op of the network against a CPU reference on real data
+(the probe, `VICTORY_GRAPH_FRAMES`, hashes and decodes every view of every
+dispatch in a window of frames), the mapping pass's delta indices (an index off
+by one gives each vertex a neighbour's delta of the right size), and what the
+network's inputs (face controls) hold.
+
 Quad reads through quad reads in pixel programs (upstream 4015a18, the same lowering
 as 8487caf; branch d16-pack-quad) made skin plastic and glossy again: not merged.
 

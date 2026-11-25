@@ -1552,12 +1552,12 @@ pub(crate) fn let_go_idle() {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
-                made.take()
+                made.take().map(|made| (made, chosen))
             } else {
                 None
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some(((host, twin), chosen)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -1566,7 +1566,11 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            if chosen {
+                release_evicted(host, twin);
+            } else {
+                crate::host::retire(host);
+            }
         }
     }
     if went > 0 {
@@ -1644,6 +1648,19 @@ pub(crate) fn placed_copies() -> [u64; 4] {
         }
     }
     out
+}
+
+/// The one place a host copy the eviction chose is released, once no slot
+/// and no list holds it (`VICTORY_TEXTURE_EVICT`): for now as the sweep
+/// releases an idle one (`crate::host::retire`, which waits for the
+/// submissions running now). shortcut: lists recorded but not yet
+/// submitted, and slots made null while a list that reads them waits,
+/// are not waited for; a deferred release keyed on the last submission
+/// that could use the texture belongs here.
+#[cfg(windows)]
+fn release_evicted(host: std::sync::Arc<HostTexture>, twin: Option<std::sync::Arc<Twin>>) {
+    crate::host::retire(host);
+    drop(twin);
 }
 
 /// The eviction chose the host copies of these title textures: the next

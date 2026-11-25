@@ -1466,7 +1466,7 @@ impl HostHeap {
                     if !same || key == 0 {
                         continue;
                     }
-                    self.unmake(&mut made, index);
+                    self.release_evicted_slot(&mut made, index);
                     evicted.insert(index, key);
                     slots += 1;
                 }
@@ -1484,6 +1484,14 @@ impl HostHeap {
         EVICTION[0].fetch_add(1, Relaxed);
         EVICTION[1].fetch_add(slots, Relaxed);
         [titles.len() as u64, bytes, slots]
+    }
+
+    /// The one place the eviction makes a slot null and lets go of what it
+    /// held: for now as a stale slot is ([`HostHeap::unmake`]: the slot's
+    /// reference waits for the submissions running now). shortcut: a list
+    /// recorded but not yet submitted that reads the slot is not waited for.
+    fn release_evicted_slot(&self, made: &mut [u64], index: u32) {
+        self.unmake(made, index);
     }
 
     /// For the 5 s line: the bytes of host copies of textures the title

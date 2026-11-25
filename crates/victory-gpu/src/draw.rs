@@ -416,6 +416,15 @@ fn asked_wide() -> bool {
 /// (`State::skin_no_blend`).
 static NULLED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
+/// The bytes of host copies of textures the title fills that slots show,
+/// by when a draw last read them (`HostHeap::read_census`), at the last
+/// look: within the last frames, within 30 s, longer ago, and those with a
+/// slot whose reads the host does not see.
+pub(crate) static TEXTURES_READ: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// `resource::placed_copies` at the last look.
+pub(crate) static PLACED_COPIES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Since the start: slots draws asked for (`State::note_asked`), and
 /// textures made for such slots on a full card.
 pub(crate) static HEAP_TEXTURES_ASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -1771,6 +1780,24 @@ impl State {
                 if !made {
                     host.texture_slot_requeue(index, frame);
                 }
+            } else {
+                // Read all the same, as far as the host can tell: the
+                // eviction leaves it.
+                host.texture_slot_read(index);
+            }
+            if !made {
+                let view = heap.handle(index).and_then(crate::descriptor::view);
+                let why = host.texture_slot_why_null(index, view.as_ref(), frame);
+                crate::descriptor::host::MISSING[why + if primary { 0 } else { 7 }].fetch_add(1, Ordering::Relaxed);
+                // Made null by the eviction: made again now it is read.
+                if crate::descriptor::host::evict_switch().0 {
+                    host.texture_slot_evicted_read(index, frame);
+                }
+                if crate::descriptor::host::stale_list()
+                    && let Some(view) = heap.handle(index).and_then(crate::descriptor::view)
+                {
+                    crate::descriptor::host::stale_read(index, &view, "material record");
+                }
             }
             asked_census(frame, index, made);
         }
@@ -1971,6 +1998,10 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        // The eviction (`VICTORY_TEXTURE_EVICT`): the bytes of slots a draw
+        // read lately that were refused for room.
+        let (evict, evict_age) = crate::descriptor::host::evict_switch();
+        let mut refused_read_bytes = 0u64;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -2069,6 +2100,12 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             let mut partly = None;
+            // The bytes a new host copy for the slot would take (a texture
+            // object's: not known here).
+            let mut slot_bytes = 4 << 20;
+            // Its host copy is on the card already: making the slot takes
+            // no memory (`VICTORY_TEXTURE_EVICT`).
+            let mut on_card = false;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 // Of the mips the view shows: what lies behind them is
@@ -2093,6 +2130,9 @@ impl State {
                     }
                     partly = Some(mapped);
                 }
+                slot_bytes = len;
+                on_card = evict
+                    && crate::resource::texture_at_made(address, &resource).is_some_and(crate::resource::host_copy_made);
             }
             // A texture object the host renders to or writes holds the
             // host's own contents: nothing to bring up to date, and this
@@ -2122,9 +2162,16 @@ impl State {
             } else if admitted {
                 HEAP_TEXTURES_RESERVED.fetch_add(1, Ordering::Relaxed);
             }
-            if !room && !admitted {
+            if !room && !admitted && on_card {
+                crate::descriptor::host::EVICTION[4].fetch_add(1, Ordering::Relaxed);
+            } else if !room && !admitted {
                 #[cfg(feature = "diagnostics")]
                 host.tint(index, crate::descriptor::host::Tint::Refused);
+                crate::descriptor::host::EVICTION[5].fetch_add(1, Ordering::Relaxed);
+                if host.texture_slot_read_lately(index) {
+                    crate::descriptor::host::EVICTION[6].fetch_add(1, Ordering::Relaxed);
+                    refused_read_bytes = refused_read_bytes.saturating_add(slot_bytes);
+                }
                 refused += 1;
                 if refused > 256 {
                     break;
@@ -2210,6 +2257,67 @@ impl State {
         }
         if early.is_none() {
             catching_up(began.elapsed().saturating_sub(SPAN));
+        }
+        if evict {
+            self.evict_textures(host, refused_read_bytes, evict_age);
+        }
+        // What is shown and when it was read, for the 5 s line.
+        static CENSUS_MS: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let last = CENSUS_MS.load(Ordering::Relaxed);
+        if now >= last + 5_000 && CENSUS_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            for (to, bytes) in TEXTURES_READ.iter().zip(host.read_census()) {
+                to.store(bytes, Ordering::Relaxed);
+            }
+            for (to, n) in PLACED_COPIES.iter().zip(crate::resource::placed_copies()) {
+                to.store(n, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The eviction's part of a pass (`VICTORY_TEXTURE_EVICT=1`,
+    /// `HostHeap::evict`): when slots a draw read lately were refused for
+    /// room (`refused` bytes of them), as many textures read longest ago as
+    /// hold that much and 32 MB more, less what was chosen before and not
+    /// let go yet (the sweep lets go a second or two later); at most every
+    /// half second. And, every two seconds, the textures not read for `age`
+    /// milliseconds, whether the card is full or not.
+    fn evict_textures(&self, host: &crate::descriptor::host::HostHeap, refused: u64, age: Option<u64>) {
+        static LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let now = crate::host::now_ms();
+        let due = |i: usize, every: u64| {
+            let last = LAST[i].load(Ordering::Relaxed);
+            now >= last + every && LAST[i].compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        };
+        let pending = crate::resource::EVICTED[10].load(Ordering::Relaxed);
+        let need = refused.saturating_add(32 << 20).saturating_sub(pending);
+        let mut said = None;
+        if refused > 0 && need > 0 && due(0, 500) {
+            said = Some(("refused", need, host.evict(need, None)));
+        }
+        if let Some(age) = age
+            && due(1, 2_000)
+        {
+            let chose = host.evict(0, Some(age));
+            if said.is_none() && chose[0] > 0 {
+                said = Some(("unread", age, chose));
+            }
+        }
+        if let Some((why, of, [textures, bytes, slots])) = said
+            && textures > 0
+        {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let n = SAID.fetch_add(1, Ordering::Relaxed);
+            if n < 40 || n.is_multiple_of(50) {
+                tracing::info!(
+                    why,
+                    of,
+                    textures,
+                    mb = bytes >> 20,
+                    slots,
+                    "textures let go from the card (VICTORY_TEXTURE_EVICT): read longest ago, none read lately"
+                );
+            }
         }
     }
 

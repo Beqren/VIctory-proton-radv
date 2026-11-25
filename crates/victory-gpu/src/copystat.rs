@@ -195,6 +195,23 @@ pub(crate) enum C {
     PagesUnmapped,
     PagesLeft,
     PagesOneZero,
+    /// Mappings of the runtime that could join a neighbouring view, those
+    /// that did, and joins that failed (`xmem` `map_joined`).
+    JoinCould,
+    JoinDone,
+    JoinFailed,
+}
+
+/// A mapping could join a neighbouring view (0), did (1), or failed to (2).
+pub fn view_join(what: u8) {
+    add(
+        match what {
+            0 => C::JoinCould,
+            1 => C::JoinDone,
+            _ => C::JoinFailed,
+        },
+        1,
+    );
 }
 
 /// Views of physical pages the runtime has mapped now (a gauge, not a
@@ -228,7 +245,7 @@ pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
     add(t, us);
 }
 const COUNTERS: usize = 112;
-const _: () = assert!((C::PagesOneZero as usize) < COUNTERS);
+const _: () = assert!((C::JoinFailed as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1304,7 +1321,8 @@ pub(crate) fn log(frames: f64) {
          calls {:.0} pages ({:.0} already so) {:.1} ms; in them {:.0} memory calls {:.1} ms, our notes \
          {:.1} ms ({:.1} ms waiting for the guards' lock); the GPU's page mappings by kind: {:.0} pages \
          in runs, {:.0} one pool page over many ({:.0} of them a page of zeros), {:.0} unmapped, {:.0} \
-         left; views of physical pages alive {} (at most {})",
+         left; views of physical pages alive {} (at most {}); mappings that could join a neighbouring \
+         view {:.0}, joined {:.0}, joins failed {:.0}",
         c[C::KernelCalls as usize],
         ms(c[C::KernelUs as usize]),
         mb(c[C::KernelBytes as usize]),
@@ -1346,6 +1364,9 @@ pub(crate) fn log(frames: f64) {
         c[C::PagesLeft as usize],
         VIEWS[0].load(Relaxed),
         VIEWS[1].load(Relaxed),
+        c[C::JoinCould as usize],
+        c[C::JoinDone as usize],
+        c[C::JoinFailed as usize],
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

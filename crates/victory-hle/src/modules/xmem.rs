@@ -711,7 +711,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map_joined(&mut physical, base + i * PAGE, run * PAGE, first, false) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -783,12 +783,112 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map_joined(&mut physical, to + k, PAGE, slice, true) {
             return false;
         }
     }
     true
 }
+
+/// Whether a page mapped next to a view that shows the pages just before
+/// or after it in the same section joins that view (`VICTORY_VIEW_JOIN=0`
+/// maps every mapping as a view of its own, as before).
+///
+/// Under Wine a view's mapping and unmapping cost grows with the views the
+/// process holds (`/tmp/victory-perf/viewbench`: one page remapped in 14 us
+/// with 100 views, 192 us with 40,000, 569 us with 63,000), and the title
+/// maps its pages one at a time (`XMemMapPhysicalPages` of one page,
+/// `CopyPageMappingsBatchX` page by page): run 6 of the frame study held
+/// 123,000-128,000 views, its 2,000-4,400 remapping calls a frame took
+/// 0.6-0.9 ms each, 1.2-2.7 s a frame, and the mapping lock they hold is
+/// what the submitting thread waits for. Joining costs an unmapping of the
+/// neighbour and a coalescing of placeholders now, and makes cutting the
+/// joined view later dearer (it is unmapped whole and what stays mapped
+/// again, `unmap`); views are joined up to [`JOIN_MAX`].
+fn join_views() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_VIEW_JOIN").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// The most bytes a joined view grows to.
+const JOIN_MAX: usize = 16 * PAGE;
+
+/// [`map`], joining the view to the views on either side of it that show
+/// the slices just before and after it ([`join_views`]) if `may_join`.
+/// Only the GPU's page mappings join (`map_alias`): a neighbour is unmapped
+/// for a moment, and a title thread writing it then would fault. The GPU's
+/// mappings are of its tiled heap, which the title's code does not touch;
+/// our own reads of it in place wait for the mapping lock the caller holds,
+/// and our reads through the kernel fail softly. Physical pages the title
+/// maps (`XMemMapPhysicalPages`, its streaming pools) are only counted.
+fn map_joined(physical: &mut Physical, base: usize, len: usize, slice: Slice, may_join: bool) -> bool {
+    let left = physical
+        .views
+        .range(..base)
+        .next_back()
+        .filter(|(at, (size, s))| {
+            *at + size == base
+                && Arc::ptr_eq(&s.section, &slice.section)
+                && s.index + size / PAGE == slice.index
+                && size + len <= JOIN_MAX
+        })
+        .map(|(at, (size, s))| (*at, *size, s.clone()));
+    let right = physical
+        .views
+        .get(&(base + len))
+        .filter(|(size, s)| {
+            Arc::ptr_eq(&s.section, &slice.section)
+                && s.index == slice.index + len / PAGE
+                && size + len + left.as_ref().map_or(0, |l| l.1) <= JOIN_MAX
+        })
+        .map(|(size, _)| *size);
+    if left.is_none() && right.is_none() {
+        return map(physical, base, len, slice);
+    }
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::view_join(0);
+    if !may_join || !join_views() {
+        return map(physical, base, len, slice);
+    }
+    let from = left.as_ref().map_or(base, |l| l.0);
+    let to = base + len + right.unwrap_or(0);
+    let first = left.as_ref().map_or_else(|| slice.clone(), |l| l.2.clone());
+    // The neighbours go back to placeholders (their bytes stay in the
+    // section), the new range is cut out of its placeholder, and the
+    // placeholders become one.
+    if let Some(l) = &left {
+        unmap(physical, l.0, l.1);
+    }
+    if let Some(size) = right {
+        unmap(physical, base + len, size);
+    }
+    // SAFETY: placeholders only: the split fails harmlessly if the range is
+    // a whole placeholder; the coalescing spans whole placeholders.
+    let coalesced = unsafe {
+        VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+        VirtualFree(from as *mut c_void, to - from, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0
+    };
+    if coalesced && map(physical, from, to - from, first) {
+        #[cfg(feature = "diagnostics")]
+        victory_gpu::view_join(1);
+        return true;
+    }
+    // Each part as it was, on its own placeholder (if the coalescing went
+    // through, they are cut out of it again by `map`'s split).
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::view_join(2);
+    if let Some(l) = left {
+        map(physical, l.0, l.1, l.2);
+    }
+    if let Some(size) = right {
+        let index = slice.index + len / PAGE;
+        map(physical, base + len, size, Slice { index, ..slice.clone() });
+    }
+    map(physical, base, len, slice)
+}
+
+/// `MEM_COALESCE_PLACEHOLDERS` (winnt.h): adjacent placeholders become one.
+const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.

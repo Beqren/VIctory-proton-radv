@@ -1489,7 +1489,7 @@ pub(crate) fn log(frames: f64) {
         let guard_ms = p[P_GUARD_US] / 1e3;
         tracing::info!(
             "asking and reading per frame: askings {:.0} ({:.0} from the journal asked ahead); guard calls {:.0} {:.2} ms over \
-             {:.0} blocks ({:.0} all clean): lock {:.2} ms, guarding again {:.2} ms, the walk and the rest {:.2} ms; \
+             {:.0} blocks ({:.0} all clean; {:.0} clean blocks passed by words, VICTORY_GUARD_BITS): lock {:.2} ms, guarding again {:.2} ms, the walk and the rest {:.2} ms; \
              refreshes of watched ranges {:.0}, {:.0} of them found something written; reads into copies {:.0}, {:.1} MB, \
              {:.2} ms ({:.2} GB/s, {:.1} KiB a read); sampled reads: {:.1} MB of which {:.2} MB in 4 KiB pages that differed \
              from the copy",
@@ -1499,6 +1499,7 @@ pub(crate) fn log(frames: f64) {
             guard_ms,
             p[P_GUARD_BLOCKS],
             p[P_GUARD_CLEAN],
+            p[P_GUARD_BITS],
             p[P_GUARD_LOCK_US] / 1e3,
             p[P_GUARD_PROTECT_US] / 1e3,
             (guard_ms - p[P_GUARD_LOCK_US] / 1e3 - p[P_GUARD_PROTECT_US] / 1e3).max(0.0),

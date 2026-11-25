@@ -26,6 +26,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+mod blocks;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -463,6 +465,8 @@ pub(crate) const P_WRITES_AHEAD: usize = 33;
 pub(crate) const P_GUARD_US: usize = 34;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) const P_GUARD_BLOCKS: usize = 35;
+/// Clean blocks [`guard_bits`] passed over by words.
+pub(crate) const P_GUARD_BITS: usize = 36;
 
 /// Why a guarded block was opened (diagnostics).
 #[derive(Clone, Copy)]
@@ -499,7 +503,7 @@ struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: Clean,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -519,7 +523,10 @@ struct Guards {
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    clean: Clean {
+        tree: BTreeSet::new(),
+        bits: blocks::Blocks::new(),
+    },
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     copies: BTreeSet::new(),
@@ -640,69 +647,154 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     #[cfg(feature = "diagnostics")]
     prep(P_GUARD_LOCK_US, waiting.elapsed().as_micros() as u64);
     let mut written = Vec::new();
-    let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut uncommitted_until = first;
+    if guard_bits() {
+        // The range's blocks that are not clean, off the bits a word at a
+        // time; nothing else of the range is looked at.
+        if g.clean.bits.all(first, last) {
+            prep(P_GUARD_CLEAN, 1);
+            return Some(written);
+        }
+        let open: Vec<usize> = g.clean.bits.missing(first..last).collect();
+        prep(P_GUARD_BITS, (last - first - open.len()) as u64);
+        let mut run: Option<(usize, usize)> = None;
+        for block in open {
+            if let Some((from, to)) = run
+                && to != block
+            {
+                protect_run(&mut g, from, to);
+                run = None;
+            }
+            match take_block(&mut g, block, &mut uncommitted_until, &mut written) {
+                Taken::Run => run = Some((run.map_or(block, |r| r.0), block + 1)),
+                Taken::Done => {
+                    if let Some((from, to)) = run.take() {
+                        protect_run(&mut g, from, to);
+                    }
+                }
+            }
+        }
+        if let Some((from, to)) = run {
+            protect_run(&mut g, from, to);
+        }
+        return Some(written);
+    }
+    let mut run: Option<usize> = None;
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    let clean: Vec<usize> = g.clean.tree.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
         prep(P_GUARD_CLEAN, 1);
         return Some(written);
     }
     let mut next_clean = 0;
-    let mut uncommitted_until = first;
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
-            }
-        }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            prep(P_GUARD_WRITTEN, 1);
-            #[cfg(feature = "diagnostics")]
-            {
-                let why = g.why.remove(&block).map_or(5, usize::from);
-                prep(P_WRITTEN_WHY + why, 1);
-            }
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only. With
-                // [`one_view`] another view of the page may be open (the
-                // one written through): guarded again first.
-                // A view that could not be guarded: the block is not
-                // called clean, and is asked about again next time.
-                if !(one_view() && view_guard()) || protect_views_of(&mut g, block) {
-                    g.clean.insert(block);
-                }
-            } else {
-                run.get_or_insert(block);
-                continue;
-            }
+        if block < last && !is_clean && matches!(take_block(&mut g, block, &mut uncommitted_until, &mut written), Taken::Run) {
+            run.get_or_insert(block);
+            continue;
         }
         if let Some(from) = run.take() {
-            #[cfg(feature = "diagnostics")]
-            let protecting = std::time::Instant::now();
-            protect(&mut g, from, block);
-            #[cfg(feature = "diagnostics")]
-            prep(P_GUARD_PROTECT_US, protecting.elapsed().as_micros() as u64);
+            protect_run(&mut g, from, block);
         }
     }
     Some(written)
+}
+
+/// What [`take_block`] left to the caller.
+enum Taken {
+    /// Written, and to be guarded again with its neighbours ([`protect`]).
+    Run,
+    /// Nothing more to do for it (it was a hole, or guarded already).
+    Done,
+}
+
+/// Of [`guard`]: a block of the range that is not clean. Unless it is a
+/// hole (uncommitted: looked up once for the region from
+/// `uncommitted_until`), it is written: its pages go into `written`, and it
+/// is guarded again here if it still is read-only (written through the
+/// runtime) or left to the caller's run.
+fn take_block(g: &mut Guards, block: usize, uncommitted_until: &mut usize, written: &mut Vec<usize>) -> Taken {
+    if g.absent.contains(&block) {
+        // Ordinary commits need no runtime mapping notification. Reuse
+        // this asking's query for the following blocks in the same region.
+        if block >= *uncommitted_until {
+            *uncommitted_until = uncommitted_end(block);
+        }
+        if block < *uncommitted_until {
+            return Taken::Done;
+        }
+        g.absent.remove(&block);
+    }
+    written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+    prep(P_GUARD_WRITTEN, 1);
+    #[cfg(feature = "diagnostics")]
+    {
+        let why = g.why.remove(&block).map_or(5, usize::from);
+        prep(P_WRITTEN_WHY + why, 1);
+    }
+    if !g.protected.contains(&block) {
+        return Taken::Run;
+    }
+    // Written through the runtime, still read-only. With [`one_view`]
+    // another view of the page may be open (the one written through):
+    // guarded again first. A view that could not be guarded: the block is
+    // not called clean, and is asked about again next time.
+    if !(one_view() && view_guard()) || protect_views_of(g, block) {
+        g.clean.insert(block);
+    }
+    Taken::Done
+}
+
+/// [`protect`] of a run of [`guard`], timed.
+fn protect_run(g: &mut Guards, from: usize, to: usize) {
+    #[cfg(feature = "diagnostics")]
+    let protecting = std::time::Instant::now();
+    protect(g, from, to);
+    #[cfg(feature = "diagnostics")]
+    prep(P_GUARD_PROTECT_US, protecting.elapsed().as_micros() as u64);
+}
+
+/// Whether [`guard`] finds a range's blocks that are not clean off the
+/// clean blocks' bits (`VICTORY_GUARD_BITS=1`; off by default until
+/// measured), instead of collecting the range's clean blocks out of a tree
+/// to learn which are missing. The answers are the same; the counter
+/// `P_GUARD_BITS` is the clean blocks it passed over by words.
+fn guard_bits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_some_and(|v| v == "1"))
+}
+
+/// The guards' clean blocks, as a tree and as bits ([`blocks::Blocks`]),
+/// kept the same: [`guard_bits`] reads the bits.
+struct Clean {
+    tree: BTreeSet<usize>,
+    bits: blocks::Blocks,
+}
+
+impl Clean {
+    fn insert(&mut self, block: usize) -> bool {
+        self.bits.insert(block);
+        self.tree.insert(block)
+    }
+
+    fn remove(&mut self, block: &usize) -> bool {
+        self.bits.remove(block);
+        self.tree.remove(block)
+    }
+
+    fn extend(&mut self, blocks: std::ops::Range<usize>) {
+        self.bits.extend(blocks.clone());
+        self.tree.extend(blocks);
+    }
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in

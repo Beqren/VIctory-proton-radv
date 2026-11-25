@@ -643,10 +643,16 @@ macro_rules! once {
 /// a view it takes the address of, since the start.
 pub(crate) static NULL_ADDRESSED: AtomicU64 = AtomicU64::new(0);
 
-/// Whether such draws and dispatches are dropped (`VICTORY_DROP_NULL_ADDRESS`, on).
+/// Whether such draws and dispatches are dropped (`VICTORY_DROP_NULL_ADDRESS=1`;
+/// off). Dropped, the indirect light passes among them write nothing and
+/// everything out of direct light is black (the owner's session on fcec294,
+/// 2026-11-25). Run instead, address 0 is title page 0, which has no copy:
+/// its reads go through the first slot of the title-memory run, a view of
+/// 64 MiB of zeros (`crate::memory`, `VICTORY_MEMORY_RUN_FIRST`), where a
+/// null view had read at the walk's offsets from address 0.
 fn drop_null_address() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_NULL_ADDRESS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_NULL_ADDRESS").is_some_and(|v| v == "1"))
 }
 
 /// Root constant and shader views bound to zeros ([`bind_null_root`]),

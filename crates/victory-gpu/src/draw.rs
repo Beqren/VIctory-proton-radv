@@ -355,6 +355,32 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Textures made in the reserve band on a full card (`starved`).
 pub(crate) static HEAP_TEXTURES_RESERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Per frame: the distinct slots the character shaders asked for
+/// (`State::note_asked`) and how many of them had no texture on the card
+/// (their host slot null). One log line per frame that asked for any:
+/// `tools`' measure of how soon the characters' textures arrive is the
+/// first frame after the world's first in which none was missing.
+fn asked_census(frame: u64, index: u32, made: bool) {
+    type Census = (u64, std::collections::HashSet<u32>, u32);
+    static CENSUS: std::sync::Mutex<Option<Census>> = std::sync::Mutex::new(None);
+    let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let c = census.get_or_insert_with(|| (frame, Default::default(), 0));
+    if c.0 != frame {
+        if !c.1.is_empty() {
+            tracing::info!(
+                frame = c.0,
+                asked = c.1.len(),
+                missing = c.2,
+                "character textures the frame's draws asked for, and of them missing on the card"
+            );
+        }
+        *c = (frame, Default::default(), 0);
+    }
+    if c.1.insert(index) && !made {
+        c.2 += 1;
+    }
+}
+
 /// Since the start: slots draws asked for (`State::note_asked`), and
 /// textures made for such slots on a full card.
 pub(crate) static HEAP_TEXTURES_ASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -1693,6 +1719,7 @@ impl State {
             {
                 host.texture_slot_asked(index, frame);
                 HEAP_TEXTURES_ASKED[0].fetch_add(1, Ordering::Relaxed);
+                asked_census(frame, index, host.texture_slot_made(index));
             }
         }
     }

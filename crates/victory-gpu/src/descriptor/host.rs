@@ -137,11 +137,11 @@ pub(crate) enum Rule {
     /// every such view took its neighbours out of the queue for good, and
     /// their host slots showed what they had then: here 38,356 slots made
     /// stale in three minutes of the opening, 13,523 of them by a view
-    /// that starts 4 KiB or more away (2026-11-25, run 1). The default
-    /// ([`stale_rule`]).
+    /// that starts 4 KiB or more away (2026-11-25, run 1).
+    /// `VICTORY_STALE_TEXTURES=start` ([`stale_rule`]).
     #[default]
     Start,
-    /// Whenever their spans overlap. `VICTORY_STALE_TEXTURES=overlap`.
+    /// Whenever their spans overlap: the default ([`stale_rule`]).
     Overlap,
     /// Never; a view that would be stale under [`Rule::Overlap`] is left
     /// out of the spans instead. `VICTORY_STALE_TEXTURES=0`.
@@ -330,9 +330,11 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 pub(crate) static STALE_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// When a view the title writes makes older views of other memory stale
-/// ([`Rule`]): where it starts within 4 KiB of theirs, by default;
-/// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, the rule
-/// before; `VICTORY_STALE_TEXTURES=0`: never.
+/// ([`Rule`]): wherever their spans overlap, by default;
+/// `VICTORY_STALE_TEXTURES=start`: where it starts within 4 KiB of theirs;
+/// `VICTORY_STALE_TEXTURES=0`: never. (Left at the overlap rule until a
+/// run under the patched Wine measures the 4 KiB rule; the two runs below
+/// were under the stock one. The tests are about the 4 KiB rule.)
 ///
 /// The slot listing of the main character's head (`VICTORY_LIST_SLOTS`,
 /// 2026-11-25): under the overlap rule its 1024x1024 colour map (slot 40964
@@ -340,14 +342,15 @@ pub(crate) static STALE_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// null; under this rule the same map (slot 98036 of the record at 0xf000,
 /// run E) stayed queued and was made. Slots passed over because their
 /// memory was not mapped, the sign of neighbours taken for one another:
-/// 282 under the overlap rule (run f1), 509 and 860 under this one (runs E
-/// and f4), 36,775 with none made stale (run f2).
+/// 282 and 1,470 under the overlap rule (runs f1, D), 509, 124 and 860
+/// under the 4 KiB rule (runs E, F, f4), 36,775 with none made stale (f2).
 fn stale_rule() -> Rule {
     static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
-        Ok("overlap") => Rule::Overlap,
+        Ok("start") => Rule::Start,
         Ok("0") => Rule::Never,
-        _ => Rule::Start,
+        _ if cfg!(test) => Rule::Start,
+        _ => Rule::Overlap,
     })
 }
 
@@ -1040,6 +1043,12 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+    }
+
+    /// Whether host slot `index` shows a view made from the title's (not
+    /// null).
+    pub(crate) fn texture_slot_made(&self, index: u32) -> bool {
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(|&key| key != 0)
     }
 
     /// A draw asks for the texture at title slot `index` in `frame`.

@@ -1125,19 +1125,80 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
-/// `v_mul_f16`, `v_cvt_f16_f32` ...) are rounded to nearest as the console rounds them
-/// ([`Lower::f16_nearest`]) instead of as the host's `f32tof16` does (toward zero on NVIDIA:
-/// the last place of a result that is not exact is then one lower than the console's).
-/// Off by default: it is exact but untried in a game run, and adds instructions to every
-/// such operation. The wave sum of 16-bit floats ([`Lower::half_sum`]) is always exact.
+/// The results of 16-bit float operations (`v_add_f16`, `v_pk_fma_f16`, `v_cvt_f16_f32`,
+/// `v_fma_mix*_f16` ...) are rounded to nearest, ties to even, as the console rounds them
+/// ([`Lower::f16_nearest`], [`Lower::half_of`]), not as the host's `f32tof16` does: toward
+/// zero on NVIDIA and on RADV too (the face network, 65 `compute_graph_ops` programs of
+/// packed f16 arithmetic, run 2026-11-25: every one of 6,400 results of an
+/// `AddBroadcastAligned` dispatch was the conversion toward zero of the exact sum, 41% of
+/// them one last place below the console's; matrix products came out 0.6% small, and the
+/// network drifted by as much over its layers; its programs set the MODE register's f16
+/// rounding to nearest themselves). `VICTORY_F16_NEAREST=0` turns it off (the host's
+/// conversion, a dozen instructions fewer per result). The wave sum of 16-bit floats
+/// ([`Lower::half_sum`]) is always exact.
 fn f16_nearest_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F16_NEAREST.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_none_or(|v| v != "0"))
+}
+
+/// Whether compute programs that write and read buffers or images between
+/// group barriers get globally coherent UAVs (`VICTORY_COHERENT_UAVS=1`;
+/// off by default). The face network's Formula program (0aa7934094794dbf,
+/// an interpreter whose 1,024 threads pass values through a register file
+/// in a UAV, a barrier between its 12 stages) disagreed with a CPU model of
+/// its console code in 108 of the 440 face controls it computes (dump run
+/// dump3, 2026-11-25); the model's trace points at a stage-3 read that saw
+/// a register before another wave's stage-2 write, as a stale vector cache
+/// would (the host may spread a group over both halves of a WGP).
+/// Unverified: with this on (run confirm2) the faces stayed torn, and the
+/// model itself is unconfirmed, so it stays off.
+/// Whether a compute program that stores to UAVs and synchronises its group
+/// with `s_barrier` reads 16-bit integer typed buffer views (`_d16` loads of
+/// 1, 2 or 4 channels, the view's kind from the host's table by heap slot)
+/// through the slot's raw view instead (`VICTORY_RAW_TYPED_LOADS=0` turns it
+/// off). On the host (RADV through vkd3d-proton) a typed buffer load after
+/// the group barrier could return what the buffer held before another wave's
+/// store that preceded the barrier; raw loads see it. The face network's
+/// Formula program (0aa7934094794dbf, an interpreter whose 1,024 threads keep
+/// a register file in an R16_UINT view, a barrier between its 12 stages)
+/// replayed from the title's buffers (`formula_replay_tests`): typed, its
+/// registers left a CPU model of its console code from stage 2 (1 register,
+/// 17 by stage 4, 119 by stage 12), whatever the barrier's fence bits, two
+/// barriers, globally coherent views or RADV's LLVM backend; one dispatch a
+/// stage, or raw loads, matched the model in every register after every
+/// stage.
+fn raw_typed_loads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_RAW_TYPED_LOADS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_TYPED_LOADS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`raw_typed_loads_on`], for its thread only.
+    pub(super) static TEST_RAW_TYPED_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn coherent_uavs_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_COHERENT_UAVS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COHERENT_UAVS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`coherent_uavs_on`], for its thread only.
+    pub(super) static TEST_COHERENT_UAVS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -1401,6 +1462,14 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        s.raw_typed_loads = raw_typed_loads_on()
+            && writes_uavs
+            && insts().any(|i| i.name() == "s_barrier")
+            && insts().any(|i| matches!(i.fields, Fields::Buffer { .. }) && i.name().contains("load_format"));
+        s.coherent_uavs = coherent_uavs_on()
+            && writes_uavs
+            && insts().any(|i| i.name() == "s_barrier")
+            && insts().any(|i| matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. }) && i.name().contains("load"));
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
@@ -2200,14 +2269,14 @@ impl<'a> Lower<'a> {
     /// single precision, as a half.
     fn half_sum_here(&mut self, x: V) -> V {
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         self.s.flags |= flags::WAVE_OPS;
         let low = self.s.m.i32(0xFFFF);
         let h = self.s.m.bin(c, Bin::And, x, low);
         let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
         let k = self.s.m.i8(0);
         let sum = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k, k]);
-        self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[sum])
+        self.half_of(sum)
     }
 
     /// `WaveActiveSum` of 16-bit floats (`x`: each lane's term in its low half, +0 in the
@@ -3610,11 +3679,103 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, away, stepped, h)
     }
 
+    /// Fused f16 multiply-add with one nearest-even rounding. The product
+    /// of two finite f16s is exact in f32. TwoSum recovers the error of the
+    /// f32 addition so a rounded sum at an f16 midpoint can be resolved.
+    fn fma_f16(&mut self, a: V, b: V, addend: V, clamp: bool) -> V {
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let product = m.bin(c, Bin::Mul, a, b);
+        let sum = m.bin(c, Bin::Add, product, addend);
+        let addend_hi = m.bin(c, Bin::Sub, sum, product);
+        let product_hi = m.bin(c, Bin::Sub, sum, addend_hi);
+        let product_lo = m.bin(c, Bin::Sub, product, product_hi);
+        let addend_lo = m.bin(c, Bin::Sub, addend, addend_hi);
+        let error = m.bin(c, Bin::Add, product_lo, addend_lo);
+        // Saturation only changes the sum to an endpoint, neither a midpoint.
+        let sum = if clamp { self.unary(7, sum) } else { sum };
+        let bits = self.as_int(sum);
+        let error_bits = self.as_int(error);
+        let m = &mut self.s.m;
+        let sign_mask = m.i32(0x8000_0000);
+        let sign = m.bin(c, Bin::And, bits, sign_mask);
+        let magnitude = m.bin(c, Bin::Xor, bits, sign);
+        let error_bits = m.bin(c, Bin::Xor, error_bits, sign);
+        let error = self.as_float(error_bits);
+
+        // Pack the f16 ourselves: the legacy conversion may round toward zero.
+        let m = &mut self.s.m;
+        let one = m.i32(1);
+        let zero = m.i32(0);
+        let k23 = m.i32(23);
+        let exponent = m.bin(c, Bin::LShr, magnitude, k23);
+        let min_normal = m.i32(113);
+        let normal = m.cmp(c, pred::IUGE, exponent, min_normal);
+        let min_midpoint = m.i32(102); // f32 exponent for 2^-25
+        let tiny = m.cmp(c, pred::IULT, exponent, min_midpoint);
+        let bounded = m.select(c, tiny, min_midpoint, exponent);
+        let subnormal_base = m.i32(126);
+        let subnormal_shift = m.bin(c, Bin::Sub, subnormal_base, bounded);
+        let k13 = m.i32(13);
+        let shift = m.select(c, normal, k13, subnormal_shift);
+        let bias = m.i32(112 << 23);
+        let normal_bits = m.bin(c, Bin::Sub, magnitude, bias);
+        let fraction_mask = m.i32(0x007F_FFFF);
+        let fraction = m.bin(c, Bin::And, magnitude, fraction_mask);
+        let hidden_bit = m.i32(0x0080_0000);
+        let subnormal_bits = m.bin(c, Bin::Or, fraction, hidden_bit);
+        let significand = m.select(c, normal, normal_bits, subnormal_bits);
+        let lower = m.bin(c, Bin::LShr, significand, shift);
+        let unit = m.bin(c, Bin::Shl, one, shift);
+        let mask = m.bin(c, Bin::Sub, unit, one);
+        let remainder = m.bin(c, Bin::And, significand, mask);
+        let midpoint = m.bin(c, Bin::LShr, unit, one);
+        let above = m.cmp(c, pred::IUGT, remainder, midpoint);
+        let at_midpoint = m.cmp(c, pred::EQ, remainder, midpoint);
+        let odd = m.bin(c, Bin::And, lower, one);
+        let odd = m.cmp(c, pred::NE, odd, zero);
+        let fzero = m.f32(0);
+        let away = m.cmp(c, pred::OGT, error, fzero);
+        let exact = m.cmp(c, pred::OEQ, error, fzero);
+        let even_tie = m.bin(c, Bin::And, exact, odd);
+        let round_up = m.bin(c, Bin::Or, away, even_tie);
+        let round_up = m.bin(c, Bin::And, at_midpoint, round_up);
+        let round_up = m.bin(c, Bin::Or, above, round_up);
+        let round_up = m.cast(c, Cast::ZExt, round_up, self.s.t.i32);
+        let rounded = m.bin(c, Bin::Add, lower, round_up);
+        let rounded = m.select(c, tiny, zero, rounded);
+
+        let limit = m.i32(0x4780_0000); // 65536; smaller overflows round up above
+        let overflow = m.cmp(c, pred::IUGE, magnitude, limit);
+        let infinity = m.i32(0x7C00);
+        let rounded = m.select(c, overflow, infinity, rounded);
+        let k16 = m.i32(16);
+        let sign = m.bin(c, Bin::LShr, sign, k16);
+        let rounded = m.bin(c, Bin::Or, sign, rounded);
+        let f32_infinity = m.i32(0x7F80_0000);
+        let nan = m.cmp(c, pred::IUGT, magnitude, f32_infinity);
+        let fallback = self.half_of(sum);
+        self.s.m.select(c, nan, fallback, rounded)
+    }
+
+    /// An f32 value as the console's 16-bit float result: rounded to nearest even
+    /// ([`Self::f16_nearest`]) unless `VICTORY_F16_NEAREST=0` ([`f16_nearest_on`]), then
+    /// the host's `f32tof16`. In the low 16 bits.
+    fn half_of(&mut self, f: V) -> V {
+        if f16_nearest_on() {
+            self.f16_nearest(f)
+        } else {
+            let i32t = self.s.t.i32;
+            self.s.op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+        }
+    }
+
     /// `f` as an f16 in the low bits, rounded to nearest, ties to even, as the console's
     /// 16-bit float operations round, whatever the host's own conversion does: D3D lets
     /// `f32tof16` round toward zero, and the NVIDIA driver's does (measured on an RTX 4070:
-    /// `wave64_tests`). The conversion toward zero, or the next half away from zero where
-    /// that one is nearer, or as near and the first one odd. Past the largest half the next
+    /// `wave64_tests`), and RADV's (the face network's dumped results). The conversion
+    /// toward zero, or the next half away from zero where that one is nearer, or as near
+    /// and the first one odd. Past the largest half the next
     /// one counts as 2^16, the bound IEEE rounds by, so 65520 and up become infinity.
     /// (`f` is an f32 result of two halves here; rounding it again to 16 bits gives the
     /// rounding of the exact result, 24 bits being more than twice 11 and two.)
@@ -7832,9 +7993,7 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.half_of(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -7859,9 +8018,7 @@ impl<'a> Lower<'a> {
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = self.half_of(a);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -8528,15 +8685,9 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            // The console rounds to nearest; the host's conversion may round toward zero
-            // (NVIDIA's does), one step of the last place lower where the two differ.
-            // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            };
+            // The console rounds to nearest; the host's conversion rounds toward zero
+            // (NVIDIA's and RADV's), one step of the last place lower where the two differ.
+            let h = l.half_of(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -8576,6 +8727,13 @@ impl<'a> Lower<'a> {
             } else {
                 self.half_fsrc(inst, 2)?
             };
+            // Rounded once, as the console's fused multiply-add rounds
+            // (upstream c4ee3d2); with `VICTORY_F16_NEAREST=0` the f32 sum
+            // and the host's conversion, as before.
+            if name == "v_fma_f16" && f16_nearest_on() && v.omod == 0 {
+                let half = self.fma_f16(a, b, acc, v.clamp);
+                return self.write_half(inst, half, guard);
+            }
             let r = match name {
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
@@ -8834,7 +8992,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -8866,8 +9024,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.half_of(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
@@ -11063,9 +11220,46 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // The same element through the slot's raw view, where the view is a
+        // 16-bit integer one ([`raw_typed_loads_on`]): (taken, dwords).
+        let mut raw: Option<(V, Vec<V>)> = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
+            }
+            if uav && d16 && matches!(count, 1 | 2 | 4) && self.s.raw_typed_loads {
+                if let (Source::Loaded { load, first }, Some(index)) = (src, index) {
+                    let (load, first) = (*load, *first);
+                    let word = self.slot_word(load, first)?;
+                    let c = self.cur;
+                    let size = 2 * count;
+                    let (bits, zero) = (self.s.m.i32(super::shader::SLOT_INTEGER | 0x1F_FFFF), self.s.m.i32(0));
+                    let want = self.s.m.i32(super::shader::SLOT_INTEGER | size);
+                    let kind = self.s.m.bin(c, Bin::And, word, bits);
+                    let taken = self.s.m.cmp(c, pred::EQ, kind, want);
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let k = self.s.m.i32(size);
+                    let byte = self.s.m.bin(c, Bin::Mul, index, k);
+                    let k3 = self.s.m.i32(3);
+                    let within = self.s.m.bin(c, Bin::And, byte, k3);
+                    let aligned = self.s.m.bin(c, Bin::Sub, byte, within);
+                    let dwords = count.div_ceil(2);
+                    let (mask, align) = (self.s.m.i8((1u8 << dwords) - 1), self.s.m.i32(4));
+                    let l = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, aligned, iu, mask, align]);
+                    let mut ws = Vec::new();
+                    for d in 0..dwords {
+                        let f = self.s.m.extract(c, l, d);
+                        ws.push(self.as_int(f));
+                    }
+                    if count == 1 {
+                        let sh = self.s.m.bin(c, Bin::Shl, within, k3);
+                        let x = self.s.m.bin(c, Bin::LShr, ws[0], sh);
+                        let low = self.s.m.i32(0xFFFF);
+                        ws[0] = self.s.m.bin(c, Bin::And, x, low);
+                    }
+                    let _ = zero;
+                    raw = Some((taken, ws));
+                }
             }
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
@@ -11165,7 +11359,11 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let mut x = x.expect("a channel");
+                if let Some((taken, ws)) = &raw {
+                    x = self.s.m.select(c, *taken, ws[k as usize], x);
+                }
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }

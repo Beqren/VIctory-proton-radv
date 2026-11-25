@@ -813,6 +813,8 @@ extern "system" fn present(
     // frames) or for whatever frame comes (`capture::dump_target`).
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::capture::dump_targets(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::graphdump::flush(frame);
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.

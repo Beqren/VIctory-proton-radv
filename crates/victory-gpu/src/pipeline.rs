@@ -422,6 +422,34 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Microseconds the title's threads have waited for host pipelines since
+/// the start.
+#[cfg(windows)]
+pub(crate) fn waited_us() -> u64 {
+    make::WAITED_US.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// At a present: the frame's draws; whether the world has begun (500 draws
+/// in a frame), after which draws wait for pipelines within the frame's
+/// budget only.
+#[cfg(windows)]
+pub(crate) fn frame_drew(draws: u64) -> bool {
+    make::frame_drew(draws)
+}
+
+/// First uses of title pipelines by the time since their creation
+/// (`make::FIRST_USES`).
+#[cfg(windows)]
+pub(crate) fn first_uses() -> [u64; 4] {
+    make::FIRST_USES.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Writes the record of title pipelines if it changed (at most every 5 s).
+#[cfg(windows)]
+pub(crate) fn save_record() {
+    library::save_record(false);
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -478,6 +506,18 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 /// (diagnostics: which programs a drop counted under one reason is of).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn shaders_text(this: This) -> String {
+    if this.is_null() {
+        return "[]".to_owned();
+    }
+    let p = pipeline(this);
+    let list: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    format!("[{}]", list.join(", "))
+}
+
+/// The shader hashes of the title's pipeline `this`, in every build (for
+/// warnings that name a program once per pipeline).
+#[cfg(windows)]
+pub(crate) fn shaders_text_any(this: This) -> String {
     if this.is_null() {
         return "[]".to_owned();
     }

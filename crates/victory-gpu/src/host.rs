@@ -787,8 +787,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
-            log_removal_context();
         }
+        // Every way a run ends on the host GPU (a fetch mark the card never
+        // wrote comes before the removal is reported: run play-va2 printed
+        // no address map): the trail, the graveyard and the address map.
+        log_removal_context();
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
@@ -1939,6 +1942,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Page marks' check: the copies the list's shaders write (by address)
@@ -2466,6 +2474,9 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Title memory its texture read-backs write ([`crate::texback`]):
+    /// written by the flight until it has landed, as `back` is.
+    texture_back_ranges: Vec<(usize, usize)>,
     /// Page marks: its marks, the copies with an unmarked write, and (check)
     /// who declared what.
     marks: Option<MarkTake>,
@@ -2486,6 +2497,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    texture_back_ranges: Vec<(usize, usize)>,
     /// As in [`Sent`].
     marks: Option<MarkTake>,
     unmarked: std::collections::HashSet<usize>,
@@ -2503,8 +2515,8 @@ enum Late {
 
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
+    /// The title memory the flights' shaders and texture read-backs may
+    /// write (address, end), in order and joined.
     written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
@@ -3260,6 +3272,11 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    // Textures shaders wrote that the title reads on the CPU
+    // ([`crate::texback`]): every caller found the device alive first.
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -4250,6 +4267,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -4425,7 +4443,13 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4435,6 +4459,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
                 marks: sent.marks,
                 unmarked: sent.unmarked,
                 writers: sent.writers,
@@ -4472,7 +4497,13 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4482,6 +4513,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
                 marks: sent.marks,
                 unmarked: sent.unmarked,
                 writers: sent.writers,
@@ -4826,6 +4858,10 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
+            let texture_back_ranges = runs
+                .iter()
+                .flat_map(|l| l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>())
+                .collect();
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -4835,6 +4871,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                texture_back_ranges,
                 writes,
                 marks,
                 unmarked,
@@ -5279,6 +5316,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5364,6 +5402,34 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers of ours ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -5709,7 +5775,9 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.texture_backs.is_empty()
+                && deferred.back_wanted.is_empty())
             {
                 return false;
             }
@@ -6538,6 +6606,96 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Each frame's own time ([`FrameTimes`]).
+    times: FrameTimes,
+}
+
+/// Each presented frame's time from the present before, and what of it the
+/// title's threads waited for pipelines (`pipeline::waited_us`), in every
+/// build: the per-second line averages hide a frame of seconds among
+/// frames of 200 ms (the owner's session loss-1808: one second of 0.3 fps,
+/// 3,557 ms a frame, three seconds in no meter's count).
+struct FrameTimes {
+    last: std::time::Instant,
+    waited: u64,
+    drawn: u64,
+    /// Since the last line: the longest frame and the most a frame waited
+    /// for pipelines (ms), and all it waited (us).
+    longest: f64,
+    wait_most: f64,
+    wait_all: u64,
+}
+
+/// Since the world's first frame: the longest frame (us), and the frames of
+/// more than 1 s.
+static LONGEST_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FRAMES_OVER_1S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl FrameTimes {
+    fn new() -> Self {
+        FrameTimes {
+            last: std::time::Instant::now(),
+            waited: crate::pipeline::waited_us(),
+            drawn: crate::draw::drawn(),
+            longest: 0.0,
+            wait_most: 0.0,
+            wait_all: 0,
+        }
+    }
+
+    /// At a present.
+    fn frame(&mut self) {
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.last).as_secs_f64() * 1e3;
+        self.last = now;
+        let waited = crate::pipeline::waited_us();
+        let wait = waited.saturating_sub(self.waited);
+        self.waited = waited;
+        let drawn = crate::draw::drawn();
+        let draws = drawn.saturating_sub(self.drawn);
+        self.drawn = drawn;
+        let world = crate::pipeline::frame_drew(draws);
+        self.longest = self.longest.max(ms);
+        self.wait_most = self.wait_most.max(wait as f64 / 1e3);
+        self.wait_all += wait;
+        if !world {
+            return;
+        }
+        LONGEST_FRAME.fetch_max((ms * 1e3) as u64, Ordering::Relaxed);
+        if ms > 1000.0 {
+            FRAMES_OVER_1S.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                frame = crate::frame::current(),
+                ms,
+                waiting_for_pipelines_ms = wait as f64 / 1e3,
+                draws,
+                being_made = crate::pipeline::making(),
+                "a frame of more than a second"
+            );
+        }
+    }
+
+    /// The line for the last `frames` frames.
+    fn line(&mut self, frames: f64) {
+        let first = crate::pipeline::first_uses();
+        tracing::info!(
+            "frame times: the longest {:.0} ms; the title's threads waited for pipelines {:.1} ms a frame, at most {:.0} ms \
+             in one frame; in the world since its first frame: the longest frame {:.0} ms, {} frames of more than 1 s; \
+             title pipelines first asked for under 1 s after their creation {}, 1 to 10 s {}, later {}, of them made \
+             already {}",
+            self.longest,
+            self.wait_all as f64 / 1e3 / frames,
+            self.wait_most,
+            LONGEST_FRAME.load(Ordering::Relaxed) as f64 / 1e3,
+            FRAMES_OVER_1S.load(Ordering::Relaxed),
+            first[0],
+            first[1],
+            first[2],
+            first[3],
+        );
+        (self.longest, self.wait_most, self.wait_all) = (0.0, 0.0, 0);
+        crate::pipeline::save_record();
+    }
 }
 
 impl Meter {
@@ -6551,11 +6709,13 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            times: FrameTimes::new(),
         }
     }
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        self.times.frame();
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -6575,6 +6735,7 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        self.times.line(frames);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames

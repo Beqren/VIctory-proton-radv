@@ -26,6 +26,8 @@ pub mod device;
 mod draw;
 #[cfg(windows)]
 mod evict;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod graphdump;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
@@ -57,6 +59,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::{alias_copy_event, copies_alive, page_mapping, phase as frame_phase, remap_call, view_join, views_alive};

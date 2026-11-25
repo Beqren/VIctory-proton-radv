@@ -1476,6 +1476,9 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(crate::copystat::C::RemappedUs, std::time::Instant::now());
+    // A texture read-back going there is stale (before the guards are
+    // taken: a landing holds its lock across a guarded write).
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

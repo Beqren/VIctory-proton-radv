@@ -1185,6 +1185,7 @@ impl Drop for HostHeap {
     /// but not what its descriptors view, and a shader reading a slot of it
     /// would read freed memory (a texture-unit page fault).
     fn drop(&mut self) {
+        crate::memory::heap_gone(std::ptr::from_ref(self) as usize);
         let kept = std::mem::take(self.kept.get_mut().unwrap_or_else(|e| e.into_inner()));
         let mut n = 0u64;
         for resource in kept.into_iter().flatten() {
@@ -2555,6 +2556,24 @@ impl HostHeap {
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
+        if null_buffer_zeros()
+            && let Some(z) = zero_buffers()
+        {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: (ZERO_BYTES / 4) as u32,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: a slot of our heap; a live buffer of ours.
+            unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&desc), self.cpu(index)) };
+            return;
+        }
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -4154,7 +4173,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // location a null view that reads nothing is not checked here.
             static ZEROS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let on = *ZEROS.get_or_init(|| std::env::var_os("VICTORY_NULL_CBV_ZEROS").is_some_and(|v| v == "1"));
-            let zeros = on.then(crate::draw::zero_root).flatten();
+            let zeros = if null_buffer_zeros() { zero_buffer_gpu() } else { on.then(crate::draw::zero_root).flatten() };
             let desc = match zeros {
                 Some(gpu) => D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu, SizeInBytes: 64 << 10 },
                 None => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
@@ -4165,6 +4184,26 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
+    if buffer
+        && null_buffer_zeros()
+        && let Some(z) = zero_buffers()
+    {
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: (ZERO_BYTES / 4) as u32,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a live buffer of ours (writes land
+        // there and are never read back).
+        unsafe { host.device.CreateUnorderedAccessView(&z[1], None::<&ID3D12Resource>, Some(&desc), at) };
+        return;
+    }
     let desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
@@ -4225,9 +4264,90 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// Whether views of buffers that read nothing are views of real buffers of
+/// zeros (`VICTORY_NULL_BUFFER_ZEROS`, on): 64 MiB to read, and another 64
+/// MiB for unordered views to write into, never read.
+///
+/// Why: run play-va2 (2026-11-25) lost the device on scalar data reads
+/// (SQC) at GPU addresses 0x0, 0x10000, 0x3f000 ... 0xc4000: a buffer read
+/// through a view whose base address is 0, at the offsets the shader
+/// computed. A null buffer view gives no memory and, on vkd3d-proton's path
+/// for such views, no bound the load is held to; a view of real zeros reads
+/// zeros at any offset within its size.
+fn null_buffer_zeros() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_BUFFER_ZEROS").is_none_or(|v| v != "0"))
+}
+
+/// The bytes of each buffer of [`null_buffer_zeros`].
+const ZERO_BYTES: u64 = 64 << 20;
+
+/// The buffers of [`null_buffer_zeros`]: to read (0) and to write (1).
+fn zero_buffers() -> Option<&'static [ID3D12Resource; 2]> {
+    static MADE: std::sync::OnceLock<Option<[ID3D12Resource; 2]>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let make = || -> Option<ID3D12Resource> {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: ZERO_BYTES,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation; committed resources start zeroed.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r)
+                    .ok()?;
+            }
+            r
+        };
+        let made = [make()?, make()?];
+        tracing::info!(mb = ZERO_BYTES >> 20, "views of buffers that read nothing read real zeros (VICTORY_NULL_BUFFER_ZEROS)");
+        Some(made)
+    })
+    .as_ref()
+}
+
+/// The GPU address of the buffer of zeros to read ([`null_buffer_zeros`]).
+pub(crate) fn zero_buffer_gpu() -> Option<u64> {
+    if !null_buffer_zeros() {
+        return None;
+    }
+    // SAFETY: a live buffer.
+    zero_buffers().map(|b| unsafe { b[0].GetGPUVirtualAddress() })
+}
+
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if null_buffer_zeros()
+        && let (Some(z), Some(host)) = (zero_buffers(), host())
+    {
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: (ZERO_BYTES / 4) as u32,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap; a live buffer of ours.
+        unsafe { host.device.CreateShaderResourceView(&z[0], Some(&desc), at) };
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,

@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// A shader of the draw being bound was handed address 0 for a view
+    /// it takes the address of ([`State::host_word`]).
+    static NULL_ADDRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While a stage is bound: whether its shader marks the pages it writes
     /// through heap views (page marks, `crate::shadow::marks_mode`: it
     /// binds the written-pages bitmap).
@@ -557,6 +560,83 @@ fn early_budgets() -> (u64, u64) {
 /// the texture pass has run in this frame before it: the pass runs only
 /// where a shader picks buffers by index (`SLOT_STRIDES`), which a bake
 /// shader need not.
+/// The face network's tensor programs (the 65 `compute_graph_ops` of the
+/// pack), for the blend-shape probe.
+#[cfg(feature = "diagnostics")]
+const GRAPH_PROGRAMS: [&str; 65] = [
+    "0709e8356abd9082", "088735d999e0c9f4", "0aa7934094794dbf", "13c8daa0bad76f2a", "164a8fa92a2c699f",
+    "17fba369586b4b79", "1c149749f2e45123", "20888698baa6ea53", "21e30428bed8410d", "24a83bd1f400880f",
+    "25c0eac2493ca478", "2666062bd7f4c95d", "276807e09cc5ac96", "2d2bf473555f8dd5", "305809281f57812f",
+    "38a65783327c30b6", "3931481a3e2ff49f", "3a738c1d82dd3fe3", "3d65925d7cd4a39a", "3eed5349508763fb",
+    "433e7b2c5496ceea", "44679bc29abcf17a", "52a3f6d2c90c9919", "5a07a7d6687e7087", "5a8a378f351c86c3",
+    "5b10547f431b1355", "5e5d98e4ff3a7cf9", "60c4f9d76c3aed89", "66177c4264e3c6bc", "6831220e1ed5878f",
+    "6a04b371a8e26853", "6b176df5514d9a3f", "6b1ec09dad51d662", "6b60e7642632c2b9", "6eea8cd13a310ddc",
+    "7031554d409c394f", "7519e7515cb3d703", "77c639e3289f168d", "7a38ed7f5205f384", "7de0f9db96ddd295",
+    "7dfd9a07e164f011", "8184d60481fa0125", "862579ca496e9d31", "918081d4df02c5bc", "94ed3044f86cc704",
+    "95efe597345a9e17", "a06ef09446bd6e70", "a26a38d61f256901", "aaf7da7a94dc72a9", "b22a16a178976e1b",
+    "c41ee78453b1eed8", "d4bc666022520dfd", "d603b4c3b6505026", "e45172602f6280b6", "e4576c6eca0f8ce3",
+    "e4d850a7baf18270", "e52a6557e730c889", "e72489e94f2e167a", "e8820cb254b5c681", "eb109d093eb4ddbe",
+    "f3a16846866f61ab", "f42156fd1b46c292", "f8425d3c03df62a0", "fcbb2e25040a325b", "fd49b6d7aca608d3",
+];
+
+/// Diagnostics: how much of the face network's arena (a buffer view of 16
+/// MB or more) the dump copies: up to the end of the last 64 KiB piece
+/// title memory holds anything in, and one piece more, at least 1 MB
+/// (`VICTORY_GRAPH_ARENA_KB` sets it), once per run.
+#[cfg(feature = "diagnostics")]
+fn arena_extent(address: u64, len: u64) -> u64 {
+    static E: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let e = *E.get_or_init(|| {
+        if let Some(kb) = std::env::var("VICTORY_GRAPH_ARENA_KB").ok().and_then(|v| v.parse::<u64>().ok()) {
+            return kb << 10;
+        }
+        const PIECE: usize = 64 << 10;
+        let mut last = 0;
+        let mut b = vec![0u8; PIECE];
+        for i in 0..(len as usize / PIECE) {
+            if crate::host::read_into((address as usize + i * PIECE) as *const u8, &mut b) && b.iter().any(|&x| x != 0) {
+                last = i + 1;
+            }
+        }
+        let e = ((last + 1) * PIECE) as u64;
+        tracing::info!(last_piece = last, extent = e, "face network dump: arena extent from title memory");
+        e.max(1 << 20)
+    });
+    e.min(len)
+}
+
+/// The f32 an f16's bits stand for (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn half(h: u16) -> f32 {
+    let (sign, exp, man) = (u32::from(h >> 15), u32::from(h >> 10 & 0x1f), u32::from(h & 0x3ff));
+    let mag = match exp {
+        0 => man as f32 / (1 << 24) as f32,
+        31 if man == 0 => f32::INFINITY,
+        31 => f32::NAN,
+        e => f32::from_bits((e + 112) << 23 | man << 13),
+    };
+    if sign == 1 { -mag } else { mag }
+}
+
+/// Bytes read as f16s: how many are NaN or infinite, larger than 64 and
+/// than 4 in magnitude, and not zero (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn half_stats(bytes: &[u8]) -> String {
+    let (mut bad, mut big, mut over4, mut nz) = (0usize, 0usize, 0usize, 0usize);
+    for h in bytes.chunks_exact(2) {
+        let x = half(u16::from_le_bytes([h[0], h[1]]));
+        if !x.is_finite() {
+            bad += 1;
+        } else if x.abs() > 64.0 {
+            big += 1;
+        } else if x.abs() > 4.0 {
+            over4 += 1;
+        }
+        nz += usize::from(x != 0.0);
+    }
+    format!("as halves: {nz} not zero, {bad} NaN/inf, {big} over 64, {over4} over 4")
+}
+
 fn bake_probe(p: &HostPipeline) -> bool {
     let Some(stage) = p.stages.iter().find(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())) else {
         return false;
@@ -636,6 +716,22 @@ macro_rules! once {
     }};
 }
 
+/// Draws and dispatches dropped because a shader was handed address 0 for
+/// a view it takes the address of, since the start.
+pub(crate) static NULL_ADDRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether such draws and dispatches are dropped (`VICTORY_DROP_NULL_ADDRESS=1`;
+/// off). Dropped, the indirect light passes among them write nothing and
+/// everything out of direct light is black (the owner's session on fcec294,
+/// 2026-11-25). Run instead, address 0 is title page 0, which has no copy:
+/// its reads go through the first slot of the title-memory run, a view of
+/// 64 MiB of zeros (`crate::memory`, `VICTORY_MEMORY_RUN_FIRST`), where a
+/// null view had read at the walk's offsets from address 0.
+fn drop_null_address() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_NULL_ADDRESS").is_some_and(|v| v == "1"))
+}
+
 /// Root constant and shader views bound to zeros ([`bind_null_root`]),
 /// since the start.
 pub(crate) static NULL_ROOTS: AtomicU64 = AtomicU64::new(0);
@@ -656,6 +752,9 @@ pub(crate) fn null_roots_on() -> bool {
 /// (4 MiB: a root view has no size, and reads past its start by offsets
 /// the title computes).
 pub(crate) fn zero_root() -> Option<u64> {
+    if let Some(gpu) = crate::descriptor::host::zero_buffer_gpu() {
+        return Some(gpu);
+    }
     // A failure is not kept: the next call tries again (review finding).
     static ZERO: std::sync::OnceLock<(ID3D12Resource, u64)> = std::sync::OnceLock::new();
     if let Some(z) = ZERO.get() {
@@ -1066,7 +1165,19 @@ impl State {
             _ => 0,
         };
         if address == 0 {
-            once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
+            NULL_ADDRESS.set(true);
+            static SEEN: std::sync::Mutex<Vec<(usize, u8, u32)>> = std::sync::Mutex::new(Vec::new());
+            let key = (self.pipeline, slot, dword);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 200 && !seen.contains(&key) {
+                seen.push(key);
+                tracing::warn!(
+                    slot,
+                    dword,
+                    shaders = crate::pipeline::shaders_text_any(self.pipeline as This),
+                    "a shader takes the address of a buffer view that is not there: it reads 0"
+                );
+            }
         }
         if kind == USER_VIEW_ADDRESS {
             address as u32
@@ -1296,6 +1407,7 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
+                NULL_ADDRESS.set(false);
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
@@ -1310,6 +1422,19 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                // A program handed address 0 for a view it walks memory
+                // from: dropped (`VICTORY_DROP_NULL_ADDRESS`, on). Run
+                // run1st-1 (2026-11-25): every such program is a ray tracing
+                // pass (sr_tracing, indirect_light_probes, rtdirectionalshadows,
+                // shadowmask, deferred_tiled:CS_LaserLightShadowRaytracing)
+                // whose structure's view is not there (ray tracing is off);
+                // walking a structure from address 0 read fixed fields at
+                // 0x3f000, 0xbd000-0xc4000 ... (runs play-va2, play-va3, b18:
+                // scalar reads, a device loss).
+                if NULL_ADDRESS.take() && drop_null_address() {
+                    NULL_ADDRESSED.fetch_add(1, Ordering::Relaxed);
+                    return false;
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -2650,6 +2775,153 @@ impl State {
         });
     }
 
+    /// Diagnostics: the face network's dump (`crate::graphdump`), before
+    /// (`after` false) or after a dispatch: the dispatch's record (program,
+    /// groups, root arguments, each view's words and range, constant
+    /// buffers' words) and the copies the window asks for.
+    #[cfg(feature = "diagnostics")]
+    fn graph_dump(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3], after: bool) {
+        use std::fmt::Write;
+        let Some(w) = crate::graphdump::window() else { return };
+        let real_frame = crate::queue::presented() + 1;
+        if real_frame < w.first {
+            return;
+        }
+        let hash = |h: &str| p.stages.iter().any(|s| s.shader.hash == h);
+        // Every dispatch's buffer views against the watched ranges (who
+        // writes the face controls).
+        if !after {
+            let program = p.stages.first().map_or("", |s| s.shader.hash.as_str());
+            for stage in &p.stages {
+                for u in &stage.translated().used {
+                    let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
+                        continue;
+                    };
+                    let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                    if let Some((a, n)) = view.as_ref().and_then(crate::descriptor::host::buffer_range) {
+                        crate::graphdump::watch_view(program, &format!("{:?} s{}+{}", u.kind, u.slot, u.table_offset_dwords), a, n);
+                    }
+                }
+            }
+        }
+        let graph = p.stages.iter().any(|s| GRAPH_PROGRAMS.contains(&s.shader.hash.as_str()));
+        let skinning = hash("36e010b53acffd77");
+        let head = hash("970c4fbb3b017c0e") || hash("61e54e90adccaf6a") || skinning;
+        if !graph && !head {
+            return;
+        }
+        if graph && after {
+            return;
+        }
+        // Passes of the network, each from its Formula dispatch (the face
+        // controls) to the next: the first `full` with the arena before
+        // every dispatch, the next `light` with first-sight copies only.
+        static PASS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+        let formula = hash("0aa7934094794dbf");
+        if formula && !after {
+            PASS.fetch_add(1, Ordering::Relaxed);
+        }
+        if formula
+            && let Some(Root::Table(table)) = self.compute.first()
+            && let Some((a, n)) =
+                crate::descriptor::view(table + 32 * 4).as_ref().and_then(crate::descriptor::host::buffer_range)
+        {
+            crate::graphdump::watch_controls(a, n);
+        }
+        let pass = PASS.load(Ordering::Relaxed);
+        if pass < 0 {
+            return;
+        }
+        let pass = pass as u64;
+        if pass >= w.full + w.light {
+            crate::graphdump::finish(real_frame);
+            return;
+        }
+        let full = pass < w.full;
+        let frame = pass;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let phase = if after { "after" } else { "before" };
+        let hashes: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
+        let [x, y, z] = groups;
+        let mut text = format!(
+            "dispatch {seq} frame={frame} {phase} programs={hashes:?} groups={x},{y},{z} realframe={real_frame}"
+        );
+        for (slot, root) in self.compute.iter().enumerate() {
+            match root {
+                Root::None => {}
+                Root::Table(a) => {
+                    let _ = write!(text, " root{slot}=table:{a:#x}");
+                }
+                Root::Constants(v) => {
+                    let _ = write!(text, " root{slot}=constants:{v:x?}");
+                }
+                Root::View(a) => {
+                    let _ = write!(text, " root{slot}=view:{a:#x}");
+                }
+            }
+        }
+        let mut buffers: Vec<(String, u64, u64)> = Vec::new();
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
+                    let _ = write!(text, "\n  used {:?} s{}+{} root {:?}", u.kind, u.slot, u.table_offset_dwords, u.root);
+                    continue;
+                };
+                let label = format!("s{}+{}", u.slot, u.table_offset_dwords);
+                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                if let Some(View::Constant(address, size)) = view {
+                    let mut bytes = vec![0u8; (size as usize).min(1024) & !3];
+                    let words: Vec<u32> = if crate::host::read_into(address as *const u8, &mut bytes) {
+                        bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let _ = write!(text, "\n  view {label} {:?} constants {address:#x}+{size:#x} words {words:08x?}", u.kind);
+                    continue;
+                }
+                let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+                let _ = write!(text, "\n  view {label} {:?} range {range:x?} desc {view:?}", u.kind);
+                if let Some((address, len)) = range {
+                    buffers.push((label, address, len));
+                }
+            }
+        }
+        crate::graphdump::note(text);
+        if skinning {
+            return;
+        }
+        for (label, address, len) in buffers {
+            let what = format!("seq={seq} {phase} {label}");
+            if graph {
+                if len >= 16 << 20 {
+                    // Between two Zero dispatches the arena holds nothing
+                    // the next one reads: no copy.
+                    static ZERO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    let zero = hash("6a04b371a8e26853");
+                    let zeros = ZERO.swap(zero, Ordering::Relaxed) && zero;
+                    if (full && !zeros) || formula {
+                        crate::graphdump::copy(list, frame, address, arena_extent(address, len), &format!("{what} arena"));
+                    }
+                } else {
+                    // The controls as title memory holds them now, to
+                    // compare with what the card is given.
+                    if formula && len <= 4 << 20 {
+                        let mut b = vec![0u8; len as usize];
+                        if crate::host::read_into(address as *const u8, &mut b) {
+                            crate::graphdump::cpu(frame, &format!("{what} title"), address, b);
+                        }
+                    }
+                    if crate::graphdump::first_sight(frame, address, len) {
+                        crate::graphdump::copy(list, frame, address, len, &format!("{what} first"));
+                    }
+                }
+            } else {
+                crate::graphdump::copy(list, frame, address, len.min(32 << 20), &what);
+            }
+        }
+    }
+
     /// Diagnostics: at a dispatch of the title's head blend-shape programs
     /// (`ped_standard_head_cs`) and of the head's skinning
     /// (`CS_PedStandardSkinning_11`), the floats of each buffer it reads or
@@ -2665,22 +2937,66 @@ impl State {
     /// the ones missing.
     #[cfg(feature = "diagnostics")]
     fn probe_blendshapes(&self, p: &HostPipeline) {
-        const NAMES: [&[u8]; 5] = [
+        const NAMES: [&[u8]; 6] = [
             b"CS_BlendshapeTranslationsHSSGraphOutputExtract",
             b"CS_ComputeStickyLips",
             b"CS_ReconstructBlendshapeNormals",
             b"CS_PedStandardSkinning_11",
             b"CS_ComputeBlendshapeMappings",
+            // The face network's tensor programs (65 `compute_graph_ops`,
+            // picked by hash below): a line a frame with the number recorded
+            // in the frame before, every dispatch in full in frames
+            // `VICTORY_GRAPH_FRAMES=<first>,<count>` (default 1040,10).
+            b"\0compute_graph_ops",
         ];
-        static SEEN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-        let Some(which) = NAMES.iter().position(|n| crate::pipeline::holds_name(self.pipeline as This, n)) else {
-            return;
+        static SEEN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+        let frame = crate::queue::presented() + 1;
+        let graph = p.stages.iter().any(|s| GRAPH_PROGRAMS.contains(&s.shader.hash.as_str()));
+        let which = if graph {
+            5
+        } else {
+            let Some(which) = NAMES[..5].iter().position(|n| crate::pipeline::holds_name(self.pipeline as This, n))
+            else {
+                return;
+            };
+            which
         };
         let name = NAMES[which];
         let n = SEEN[which].fetch_add(1, Ordering::Relaxed);
-        if n >= 48 && n % 400 != 0 {
+        // Once a frame (the first dispatch of the program in the frame): the
+        // compact line with each view's content hash.
+        static LAST_FRAME: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+        let first_in_frame = LAST_FRAME[which].swap(frame, Ordering::Relaxed) != frame;
+        if which == 5 {
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            static COUNTED: AtomicU64 = AtomicU64::new(0);
+            if COUNTED.swap(frame, Ordering::Relaxed) != frame {
+                let k = COUNT.swap(0, Ordering::Relaxed);
+                tracing::info!(frame, before = k, "face network: graph dispatches recorded in the frame before this one's first");
+            }
+            COUNT.fetch_add(1, Ordering::Relaxed);
+            static WINDOW: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+            let (first, count) = *WINDOW.get_or_init(|| {
+                std::env::var("VICTORY_GRAPH_FRAMES")
+                    .ok()
+                    .and_then(|v| {
+                        let (a, b) = v.split_once(',')?;
+                        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                    })
+                    .unwrap_or((1040, 10))
+            });
+            if !(first..first + count).contains(&frame) {
+                return;
+            }
+        }
+        let full = which == 5 || n < 48 || n % 400 == 0;
+        if !full && !(first_in_frame && matches!(which, 0 | 3)) {
             return;
         }
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+        };
+        let mut compact = String::new();
         let stats = |bytes: &[u8]| {
             let (mut nan, mut inf, mut huge, mut zero) = (0, 0, 0, 0);
             for w in bytes.chunks_exact(4) {
@@ -2746,9 +3062,13 @@ impl State {
                     continue;
                 };
                 ranges.push(((u.slot, u.table_offset_dwords), (address, len)));
-                let mut title = vec![0u8; len.min(64 << 10) as usize & !3];
+                let mut title = vec![0u8; len.min(4 << 20) as usize & !3];
                 if title.is_empty() || !crate::host::read_into(address as *const u8, &mut title) {
                     text.push_str(&format!("\n    {label} {address:#x}+{len:#x} unreadable: view {desc}"));
+                    continue;
+                }
+                compact.push_str(&format!(" {label}={address:#x}:{:016x}", fnv(&title)));
+                if !full {
                     continue;
                 }
                 let mut host = vec![0u8; title.len()];
@@ -2765,10 +3085,45 @@ impl State {
                     format!("{} of {start:#x}+{size:#x}", s.id())
                 });
                 text.push_str(&format!(
-                    "\n    {label} {address:#x}+{len:#x} (copy {span:?}) view {desc}: title {}; {differ}",
-                    stats(&title)
+                    "\n    {label} {address:#x}+{len:#x} (copy {span:?}) view {desc}: title {} hash {:016x}; {} {differ}",
+                    stats(&title),
+                    fnv(&title),
+                    half_stats(&title)
                 ));
             }
+        }
+        if !full {
+            // The once-a-frame line: each view's hash, and for the extract
+            // the face network's output (table 0 dword 16) whole, as halves,
+            // and the halves the extract's first thread reads (from constant
+            // word 15 of table 0 dword 56 on, three a vertex).
+            if which == 0
+                && let Some(&(_, (out, len))) = ranges.iter().find(|(k, _)| *k == (0, 16))
+            {
+                let mut b = vec![0u8; len.min(4 << 20) as usize & !1];
+                if crate::host::read_into(out as *const u8, &mut b) {
+                    let nz = b.chunks_exact(2).filter(|h| h != &[0u8, 0]).count();
+                    compact.push_str(&format!(
+                        " network output {nz} halves not zero, hash {:016x}, {}",
+                        fnv(&b),
+                        half_stats(&b)
+                    ));
+                    let first = constants
+                        .iter()
+                        .find(|(k, _)| *k == (0, 56))
+                        .and_then(|(_, w)| w.get(15).copied())
+                        .unwrap_or(0) as usize;
+                    let read: Vec<f32> = b
+                        .chunks_exact(2)
+                        .skip(first)
+                        .take(24)
+                        .map(|h| half(u16::from_le_bytes([h[0], h[1]])))
+                        .collect();
+                    compact.push_str(&format!(" read from half {first}: {read:?}"));
+                }
+            }
+            tracing::info!("blend-shape probe {} frame {frame} compact:{compact}", String::from_utf8_lossy(name));
+            return;
         }
         let constant = |slot: u8, dword: u32, index: usize| {
             constants.iter().find(|(k, _)| *k == (slot, dword)).and_then(|(_, w)| w.get(index).copied())
@@ -2904,7 +3259,27 @@ impl State {
                     text.push_str(&format!("\n    map {map:#x}+{len:#x}: {}", at(map, 32)));
                 }
             }
+            5 => {
+                let hashes: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
+                text.push_str(&format!("\n    programs {hashes:?}"));
+            }
             _ => {}
+        }
+        if which == 0 {
+            // The face network's output the extract reads (table 0 dword 16,
+            // R16_UINT halves): of the whole view, how many halves are not
+            // zero, in title memory.
+            if let Some((out, len)) = range(0, 16) {
+                let mut b = vec![0u8; len.min(4 << 20) as usize & !1];
+                if crate::host::read_into(out as *const u8, &mut b) {
+                    let nz = b.chunks_exact(2).filter(|h| h != &[0u8, 0]).count();
+                    let first = b.chunks_exact(2).position(|h| h != [0u8, 0]);
+                    text.push_str(&format!(
+                        "\n    network output {out:#x}+{len:#x}: {nz} of {} halves not zero (title), the first at {first:?}",
+                        b.len() / 2
+                    ));
+                }
+            }
         }
         tracing::info!(
             "blend-shape probe {} #{n} frame {}:{text}",
@@ -3061,6 +3436,8 @@ impl State {
         self.probe_blendshapes(p);
         #[cfg(feature = "diagnostics")]
         self.cull_keep_all(p);
+        #[cfg(feature = "diagnostics")]
+        self.graph_dump(list, p, [x, y, z], false);
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -3078,6 +3455,22 @@ impl State {
             }
             // SAFETY: an open list with everything set.
             _ => unsafe { list.list.Dispatch(x, y, z) },
+        }
+        #[cfg(feature = "diagnostics")]
+        self.graph_dump(list, p, [x, y, z], true);
+        // `VICTORY_DISPATCH_BARRIER=1` (off): a wait for every shader write
+        // after each dispatch, as if the title had put a UAV barrier between
+        // all of them. An experiment on ordering: the face network's chain
+        // of about a thousand dispatches a frame comes out torn, here and
+        // upstream, with few barriers recorded between its passes.
+        static AFTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *AFTER.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_BARRIER").is_some_and(|v| v == "1")) {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            };
+            // SAFETY: an open list; a global UAV barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
@@ -4247,6 +4640,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some textures shaders write the title reads on the CPU
+            // ([`crate::texback`]).
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

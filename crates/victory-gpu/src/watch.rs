@@ -686,6 +686,119 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// How [`write_title_memory`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleWrite {
+    /// Written. `reguarded`: a block of the destination had been guarded
+    /// again after [`writing`] opened it (a copy took it meanwhile), and the
+    /// write faulted into the guard there; a kernel write would have failed.
+    Written { reguarded: bool },
+    /// Nothing written: a page of the destination is not committed, or is
+    /// read-only (or a guard page) for a reason not ours. The address, and
+    /// the page's `State`, `Protect` and `Type`.
+    Refused { at: usize, state: u32, protect: u32, kind: u32 },
+}
+
+/// Writes `data` into title memory at `at` from user mode, for a runtime
+/// that has read or decoded it into a buffer of its own (DirectStorage,
+/// `fread`). A kernel write into a guarded block fails (ERROR_NOACCESS)
+/// instead of faulting into our handler, and [`writing`] alone cannot
+/// stop a copy on another thread from guarding the block again before the
+/// kernel gets there: the title stops at the failed request (run of
+/// 2026-11-25 on the viewtree Wine, three minutes in; one start in three in
+/// batch2). Here the write is ours: a block guarded meanwhile faults and is
+/// opened like the title's own writes, and is reported written.
+///
+/// Held over the write: [`title_memory_reading`], so that no remapping
+/// leaves a gap in the destination's view meanwhile (it would be an access
+/// violation nobody takes). The destination is looked at first and nothing
+/// is written if a page could not be written; the caller may try again.
+/// Not to be called with `title_memory_reading` held.
+pub fn write_title_memory(at: usize, data: &[u8]) -> TitleWrite {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    let len = data.len();
+    if len == 0 {
+        return TitleWrite::Written { reguarded: false };
+    }
+    let end = at.saturating_add(len);
+    // Opens the guards and tells the texture side, before the lock: the
+    // texture side takes `title_memory_reading` with its own locks held.
+    writing(at, len);
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(hook) = *BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) {
+        hook(at, len);
+    }
+    let mut reguarded = false;
+    {
+        let _mapped = title_memory_reading();
+        {
+            let g = guards();
+            let mut p = at;
+            while p < end {
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+                let refused = TitleWrite::Refused {
+                    at: p,
+                    state: info.State,
+                    protect: info.Protect,
+                    kind: info.Type,
+                };
+                if n == 0 || info.State != MEM_COMMIT || info.Protect & PAGE_GUARD != 0 {
+                    return refused;
+                }
+                let stop = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+                if stop <= p {
+                    return refused;
+                }
+                match info.Protect & 0xff {
+                    PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY => {}
+                    // Ours (the handler opens it at the write), or not.
+                    PAGE_READONLY if (p / BLOCK..stop.div_ceil(BLOCK)).all(|b| g.protected.contains(&b)) => {
+                        reguarded = true;
+                    }
+                    _ => return refused,
+                }
+                p = stop;
+            }
+        }
+        // The handler takes the guards' lock: not held here.
+        install();
+        // SAFETY: `[at, end)` is committed and writable or guarded by us
+        // (then opened at the fault), and stays mapped while `_mapped` is
+        // held; `data` is the caller's own buffer, not title memory there.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), at as *mut u8, len) };
+    }
+    // Again now that the bytes are there: a texture pass between the first
+    // call and the write took what was there before.
+    crate::descriptor::host::remapped(at, len);
+    TitleWrite::Written { reguarded }
+}
+
+/// Tests: called by [`write_title_memory`] between opening the guards and
+/// writing, where another thread's copy could guard the destination again.
+#[cfg(any(test, feature = "test-hooks"))]
+static BETWEEN: Mutex<Option<fn(usize, usize)>> = Mutex::new(None);
+
+/// Tests of the runtime: guards `[at, at + len)` as a copy of it would (if
+/// it is view memory), and sets the hook [`write_title_memory`] calls
+/// between opening the guards and writing.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn test_guard(at: usize, len: usize) -> Option<Vec<usize>> {
+    guard(at, at.saturating_add(len))
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn test_between(hook: Option<fn(usize, usize)>) {
+    *BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked

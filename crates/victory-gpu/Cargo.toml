@@ -22,6 +22,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# Hooks for the runtime's tests (`watch::test_guard`); never in a build of the program.
+test-hooks = []
 
 [lints]
 workspace = true

@@ -949,9 +949,20 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
+        if beside() {
+            // Read or decoded into a buffer of ours, then written in from
+            // user mode (`copy_in`).
+            let mut data = vec![0; len];
+            let n = fill(&mut data)?;
+            return copy_in(request, &data[..n]);
+        }
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        #[cfg(test)]
+        if REGUARD.load(Ordering::Relaxed) {
+            victory_gpu::test_guard(request.destination as usize, len);
+        }
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -966,7 +977,26 @@ fn into_destination(
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    // A page the title has just made, or a view the host refuses for a
+    // moment, can come right a little later: tried again before the request
+    // fails (after victory-fork 8dd30ab; `VICTORY_DSTORAGE_RETRIES`).
+    let mut tries = 0;
+    while !written && tries < retries() {
+        std::thread::sleep(backoff(tries));
+        tries += 1;
+        written = super::xmem::write_physical(pages, offset, &data[..n]);
+    }
+    if tries > 0 {
+        let n = RETRIED[usize::from(!written)].fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(
+            written,
+            tries,
+            requests = n,
+            "dstorage: a destination's physical pages written again after a failed write"
+        );
+    }
+    if written {
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result
@@ -982,6 +1012,120 @@ fn into_destination(
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
+    }
+}
+
+/// Whether requests into a title address are read or decoded into a buffer
+/// of ours and written in from user mode (`VICTORY_READ_BESIDE`, on; `0`:
+/// read and decoded in place, as before).
+///
+/// A raw request into an address was a file read straight into title
+/// memory: the kernel's write, which does not fault into the GPU side's
+/// guard. `kernel_will_write` opened the guarded blocks first, but a copy
+/// on another thread could guard them again before the read landed, and
+/// the read then failed with ERROR_NOACCESS (0x800703e6); the title stops
+/// at a failed request with its own breakpoint. Every such failure in the
+/// runs of 2026-11-25 was a raw request (options 0x0) of 1-45 KB: one start
+/// in three within two seconds (batch2), and three minutes into a run on
+/// the viewtree Wine (play.log). Decodes were user-mode writes already.
+fn beside() -> bool {
+    #[cfg(test)]
+    match BESIDE_TEST.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// Tests: 1 reads beside, 2 in place, 0 as the environment says.
+#[cfg(test)]
+static BESIDE_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests: the destination is guarded again between opening it and the read
+/// in place, as a copy on another thread can.
+#[cfg(test)]
+static REGUARD: AtomicBool = AtomicBool::new(false);
+
+/// How many times a refused write into the destination is tried again
+/// (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s in all; 0: none).
+fn retries() -> u32 {
+    static RETRIES: OnceLock<u32> = OnceLock::new();
+    *RETRIES.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(12)
+    })
+}
+
+fn backoff(tries: u32) -> std::time::Duration {
+    std::time::Duration::from_millis((2u64 << tries.min(6)).min(128))
+}
+
+/// ERROR_NOACCESS as an HRESULT: what the read in place failed with.
+const NOACCESS: HRESULT = 0x8007_03e6_u32 as HRESULT;
+
+/// Since the start: page-destination requests written on a later try, and
+/// given up.
+static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Since the start, writes into an address from a buffer: those that met a
+/// block guarded again after it was opened (a read in place would have
+/// failed there), those written on a later try, and those given up.
+static BUFFERED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Writes a request's bytes into its title address from user mode
+/// ([`victory_gpu::write_title_memory`]): a block guarded meanwhile faults
+/// into the guard and is opened and noted written. A destination with a
+/// page that cannot be written now (not committed, or read-only not by
+/// our hand) is tried again; the request fails only when the tries are used
+/// up.
+fn copy_in(request: &Request, data: &[u8]) -> Result<(), HRESULT> {
+    use victory_gpu::TitleWrite;
+    let at = request.destination as usize;
+    let mut tries = 0;
+    loop {
+        match victory_gpu::write_title_memory(at, data) {
+            TitleWrite::Written { reguarded } => {
+                // Said once per request that needed it, the first few and
+                // then at powers of two.
+                let counted = |i: usize| {
+                    let n = BUFFERED[i].fetch_add(1, Ordering::Relaxed) + 1;
+                    n <= 8 || n.is_power_of_two()
+                };
+                if (reguarded && counted(0)) | (tries > 0 && counted(1)) {
+                    tracing::info!(
+                        reguarded,
+                        tries,
+                        len = data.len(),
+                        met_guard = BUFFERED[0].load(Ordering::Relaxed),
+                        on_a_retry = BUFFERED[1].load(Ordering::Relaxed),
+                        given_up = BUFFERED[2].load(Ordering::Relaxed),
+                        "dstorage: a request's bytes written in from our buffer where a read in place would have failed"
+                    );
+                }
+                return Ok(());
+            }
+            TitleWrite::Refused { at: page, state, protect, kind } => {
+                if tries >= retries() {
+                    let given_up = BUFFERED[2].fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        page = format_args!("{page:#x}"),
+                        state = format_args!("{state:#x}"),
+                        protect = format_args!("{protect:#x}"),
+                        kind = format_args!("{kind:#x}"),
+                        tries,
+                        given_up,
+                        "dstorage: a destination page cannot be written (VICTORY_DSTORAGE_RETRIES)"
+                    );
+                    return Err(NOACCESS);
+                }
+                std::thread::sleep(backoff(tries));
+                tries += 1;
+            }
+        }
     }
 }
 
@@ -1537,6 +1681,79 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+    /// The failure of 2026-11-25: a raw request into a view whose block a
+    /// copy guards again after `kernel_will_write` opened it. Read in place
+    /// it fails with ERROR_NOACCESS; read beside it lands, and the block is
+    /// reported written to the copies.
+    #[test]
+    fn raw_reads_into_a_view_guarded_again_land() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
+        const LEN: usize = 2 * PAGE;
+        // SAFETY: a pagefile section of two pages, mapped read-write; left
+        // mapped (other tests may still look at the guards).
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value
+        };
+        assert!(!view.is_null());
+        let bytes = pattern(LEN);
+        let (_dir, file) = file_with(&bytes);
+        let (queue, array) = (new_queue(0), status_array(1));
+        // Across the two blocks, as in the title's failures (1-45 KB).
+        let (at, n) = (PAGE - 1000, 1344 + 2000);
+        let run = || {
+            victory_gpu::test_guard(view as usize, LEN);
+            // SAFETY: inside the view.
+            let destination = unsafe { view.cast::<u8>().add(at) };
+            let r = request(0, destination.cast(), n, file, at as u64, n);
+            enqueue(queue, &r);
+            enqueue_status(queue, array, 0);
+            void(queue, 0x30);
+            wait(array, 0)
+        };
+        // SAFETY: the view's bytes, read only.
+        let seen = || unsafe { std::slice::from_raw_parts(view.cast::<u8>().add(at), n) }.to_vec();
+
+        // Before: read in place, the guard put back between the opening and
+        // the read.
+        BESIDE_TEST.store(2, Ordering::Relaxed);
+        REGUARD.store(true, Ordering::Relaxed);
+        let before = run();
+        REGUARD.store(false, Ordering::Relaxed);
+        eprintln!("read in place, guarded again: {before:#010x}");
+        assert_eq!(before, NOACCESS);
+
+        // After: read beside, the guard put back at the same point.
+        BESIDE_TEST.store(1, Ordering::Relaxed);
+        victory_gpu::test_between(Some(|at, len| {
+            victory_gpu::test_guard(at, len);
+        }));
+        let after = run();
+        victory_gpu::test_between(None);
+        BESIDE_TEST.store(0, Ordering::Relaxed);
+        eprintln!("read beside, guarded again: {after:#010x}");
+        assert_eq!(after, S_OK);
+        assert_eq!(seen(), bytes[at..at + n]);
+        let met = BUFFERED[0].load(Ordering::Relaxed);
+        assert!(met >= 1, "the guard put back was met ({met})");
+        // The copies see both blocks written (each 64 KiB block is one page).
+        let first = view as usize / PAGE;
+        assert_eq!(
+            victory_gpu::test_guard(view as usize, LEN),
+            Some(vec![first, first + 1])
+        );
+    }
+
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;

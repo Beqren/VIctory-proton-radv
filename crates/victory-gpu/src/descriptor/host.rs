@@ -99,8 +99,9 @@ pub(crate) struct HostHeap {
 /// Views of one span with different descriptions (the formats of one
 /// family, say) are one texture's, and so are views of one description at
 /// one start that show more and fewer of its mips.
-/// Which older views a newer one makes stale is the [`Rule`]'s: by default
-/// only those that start where it does, so spans may overlap.
+/// Which older views a newer one makes stale is the [`Rule`]'s ([`stale_rule`]):
+/// none by default; under the 4 KiB rule only those that start where it
+/// does, so spans may overlap.
 /// No host heap is needed, so it is tested without one.
 #[derive(Default)]
 pub(crate) struct Spans {
@@ -118,7 +119,7 @@ pub(crate) struct Spans {
 /// (from victory-fork 310c6eb, written anew on this fork's spans).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Rule {
-    /// When it starts where the older one starts: at the same address
+    /// When it starts where the older one starts (`VICTORY_STALE_TEXTURES=start`): at the same address
     /// with another length or description, or within [`HEAD`] bytes of
     /// it. No two textures share the block their smallest mips are in. A
     /// view that only reaches into the memory an older texture's larger
@@ -131,15 +132,15 @@ pub(crate) enum Rule {
     /// stale in three minutes of the opening, 13,523 of them by a view
     /// that starts 4 KiB or more away (2026-11-25, run 1), and the main
     /// character's face and neck were black in every captured close-up of
-    /// four runs; with no view ever made stale (`VICTORY_STALE_TEXTURES=0`)
-    /// the face was there (run f2).
+    /// four runs; with no view ever made stale the face was there (run
+    /// f2), and under this rule it was black again (run f4: [`stale_rule`]).
     #[default]
     Start,
     /// Whenever their spans overlap: the rule before.
     /// `VICTORY_STALE_TEXTURES=overlap`.
     Overlap,
     /// Never; a view that would be stale under [`Rule::Overlap`] is left
-    /// out of the spans instead. `VICTORY_STALE_TEXTURES=0`.
+    /// out of the spans instead. The default ([`stale_rule`]).
     Never,
 }
 
@@ -161,9 +162,10 @@ impl Spans {
     fn overlapping(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         // Under [`Rule::Overlap`] the spans of one start are one texture's,
         // and no other texture's reaches over it: only those of the start
-        // before may reach here. Under the others spans overlap: the
+        // before may reach here (under [`Rule::Never`] a view that would
+        // overlap is left out). Under [`Rule::Start`] spans overlap: the
         // spans of the last 16 starts before are looked at.
-        let starts = if self.rule == Rule::Overlap { 1 } else { 16 };
+        let starts = if self.rule == Rule::Start { 16 } else { 1 };
         let mut before: Vec<u64> = Vec::new();
         for (&(at, _), _) in self.spans.range(..(start, 0)).rev() {
             if before.last() != Some(&at) {
@@ -324,15 +326,28 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 pub(crate) static STALE_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// When a view the title writes makes older views of other memory stale
-/// ([`Rule`]): where it starts within 4 KiB of theirs, by default;
-/// `VICTORY_STALE_TEXTURES=0`: never; `VICTORY_STALE_TEXTURES=overlap`:
-/// wherever their spans overlap, the rule before.
+/// ([`Rule`]): never, by default; `VICTORY_STALE_TEXTURES=start`: where it
+/// starts within 4 KiB of theirs; `VICTORY_STALE_TEXTURES=overlap` (or
+/// `1`): wherever their spans overlap, the rule before.
+///
+/// Captures of the opening cutscene's close-ups of the main character
+/// (2026-11-25, `VICTORY_CAPTURE_EVERY=1`): under the overlap rule her face
+/// and neck were black in every one of five runs, under the 4 KiB rule in
+/// the one run made with it (42,974 slots made stale, all by a view that
+/// starts within 4 KiB), and with no view made stale the face was drawn
+/// (run f2, a diagnostics build with `VICTORY_NULL_MAGENTA=1`). Which views
+/// at one start the title writes for one texture is not known yet.
+/// shortcut: a texture the title streams out keeps the slot's old host
+/// copy until the slot is written again.
+/// (The tests keep the 4 KiB rule: they are about it.)
 fn stale_rule() -> Rule {
     static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
+        Ok("start") => Rule::Start,
+        Ok("overlap" | "1") => Rule::Overlap,
         Ok("0") => Rule::Never,
-        Ok("overlap") => Rule::Overlap,
-        _ => Rule::Start,
+        _ if cfg!(test) => Rule::Start,
+        _ => Rule::Never,
     })
 }
 

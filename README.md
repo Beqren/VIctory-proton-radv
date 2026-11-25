@@ -12,9 +12,10 @@ State on that machine (2026-11-25, Series X profile): the prologue's cutscene an
 the first room are drawn, with the player moving, at 2 to 3 frames per second.
 Runs of 8 minutes mostly end without a device loss; one ended with
 `DXGI_ERROR_DEVICE_HUNG` after about 5 and a half minutes, cause unknown. Lamps
-were dark in one run. The room's walls were missing in two others, one before a fix
-that is here (the early pipeline list) and one with changes that are not. Ray-traced
-light does not run.
+were dark in one run. The first room's walls were missing in several runs; with the
+guard over all the views of a page (below) they were there in two runs out of two,
+too few to call it fixed. Some shots of the opening cutscene come out white.
+Ray-traced light does not run.
 
 What it changes over `victory-fork` (each is explained in a comment where it is):
 
@@ -28,13 +29,22 @@ What it changes over `victory-fork` (each is explained in a comment where it is)
 - DirectStorage requests read their page array when they run, and wait for it.
 - The list of pipelines to make early keeps what earlier runs listed, and compute
   pipelines get their own waiting time while a world loads.
+- A write of the title's through one view of a physical page is seen by the copies
+  taken through its other views (`VICTORY_VIEW_GUARD=0` turns it off).
+- Textures picked by index are looked at again after their upload
+  (`VICTORY_HEAP_RECHECK=0` turns it off).
 - View indices past the host heap are clamped on AMD too.
 - Programs that stop the AMD driver's compiler, or take it minutes and tens of GB,
   are left out (ray-tracing resolves).
 - Diagnostics: `VICTORY_NULL_MAGENTA`, `victory warm`, more captures.
 
-Parts of it were prompted by pull requests and issues of VIctory and victory-fork;
-the code was written anew. Developed with [Claude Code](https://claude.com/claude-code).
+The guard over all the views of a page is code of
+[victory-fork #115](https://github.com/fxceless/victory-fork/pull/115) by Spexivus
+with [its correction](https://github.com/Spexivus/victory-fork/pull/1) by joroyt and
+a part of [VIctory #1122](https://github.com/Marvisak/VIctory/pull/1122) by tightfall,
+adapted here. The second look at textures is fxceless's idea (victory-fork `a803c87`),
+written anew. Other parts were prompted by pull requests and issues of VIctory and
+victory-fork, and their code was written anew. Developed with [Claude Code](https://claude.com/claude-code).
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from

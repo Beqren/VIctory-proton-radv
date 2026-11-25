@@ -759,25 +759,71 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, #[allow(dead_code)] Held);
+
+/// Diagnostics: how long [`MAPPING`] is held, alone by the runtime
+/// (`write`) or shared by reads in place; counted when dropped.
+pub struct Held {
+    #[cfg(feature = "diagnostics")]
+    since: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    write: bool,
+}
+
+impl Held {
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn new(write: bool, waiting: Option<std::time::Instant>) -> Self {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let us = waiting.map_or(0, |w| w.elapsed().as_micros() as u64);
+            if write {
+                add(C::RemapCalls, 1);
+                add(C::RemapWaitUs, us);
+            } else {
+                add(C::ReadingCalls, 1);
+                add(C::ReadingWaitUs, us);
+            }
+        }
+        Held {
+            #[cfg(feature = "diagnostics")]
+            since: std::time::Instant::now(),
+            #[cfg(feature = "diagnostics")]
+            write,
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Held {
+    fn drop(&mut self) {
+        use crate::copystat::{C, add};
+        let us = self.since.elapsed().as_micros() as u64;
+        add(if self.write { C::RemapHeldUs } else { C::ReadingHeldUs }, us);
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let waiting = cfg!(feature = "diagnostics").then(std::time::Instant::now);
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    Remapping(guard, Held::new(true, waiting))
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>, #[allow(dead_code)] Held);
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    let waiting = cfg!(feature = "diagnostics").then(std::time::Instant::now);
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    Reading(guard, Held::new(false, waiting))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -785,8 +831,8 @@ pub fn title_memory_reading() -> Reading {
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading(guard, Held::new(false, None))),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner(), Held::new(false, None))),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }

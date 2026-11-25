@@ -117,7 +117,7 @@ fn cpu_of(thread: HANDLE) -> (u64, u64) {
 /// id. Printed in one write, to disturb the threads that log the least.
 fn sample(start: std::time::Instant, last: &mut std::collections::HashMap<u32, (u64, u64, u64)>) {
     use std::fmt::Write;
-    const FRAMES: usize = 14;
+    const FRAMES: usize = 20;
     let ids = other_threads();
     let mut text = String::with_capacity(16 << 10);
     let _ = writeln!(
@@ -128,6 +128,7 @@ fn sample(start: std::time::Instant, last: &mut std::collections::HashMap<u32, (
         PHASE.get().map(|f| f()).unwrap_or_default()
     );
     let mut seen = std::collections::HashMap::with_capacity(ids.len());
+    let mut words = vec![0u64; SCAN];
     for id in ids {
         // SAFETY: opens a thread of our own process.
         let thread = unsafe {
@@ -137,7 +138,7 @@ fn sample(start: std::time::Instant, last: &mut std::collections::HashMap<u32, (
             continue;
         }
         let (user, kernel) = cpu_of(thread);
-        let (mut frames, _) = frames_of(thread);
+        let mut frames = scanned_of(thread, &mut words);
         frames.truncate(FRAMES);
         let hash = frames.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &f| (h ^ f).wrapping_mul(0x100_0000_01b3));
         let (u0, k0, h0) = last.get(&id).copied().unwrap_or((user, kernel, 0));
@@ -145,7 +146,14 @@ fn sample(start: std::time::Instant, last: &mut std::collections::HashMap<u32, (
         if hash == h0 && user == u0 && kernel == k0 {
             let _ = writeln!(text, "  = {id}");
         } else {
-            let names: Vec<String> = frames.iter().map(|&pc| locate(pc as usize)).collect();
+            let (title, size) = TITLE.get().copied().unwrap_or((0, 0));
+            let names: Vec<String> = frames
+                .iter()
+                .map(|&pc| match pc as usize {
+                    pc if pc > title && pc < title + size => format!("title+{:#x}", pc - title),
+                    pc => locate(pc),
+                })
+                .collect();
             let _ = writeln!(
                 text,
                 "  t {id} \"{}\" ran {}+{} us: {}",
@@ -160,6 +168,101 @@ fn sample(start: std::time::Instant, last: &mut std::collections::HashMap<u32, (
     }
     *last = seen;
     eprint!("{text}");
+}
+
+/// Stack words a sample reads above a thread's stack pointer.
+const SCAN: usize = 2048;
+
+/// The title's image (base, size), for the samples to tell its return
+/// addresses on a stack.
+static TITLE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+/// Tells the samples where the title's image lies.
+pub fn set_stack_title(base: usize, size: usize) {
+    let _ = TITLE.set((base, size));
+}
+
+/// Our own image (base, size).
+fn own_image() -> (usize, usize) {
+    static OWN: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *OWN.get_or_init(|| {
+        // SAFETY: our own loaded image's headers.
+        unsafe {
+            let base = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()) as usize;
+            let pe = base + (*((base + 0x3c) as *const u32)) as usize;
+            // The optional header follows the 4-byte signature and the
+            // 20-byte file header; SizeOfImage is at 56 into it.
+            (base, *((pe + 24 + 56) as *const u32) as usize)
+        }
+    })
+}
+
+/// A thread's instruction pointer, then the words on its stack (within its
+/// bounds, at most [`SCAN`]) that point into our image or the title's: the
+/// return addresses among them, and some stale ones. Not unwound: the
+/// unwinder faulted on a sampled thread's context (run 1 of the frame study,
+/// reading 0x8 in `RtlVirtualUnwind`), and the stack words can only be read.
+fn scanned_of(thread: HANDLE, words: &mut [u64]) -> Vec<u64> {
+    let mut frames = Vec::with_capacity(16);
+    let mut info: BasicInfo = BasicInfo {
+        exit_status: 0,
+        teb: std::ptr::null(),
+        client_id: [0; 2],
+        affinity: 0,
+        priority: 0,
+        base_priority: 0,
+    };
+    // SAFETY: writes `info`, whose layout and size are the system's.
+    let status = unsafe {
+        NtQueryInformationThread(
+            thread,
+            ThreadBasicInformation,
+            (&raw mut info).cast(),
+            size_of::<BasicInfo>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 || info.teb.is_null() {
+        return frames;
+    }
+    // SAFETY: the TEB of a live thread of this process (NT_TIB: stack base
+    // at +8, limit at +0x10).
+    let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
+    // SAFETY: zeroed is a valid CONTEXT.
+    let mut context = Aligned(unsafe { std::mem::zeroed() });
+    context.0.ContextFlags = CONTEXT_FULL_AMD64;
+    let mut n = 0;
+    // SAFETY: suspends, reads and resumes a thread that is not this one;
+    // between them only its committed stack (rsp up to its base) is read,
+    // into memory allocated beforehand.
+    unsafe {
+        if SuspendThread(thread) == u32::MAX {
+            return frames;
+        }
+        if GetThreadContext(thread, &mut context.0) != 0 {
+            let rsp = context.0.Rsp as usize & !7;
+            if rsp >= low && rsp < high {
+                n = ((high - rsp) / 8).min(words.len());
+                std::ptr::copy_nonoverlapping(rsp as *const u64, words.as_mut_ptr(), n);
+            }
+        } else {
+            context.0.Rip = 0;
+        }
+        ResumeThread(thread);
+    }
+    frames.push(context.0.Rip);
+    let (own, own_size) = own_image();
+    let (title, title_size) = TITLE.get().copied().unwrap_or((0, 0));
+    for &w in &words[..n] {
+        let w = w as usize;
+        if (w > own && w < own + own_size) || (w > title && w < title + title_size) {
+            frames.push(w as u64);
+            if frames.len() >= 32 {
+                break;
+            }
+        }
+    }
+    frames
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).

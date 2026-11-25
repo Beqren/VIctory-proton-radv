@@ -136,6 +136,7 @@ pub fn run(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::set_stack_phase(victory_hle::frame_phase);
+    victory_loader::set_stack_title(image.base() as usize, image.info().size_of_image as usize);
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);

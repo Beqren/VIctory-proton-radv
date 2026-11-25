@@ -160,9 +160,18 @@ pub(crate) enum C {
     /// in submissions and in list calls are counted elsewhere; these are
     /// the title's frame waits that fall in it.
     UntilRecordPaceUs,
+    /// The lock over title memory's mappings (`watch::MAPPING`): taken
+    /// alone by the runtime to remap, and shared by reads in place; how
+    /// many times, microseconds waited, microseconds held (summed).
+    RemapCalls,
+    RemapWaitUs,
+    RemapHeldUs,
+    ReadingCalls,
+    ReadingWaitUs,
+    ReadingHeldUs,
 }
 const COUNTERS: usize = 96;
-const _: () = assert!((C::UntilRecordPaceUs as usize) < COUNTERS);
+const _: () = assert!((C::ReadingHeldUs as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1232,7 +1241,8 @@ pub(crate) fn log(frames: f64) {
          {:.2} ms {:.1} MB; journal lock waited {:.2} ms; guards: {:.0} VirtualProtect {:.2} ms, {:.0} \
          queries {:.2} ms, lock waited {:.2} ms, {:.2} ms in the fault handler; submission lock waited \
          {:.2} ms; from a present to the first list call the process ran {:.1} ms (all threads), \
-         {:.1} ms of the title's frame waits fell in it",
+         {:.1} ms of the title's frame waits fell in it; title memory's mapping lock: {:.0} remaps \
+         waited {:.1} ms held {:.1} ms, {:.0} reads in place waited {:.1} ms held {:.1} ms",
         c[C::KernelCalls as usize],
         ms(c[C::KernelUs as usize]),
         mb(c[C::KernelBytes as usize]),
@@ -1249,6 +1259,12 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::SubmitLockUs as usize]),
         ms(c[C::UntilRecordCpuUs as usize]),
         ms(c[C::UntilRecordPaceUs as usize]),
+        c[C::RemapCalls as usize],
+        ms(c[C::RemapWaitUs as usize]),
+        ms(c[C::RemapHeldUs as usize]),
+        c[C::ReadingCalls as usize],
+        ms(c[C::ReadingWaitUs as usize]),
+        ms(c[C::ReadingHeldUs as usize]),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

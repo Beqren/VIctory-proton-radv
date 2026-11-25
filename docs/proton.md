@@ -13,9 +13,10 @@ counts appear here.
 
 The title boots, reaches the world and renders part of it. On the stock Proton a
 world frame took 2 to 3 s (0.3 to 0.5 frames a second); on the Proton with the
-patched wineserver (below) it took about 1 s in the first runs, and 324 ms in the
-first 30 s of the world of one run. **It is not playable.** No run has been
-tested past ten minutes.
+patched wineserver (below) it took about 1 s in the first runs and, with the later
+fixes, 350 to 400 ms (2.5 to 3 frames a second: medians of 349, 373 and 401 ms in
+three runs of six to ten minutes, measured on one machine). **It is not playable.**
+No run has been tested past ten minutes.
 
 - Ray tracing is off on purpose (see "Ray tracing"). Most of the draws a
   diagnostics build reports as dropped are ray-tracing passes. Ignore those.
@@ -265,7 +266,9 @@ Two fixes:
   end workers, and remembers what ended a worker by its whole set of shaders.
 - Commit 6b1d840: the cause. The converter's recursion was in
   `CFGNode::find_common_dominator` and `recompute_immediate_dominator`, on a loop
-  with two back edges (a `continue`). DXC writes loops with one latch only, so
+  with two back edges (a `continue`); in a synthetic shader it needs a wave
+  shuffle (`WaveReadLaneAt`) in the same program as well, and the same shader
+  without the shuffle converts. DXC writes loops with one latch only, so
   every loop now gets one (`Module::one_latch`): the blocks that branched back
   branch to a new block that joins what each brought and branches back alone. The
   program does the same either way. With one latch the three convert and their

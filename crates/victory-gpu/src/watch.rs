@@ -770,7 +770,8 @@ fn protect_views_of(g: &mut Guards, block: usize) {
 /// Whether a write of ours (the copy-back's, a title copy at submission,
 /// the runtime's kernel reads: [`writing`]) opens only the view it goes
 /// through, leaving the other views of the same pages read-only and only
-/// noting them written (taken out of `clean`) (`VICTORY_OPEN_ONE_VIEW=1`).
+/// noting them written (taken out of `clean`). On by default;
+/// `VICTORY_OPEN_ONE_VIEW=0` opens every view, as before.
 ///
 /// Why: such a write needs one view writable, and the copy-back makes most
 /// of them. Run 1 of the preparing study (late world lines, diagnostics
@@ -780,6 +781,17 @@ fn protect_views_of(g: &mut Guards, block: usize) {
 /// ~5,600 of those read-only again (4.2 ms) besides ~1,300 calls for the
 /// blocks themselves, in 15 ms a frame of guarding again; the fault handler
 /// waited 40-45 ms a frame (title threads) for the guards' lock meanwhile.
+///
+/// Measured (diagnostics build, viewtree Proton, off-screen, medians of the
+/// last 15 frame lines; baseline run of integrate/batch4 against run 2 with
+/// the switch): `VirtualProtect` 13,750 calls 17.2 ms a frame (all threads)
+/// against 3,340 13.1 ms; at other views 5,650 against 470; opening 7,000
+/// against 1,670; guarding again in the refreshes 15 ms (run 1) against
+/// 6.7; the refreshes' guard time 25.8 against 20.5 ms; "copies" 60.6
+/// against 53.6 ms, preparing 136.7 against 130.2, copying back 77.8
+/// against 73.3; frame 357 against 347 ms (within the runs' noise). Blocks
+/// reported written (~1,900 a frame) and bytes copied (~215 MB) did not
+/// change: the same writes are seen.
 ///
 /// What it still guarantees: a block noted clean is read-only at every
 /// view of its page (pages of 2 to [`MANY_VIEWS`] views), so a title write
@@ -792,7 +804,7 @@ fn protect_views_of(g: &mut Guards, block: usize) {
 /// together.
 fn one_view() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_none_or(|v| v != "0"))
 }
 
 /// Views of one page past which its views are not guarded together.

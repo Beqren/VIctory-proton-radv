@@ -211,8 +211,11 @@ fn card_for(size: u64) -> Result<ID3D12Resource, Refused> {
     // queue's own rule (`resource::room`: nine tenths of the budget) counts
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // Or within a reserve of their own that the textures leave free
+    // ([`card_reserve`]), as long as the card stays within its budget.
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
+        && !(CARD_BYTES[0].load(Ordering::Relaxed) + size <= card_reserve() && used + size <= budget)
     {
         return Err(Refused::Room { budget, used });
     }
@@ -225,6 +228,38 @@ fn card_for(size: u64) -> Result<ID3D12Resource, Refused> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
     buffer.ok_or(Refused::NoBuffer)
+}
+
+/// Bytes of the card's budget kept for copies of title buffers on the card
+/// (`VICTORY_CARD_BUFFERS_RESERVE_MB`; 0, the default, none): the texture
+/// queue's rules (`resource::room`, `resource::reserve_room`) count what of
+/// it the copies have not taken yet as in use, and [`card_for`] makes a
+/// copy past four fifths of the budget while the copies' bytes stay within
+/// it (and the card within its budget).
+///
+/// Why: copies are made when a buffer is first used, and in the world that
+/// is after the textures have filled the card. Run 1 of the copy-back study
+/// (2026-11-25, viewtree Proton, diagnostics, `VICTORY_CARD_BUFFERS_MIN_MB=1`,
+/// late prologue frames): of the copies whose shaders' writes were looked
+/// for on the CPU, 71 of 1 MiB or more (619 MB, the largest 90, 50, 36,
+/// 25 MB) were all refused for room, made with the card at 94-99% of its
+/// budget (12.4-12.9 of 12.4-13.6 GB in use); 309 more were under the
+/// floor (28 MB together); none met the cap. Only the 174 MB heap, made
+/// before the textures, was on the card. Those copies cost 744 MB of
+/// snapshots (~50 ms a frame) and of compares on the CPU (~29 ms) a frame.
+pub(crate) fn card_reserve() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        if !cards() {
+            return 0;
+        }
+        std::env::var("VICTORY_CARD_BUFFERS_RESERVE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// What of [`card_reserve`] the copies on the card have not taken yet.
+pub(crate) fn card_reserve_left() -> u64 {
+    card_reserve().saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
 }
 
 /// Why [`card_for`] gave a copy no card side.
@@ -1298,6 +1333,19 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+/// Threads kept for [`wide`]: a quarter of the processor's, 2 to 6, unless
+/// `VICTORY_WIDE_THREADS` says how many (1 to 32). The submitting thread's
+/// snapshots and the relay thread's compares share them.
+fn wide_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6), |n| n.clamp(1, 32))
+    })
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1306,7 +1354,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");

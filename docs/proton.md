@@ -612,7 +612,24 @@ Replay (5f74661: `formula_replay`, an ignored Windows test run under Proton with
   depends on how lanes form waves.
 - `VICTORY_FORMULA_WARP=1` gave the same numbers as the hardware. Unverified that
   WARP really ran: vkd3d-proton may not have a WARP adapter.
-- Open: a stale read that no fence or coherence flag changes. Either the CPU model
+- Solved (4a10989, next item). Running one dispatch a stage (each thread's list
+  cut to stage k, `VICTORY_FORMULA_SPLIT`) matches the model in every register
+  and output after every stage, so the model is right. Reading the 16-bit
+  elements through the slot's raw view (`rawBufferLoad` on the same heap index)
+  instead of the typed view makes the single dispatch match too, at every stage.
+  On RADV through vkd3d-proton, a typed (texel-buffer) load after a group barrier
+  can return a value from before another wave's store that came before the
+  barrier. Raw (storage-buffer) loads see the store. Fix: in compute programs
+  that store to UAVs and use `s_barrier`, 16-bit integer typed loads (`_d16` of
+  1, 2 or 4 channels) also load the raw view. The table-by-slot word chooses at
+  run time: only views marked integer with 2, 4 or 8 bytes an element take the
+  raw value. `VICTORY_RAW_TYPED_LOADS=0` turns it off. With it and the table slot
+  words (now on by default, 514441e), run confirm3 shows whole faces that speak:
+  lips and jaw intact, teeth inside, the heroine's eyes normal
+  (/tmp/victory-faceref/cap3, frames 1098, 1116, 1170). For upstream: they have
+  the same bug in the same place; what to report is the Formula program, its
+  replay, and the raw-view loads.
+- Was open: a stale read that no fence or coherence flag changes. Either the CPU model
   misreads which stage an instruction belongs to, or a wave passes the barrier
   before another has finished its stores. Next: an exact console emulator of these
   ~150 instructions on the dump, as the referee, or the per-stage split (one

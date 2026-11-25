@@ -1006,20 +1006,20 @@ fn integer_format(format: u32) -> Option<bool> {
 }
 
 /// Whether the slots a draw's table copies are made in (dynamic slots) get
-/// their words in the table by slot (`VICTORY_TABLE_SLOT_WORDS=1`; off by
-/// default; always in tests). With it the 16-bit integer path reaches the
-/// face network (`compute_graph_ops`, bound through tables): in run face-4
-/// (2026-11-25) its output came alive, 196,000-267,000 of 532,480 halves
-/// not zero and changing every frame where it had been all zero, and faces
-/// moved, but grossly: mouths agape, lips and jaw torn out of shape. Some
-/// other stage of the network or its inputs is still wrong, and the still,
-/// neutral faces look better until it is found.
+/// their words in the table by slot (on; `VICTORY_TABLE_SLOT_WORDS=0` turns
+/// it off; always in tests). With it the 16-bit integer path reaches the
+/// face network (`compute_graph_ops`, bound through tables): its output
+/// came alive (run face-4, 2026-11-25), but the faces were torn until the
+/// network's Formula program read its register file through raw views
+/// (`victory-shader`, `raw_typed_loads_on`): run confirm3, faces whole and
+/// speaking, eyes normal. Without it the faces are still and neutral and the
+/// eyes glow.
 fn table_slot_words() -> bool {
     if cfg!(test) {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_SLOT_WORDS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_SLOT_WORDS").is_none_or(|v| v != "0"))
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for

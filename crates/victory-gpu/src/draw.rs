@@ -671,29 +671,77 @@ pub(crate) fn zero_root() -> Option<u64> {
 /// A root constant or shader view `param` that has no host copy (the
 /// title's address `address`, 0 if it set none) reads zeros instead of
 /// whatever the list held ([`null_roots_on`]).
-fn bind_null_root(l: &ID3D12GraphicsCommandList, param: u32, compute: bool, srv: bool, slot: u8, address: u64) {
+/// What a root view bound to zeros ([`bind_null_root`]) lacked.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum NullRoot {
+    /// The title set no view at that slot.
+    NeverSet,
+    /// The title's address has no host copy.
+    NoCopy,
+    /// The host address came out below 1 MiB.
+    NearZero,
+    /// Our own view (the title-memory directory, the stride table, the
+    /// fault marks) was not there.
+    Ours,
+}
+
+/// The kind of root view a parameter is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum RootKind {
+    Constant,
+    Shader,
+    Unordered,
+}
+
+/// The first such binding per pipeline, parameter, side and cause, logged.
+static NULL_ROOT_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(String, u32, bool, NullRoot)>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether the host address `gpu` a root view would get is one ([`NullRoot::NearZero`]
+/// below it is not).
+pub(crate) fn root_address_ok(gpu: u64) -> bool {
+    gpu >= 1 << 20
+}
+
+/// A root view `param` of pipeline `pipeline` that would read nothing of
+/// ours (`why`) reads zeros instead of whatever the list held: left unset
+/// or at 0 it is GPU address 0 plus the shader's offset, a read of nothing
+/// mapped ([`null_roots_on`]). Each pipeline, parameter, side and cause is
+/// logged once, with the count so far.
+fn bind_null_root(l: &ID3D12GraphicsCommandList, param: u32, compute: bool, kind: RootKind, pipeline: &str, slot: u8, address: u64, why: NullRoot) {
     if !null_roots_on() {
         return;
     }
     let Some(gpu) = zero_root() else {
         return;
     };
-    if NULL_ROOTS.fetch_add(1, Ordering::Relaxed) == 0 {
-        tracing::warn!(
-            slot,
-            srv,
-            compute,
-            address = format_args!("{address:#x}"),
-            "a root view with no host copy behind it reads zeros (left unset it read address 0)"
-        );
+    let n = NULL_ROOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut seen = NULL_ROOT_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(Default::default);
+        if seen.len() < 500 && seen.insert((pipeline.to_owned(), param, compute, why)) {
+            tracing::warn!(
+                pipeline,
+                param,
+                slot,
+                ?kind,
+                compute,
+                ?why,
+                address = format_args!("{address:#x}"),
+                count = n,
+                "a root view that would read nothing of ours reads zeros"
+            );
+        }
     }
     // SAFETY: an open list; a live buffer of ours.
     unsafe {
-        match (compute, srv) {
-            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+        match (compute, kind) {
+            (false, RootKind::Constant) => l.SetGraphicsRootConstantBufferView(param, gpu),
+            (false, RootKind::Shader) => l.SetGraphicsRootShaderResourceView(param, gpu),
+            (false, RootKind::Unordered) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+            (true, RootKind::Constant) => l.SetComputeRootConstantBufferView(param, gpu),
+            (true, RootKind::Shader) => l.SetComputeRootShaderResourceView(param, gpu),
+            (true, RootKind::Unordered) => l.SetComputeRootUnorderedAccessView(param, gpu),
         }
     }
 }
@@ -1259,16 +1307,17 @@ impl State {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
-                        if let Some(m) = &memory {
+                        match &memory {
                             // SAFETY: an open list; the directory lives as
                             // long as the process and the list holds it.
-                            unsafe {
+                            Some(m) => unsafe {
                                 if compute {
                                     l.SetComputeRootShaderResourceView(param, m.directory);
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
                                 }
-                            }
+                            },
+                            None => bind_null_root(l, param, compute, RootKind::Shader, &p.name, slot, 0, NullRoot::Ours),
                         }
                         continue;
                     }
@@ -1285,7 +1334,10 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set");
+                                bind_null_root(l, param, compute, RootKind::Shader, &p.name, slot, 0, NullRoot::Ours);
+                            }
                         }
                         continue;
                     }
@@ -1298,7 +1350,7 @@ impl State {
                             return false;
                         }
                         if !tabled {
-                            bind_null_root(l, param, compute, srv, slot, 0);
+                            bind_null_root(l, param, compute, if srv { RootKind::Shader } else { RootKind::Constant }, &p.name, slot, 0, NullRoot::NeverSet);
                         }
                         continue;
                     };
@@ -1315,7 +1367,7 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
-                        bind_null_root(l, param, compute, srv, slot, address);
+                        bind_null_root(l, param, compute, if srv { RootKind::Shader } else { RootKind::Constant }, &p.name, slot, address, NullRoot::NoCopy);
                         continue;
                     };
                     if biased {
@@ -1326,6 +1378,10 @@ impl State {
                             0,
                             None,
                         ));
+                    }
+                    if !root_address_ok(gpu) {
+                        bind_null_root(l, param, compute, if srv { RootKind::Shader } else { RootKind::Constant }, &p.name, slot, address, NullRoot::NearZero);
+                        continue;
                     }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -1341,16 +1397,17 @@ impl State {
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
-                    if let Some(m) = &memory {
+                    match &memory {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process and the list holds it.
-                        unsafe {
+                        Some(m) => unsafe {
                             if compute {
                                 l.SetComputeRootUnorderedAccessView(param, m.faults);
                             } else {
                                 l.SetGraphicsRootUnorderedAccessView(param, m.faults);
                             }
-                        }
+                        },
+                        None => bind_null_root(l, param, compute, RootKind::Unordered, &p.name, slot, 0, NullRoot::Ours),
                     }
                     continue;
                 }
@@ -4268,4 +4325,21 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod null_root_tests {
+    use super::root_address_ok;
+
+    /// A host address below 1 MiB is no view of ours: GPU address 0 plus
+    /// an offset, as the scalar reads at 0x0, 0xb000 and 0x41000 of runs
+    /// grave-10, ports/run1 and armB-1 were.
+    #[test]
+    fn near_zero_addresses_are_not_views() {
+        for gpu in [0u64, 0xb000, 0x41000, (1 << 20) - 1] {
+            assert!(!root_address_ok(gpu), "{gpu:#x}");
+        }
+        assert!(root_address_ok(1 << 20));
+        assert!(root_address_ok(0x8002_88ac_4000));
+    }
 }

@@ -643,7 +643,7 @@ pub(crate) static NULL_ROOTS: AtomicU64 = AtomicU64::new(0);
 /// address 0: the shader's scalar loads read GPU address 0 plus their
 /// offset. Runs grave-10 and ports/run1 (2026-11-25) lost the device on a
 /// read by the scalar cache (SQC data) at 0x0 and 0xb000.
-fn null_roots_on() -> bool {
+pub(crate) fn null_roots_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_ROOTS").is_none_or(|v| v != "0"))
 }
@@ -651,7 +651,7 @@ fn null_roots_on() -> bool {
 /// The buffer of zeros a root view with nothing behind it reads
 /// (4 MiB: a root view has no size, and reads past its start by offsets
 /// the title computes).
-fn zero_root() -> Option<u64> {
+pub(crate) fn zero_root() -> Option<u64> {
     // A failure is not kept: the next call tries again (review finding).
     static ZERO: std::sync::OnceLock<(ID3D12Resource, u64)> = std::sync::OnceLock::new();
     if let Some(z) = ZERO.get() {

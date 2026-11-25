@@ -247,6 +247,15 @@ fn card_for(size: u64) -> Result<ID3D12Resource, Refused> {
 /// floor (28 MB together); none met the cap. Only the 174 MB heap, made
 /// before the textures, was on the card. Those copies cost 744 MB of
 /// snapshots (~50 ms a frame) and of compares on the CPU (~29 ms) a frame.
+///
+/// Measured (run 3 against run 1, same diagnostics build and settings, late
+/// prologue frames, with 1024): 97 copies on the card, 941 MB (from 1, 174
+/// MB: 767 MB more of the card's budget); snapshots 52-54 -> 1.6-1.7 ms a
+/// frame (752 -> 26 MB), finding the pieces 45-50 -> 0.9-1.0 ms; preparing
+/// 144-148 -> 92-96 ms, copying back 182-195 -> 126-131 ms; but on the GPU
+/// 96-104 -> 145-148 ms (125 MB sent up to the card sides and 100 MB of
+/// 1,540 pieces fetched a frame, against 18 and 3.6), and the frame did not
+/// move (median 251.6 -> 251.1 ms). Off until the frame gains.
 pub(crate) fn card_reserve() -> u64 {
     static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MB.get_or_init(|| {
@@ -1336,6 +1345,13 @@ struct Workers {
 /// Threads kept for [`wide`]: a quarter of the processor's, 2 to 6, unless
 /// `VICTORY_WIDE_THREADS` says how many (1 to 32). The submitting thread's
 /// snapshots and the relay thread's compares share them.
+///
+/// Measured (run 2 with 12 against run 1 with 4, on 16 processor threads):
+/// snapshots 52-54 ms a frame either way (memory-bound), finding the pieces
+/// 45-50 -> 32-42 ms, but preparing 144-148 -> 168-227 ms and frames
+/// noisier (204-287 ms; median 237 against 252, within the runs' noise);
+/// run 2 also lost the device once (0x887A0005, cause not known). Left at
+/// the default.
 fn wide_threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {

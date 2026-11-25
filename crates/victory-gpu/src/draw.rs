@@ -2176,7 +2176,19 @@ impl State {
         // made before it, read by a shader yet or not (make on first read
         // would give it a frame of nulls, baked in for good).
         crate::descriptor::host::ALL_DUE.set(bake);
-        if bake && crate::descriptor::host::evict_switch().0 {
+        // At most once in `UNEVICT_MS`: the bake draws several times in
+        // most frames, and putting every evicted slot back at each made the
+        // pass remake and the eviction let go tens of thousands again (run
+        // onread-5: 61,213 made again after an eviction, 44,916 within 10 s).
+        const UNEVICT_MS: u64 = 10_000;
+        static UNEVICTED: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let last = UNEVICTED.load(Ordering::Relaxed);
+        if bake
+            && crate::descriptor::host::evict_switch().0
+            && (last == 0 || now >= last + UNEVICT_MS)
+            && UNEVICTED.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
             host.texture_slots_unevict(frame);
         }
         self.heap_textures(list, heap, host);

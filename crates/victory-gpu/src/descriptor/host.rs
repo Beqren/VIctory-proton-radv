@@ -131,6 +131,12 @@ pub(crate) struct Spans {
     /// What the last [`Spans::note`] made stale: per slot, the span and
     /// resource description it had (for the listing, [`stale_list`]).
     gone: Vec<(u32, (u64, u64), [u32; 14])>,
+    /// Under [`Rule::Head`]: per span, a fingerprint of its first
+    /// [`HEAD`] bytes when it was noted, and what takes one (title memory
+    /// through the kernel, `crate::texture::fingerprint`; tests give their
+    /// own).
+    heads: std::collections::HashMap<(u64, u64), u64>,
+    print: Option<fn(u64, u64) -> u64>,
 }
 
 /// The frames a draw's asking for a slot counts ([`HostHeap::texture_slot_asked`]).
@@ -155,8 +161,28 @@ pub(crate) enum Rule {
     /// `VICTORY_STALE_TEXTURES=start` ([`stale_rule`]).
     #[default]
     Start,
-    /// Whenever their spans overlap: the default ([`stale_rule`]).
+    /// Whenever their spans overlap (`VICTORY_STALE_TEXTURES=overlap`; the
+    /// default before [`Rule::Head`]).
     Overlap,
+    /// When its span overlaps the older one's and the older texture's
+    /// first [`HEAD`] bytes (its smallest mips, which a title streams in
+    /// first and lets go last) are no longer what they were when its view
+    /// was noted: the older texture is gone from its memory
+    /// (the default, [`stale_rule`]). Spans may overlap.
+    ///
+    /// The listing of stale slots read later (`VICTORY_STALE_LIST=1`, run
+    /// room-3 of 2026-11-25): of the null slots the character programs
+    /// asked for by index, 51,280 slot-frames of 53,500 (first 16 words of
+    /// the record) and 220,787 of 352,000 (the other places) were stale,
+    /// none for want of room. Stale slots whose title descriptor was still
+    /// the old one, as listed: 150 of 150 were small textures (16x4 to
+    /// 32x16, one level) packed at 0x400 to 0x1000 steps inside the span of
+    /// a newer 1024x1024 BC1 view of nine levels that starts 0x3c000 to
+    /// 0xa3000 before them (no level clamp): the title places small
+    /// textures where a streamed texture's large mips would be. Their own
+    /// first 4 KiB had not changed in any (6,045 of the 54,419 stale slots
+    /// read later had, most of them rewritten since).
+    Head,
     /// Never; a view that would be stale under [`Rule::Overlap`] is left
     /// out of the spans instead. `VICTORY_STALE_TEXTURES=0`.
     Never,
@@ -183,7 +209,7 @@ impl Spans {
         // before may reach here (under [`Rule::Never`] a view that would
         // overlap is left out). Under [`Rule::Start`] spans overlap: the
         // spans of the last 16 starts before are looked at.
-        let starts = if self.rule == Rule::Start { 16 } else { 1 };
+        let starts = if matches!(self.rule, Rule::Start | Rule::Head) { 16 } else { 1 };
         let mut before: Vec<u64> = Vec::new();
         for (&(at, _), _) in self.spans.range(..(start, 0)).rev() {
             if before.last() != Some(&at) {
@@ -211,8 +237,12 @@ impl Spans {
                 .range((start.saturating_sub(HEAD - 1), 0)..(start.saturating_add(HEAD), 0))
                 .map(|(&span, _)| span)
                 .collect(),
-            Rule::Overlap | Rule::Never => self.overlapping(start, end),
+            Rule::Overlap | Rule::Never | Rule::Head => self.overlapping(start, end),
         };
+        if self.rule == Rule::Head {
+            // Only those whose smallest mips changed.
+            spans.retain(|span| self.head_changed(*span));
+        }
         spans.retain(|span| {
             let same = span.0 == start && (span.1 == end || self.spans.get(span).is_some_and(|s| s.0 == *desc));
             !same
@@ -239,6 +269,7 @@ impl Spans {
             if !newer {
                 return stale;
             }
+            self.heads.remove(&span);
             if let Some((old, slots)) = self.spans.remove(&span) {
                 self.gone.extend(slots.iter().map(|&slot| (slot, span, old)));
                 // Diagnostics: stale though the newer view starts 4 KiB or
@@ -252,9 +283,24 @@ impl Spans {
                 }
             }
         }
+        if self.rule == Rule::Head
+            && !self.spans.contains_key(&(start, end))
+            && let Some(print) = self.print
+        {
+            self.heads.insert((start, end), print(start, (end - start).min(HEAD)));
+        }
         self.spans.entry((start, end)).or_insert_with(|| (*desc, Default::default())).1.insert(index);
         self.by_slot.insert(index, (start, end));
         stale
+    }
+
+    /// Under [`Rule::Head`]: whether the first bytes of `span` changed
+    /// since it was noted.
+    fn head_changed(&self, span: (u64, u64)) -> bool {
+        match (self.print, self.heads.get(&span)) {
+            (Some(print), Some(&then)) => print(span.0, (span.1 - span.0).min(HEAD)) != then,
+            _ => false,
+        }
     }
 
     /// Slot `index` holds no placed texture view any more.
@@ -266,6 +312,7 @@ impl Spans {
             span.1.remove(&index);
             if span.1.is_empty() {
                 self.spans.remove(&at);
+                self.heads.remove(&at);
             }
         }
     }
@@ -503,11 +550,23 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 pub(crate) static STALE_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// When a view the title writes makes older views of other memory stale
-/// ([`Rule`]): wherever their spans overlap, by default;
-/// `VICTORY_STALE_TEXTURES=start`: where it starts within 4 KiB of theirs;
-/// `VICTORY_STALE_TEXTURES=0`: never. (Left at the overlap rule until a
-/// run under the patched Wine measures the 4 KiB rule; the two runs below
-/// were under the stock one. The tests are about the 4 KiB rule.)
+/// ([`Rule`]): by default where their spans overlap and the older one's
+/// first 4 KiB changed since it was noted ([`Rule::Head`]);
+/// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, as
+/// before; `=start`: where it starts within 4 KiB of theirs; `=0`: never.
+/// (The tests are about the 4 KiB rule unless they say otherwise.)
+///
+/// The head rule, runs room-3 (overlap) and room-4 (head) of 2026-11-25,
+/// 180 s of the opening, patched Wine: slots made stale 68,820 to 708;
+/// null slots the character programs asked for that were stale 51,280
+/// slot-frames (first 16 words of the record) to 0; slots asked for and
+/// missing 30 frames or more, summed over the frames, 7,626 to 2,624;
+/// world frame 357 to 344 ms (noise). In the diner shots the waitress's
+/// face, the hoodie, the shirts and the posters were black or dark under
+/// the overlap rule and are textured under the head rule (frames
+/// room-3/880-990 against room-4/1060-1170). The card holds more: 11.9
+/// GB of 12.5 at the end against 13.2 of 13.5 (the budget differs from run
+/// to run), 7.6 GB of placed textures' host copies against 6.7.
 ///
 /// The slot listing of the main character's head (`VICTORY_LIST_SLOTS`,
 /// 2026-11-25): under the overlap rule its 1024x1024 colour map (slot 40964
@@ -521,9 +580,10 @@ fn stale_rule() -> Rule {
     static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
     *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
         Ok("start") => Rule::Start,
+        Ok("overlap") => Rule::Overlap,
         Ok("0") => Rule::Never,
         _ if cfg!(test) => Rule::Start,
-        _ => Rule::Overlap,
+        _ => Rule::Head,
     })
 }
 
@@ -1933,6 +1993,7 @@ impl HostHeap {
                     SPANNED[1].fetch_max(end, Relaxed);
                     let rule = stale_rule();
                     placed.rule = rule;
+                    placed.print = Some(crate::texture::fingerprint);
                     placed.note(index, start, end, resource, !seen && rule != Rule::Never)
                 }
                 None => {
@@ -3781,6 +3842,26 @@ mod tests {
     }
 
     /// A resource description of its own for every span.
+    /// Under the head rule a newer view makes an older one of other memory
+    /// stale only once the older one's first bytes changed: small textures
+    /// packed where a newer streamed texture's large mips would be stay.
+    #[test]
+    fn under_the_head_rule_only_a_changed_head_makes_stale() {
+        static CHANGED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        fn print(at: u64, _: u64) -> u64 {
+            u64::from(CHANGED.lock().unwrap().contains(&at))
+        }
+        let mut spans = Spans { rule: Rule::Head, print: Some(print), ..Default::default() };
+        // Small textures at 0x10000 and 0x11000.
+        assert!(spans.note(1, 0x10000, 0x11000, &shape(0x10000, 0x11000), true).is_empty());
+        assert!(spans.note(2, 0x11000, 0x12000, &shape(0x11000, 0x12000), true).is_empty());
+        // A large texture before them whose span covers both: they stay.
+        assert!(spans.note(3, 0x8000, 0x20000, &shape(0x8000, 0x20000), true).is_empty());
+        // The second one's memory changed: the next view over it makes it stale.
+        CHANGED.lock().unwrap().push(0x11000);
+        assert_eq!(spans.note(4, 0x8000, 0x20000, &shape(0x8000, 0x20001), true), [2]);
+    }
+
     fn shape(start: u64, end: u64) -> [u32; 14] {
         let mut desc = [0; 14];
         (desc[0], desc[4], desc[6]) = (3, start as u32, end as u32);

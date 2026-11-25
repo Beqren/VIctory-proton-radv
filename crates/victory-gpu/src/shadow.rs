@@ -896,6 +896,20 @@ pub(crate) fn back_pages() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_PAGES").is_some_and(|v| v == "1"))
 }
 
+/// Whether what shaders wrote is written into title memory from user mode
+/// (`crate::watch::write_title_memory`) and not with the kernel's write
+/// (`VICTORY_BACK_USER=1`; off by default): see [`write_user`].
+///
+/// Measured on the viewtree Wine (2026-11-25, diagnostics, late world
+/// frames, with [`back_pages`]): the write 21 ms a frame in 1,790 kernel
+/// calls (77 MB) -> 13.6 ms with no kernel call (63 MB); "putting them
+/// back" 42 -> 37 ms, the frame line's copying back 75-79 -> 70-75 ms.
+/// The guards' opening (`crate::watch::writing`, 11.8 ms) is unchanged.
+pub(crate) fn back_user() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_USER").is_some_and(|v| v == "1"))
+}
+
 /// Merges `n` bytes that go to title address `address` page by page of
 /// title memory: `merge(lo, hi)` merges offsets `[lo, hi)` and says whether
 /// the result differs from the title's bytes there. The runs of pages that
@@ -927,6 +941,55 @@ fn read_title(address: usize, into: &mut [u8]) -> bool {
     read
 }
 
+/// [`back_user`]: writes `bytes` into title memory at `at` with a plain
+/// copy, after [`crate::watch::writing`] opened the guards there; false,
+/// with nothing written, where that cannot be done safely: the runtime is
+/// changing a mapping there (the lock is not waited for: the caller may
+/// hold another reading), or a page is not committed or not writable now
+/// (read-only for a reason not ours, or guarded again by a copy since the
+/// guards were opened). The kernel's write (`crate::host::write_mapped`)
+/// does those. A block a copy guards again between the look and the copy
+/// faults into the guards' handler, which opens it and notes it written,
+/// as for the title's own writes; write-watched pages see the write, as
+/// they see the kernel's.
+///
+/// Why: under Wine `NtWriteVirtualMemory` is a request to wineserver that
+/// carries the bytes (run of 2026-11-25 on the viewtree Wine, defaults: 1,790
+/// calls a frame for 77 MB took 21 ms, 12 us a call), and wineserver is the
+/// one thread every memory call of the process waits for.
+fn write_user(at: usize, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE, VirtualQuery,
+    };
+    let end = at + bytes.len();
+    let Some(_mapped) = crate::watch::title_memory_reading_now(at, bytes.len()) else {
+        return false;
+    };
+    let mut p = at;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & PAGE_GUARD != 0
+            || !matches!(info.Protect & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+        {
+            return false;
+        }
+        let stop = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if stop <= p {
+            return false;
+        }
+        p = stop;
+    }
+    // SAFETY: `[at, end)` is committed and was writable just now, and stays
+    // mapped while `_mapped` is held; a block guarded since faults into our
+    // handler, which opens it. `bytes` is our own memory.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+    true
+}
+
 /// Puts `merged` (the title's bytes at `address` with what shaders wrote
 /// put in) into title memory; `runs` ([`merged_runs`]) are the parts that
 /// differ from what title memory held. Returns the bytes written.
@@ -954,7 +1017,9 @@ fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
             crate::copystat::add(crate::copystat::C::BackOpenUs, opening.elapsed().as_micros() as u64);
             std::time::Instant::now()
         };
-        crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+        if !(back_user() && write_user(at, bytes)) {
+            crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackWriteUs, writing.elapsed().as_micros() as u64);
         written += bytes.len();

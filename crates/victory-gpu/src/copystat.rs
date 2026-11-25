@@ -200,6 +200,9 @@ pub(crate) enum C {
     JoinCould,
     JoinDone,
     JoinFailed,
+    /// Reads in place that met a change of mapping under way over their
+    /// range and waited for it (`VICTORY_MAP_RANGES=1`, `watch::Span`).
+    ReadingMet,
 }
 
 /// A mapping could join a neighbouring view (0), did (1), or failed to (2).
@@ -216,12 +219,14 @@ pub fn view_join(what: u8) {
 
 /// Views of physical pages the runtime has mapped now (a gauge, not a
 /// count per frame), and the most there were.
-static VIEWS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static VIEWS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// The runtime holds `n` views of physical pages now.
-pub fn views_alive(n: usize) {
+/// The runtime holds `n` views of physical pages now, `alias` of them
+/// mapped by the GPU's page-mapping copies (`map_alias`).
+pub fn views_alive(n: usize, alias: usize) {
     VIEWS[0].store(n as u64, Relaxed);
     VIEWS[1].fetch_max(n as u64, Relaxed);
+    VIEWS[2].store(alias as u64, Relaxed);
 }
 
 /// A memory call of the runtime's remapping took `us`.
@@ -244,8 +249,8 @@ pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
     add(s, same);
     add(t, us);
 }
-const COUNTERS: usize = 112;
-const _: () = assert!((C::JoinFailed as usize) < COUNTERS);
+const COUNTERS: usize = 120;
+const _: () = assert!((C::ReadingMet as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1316,12 +1321,12 @@ pub(crate) fn log(frames: f64) {
          queries {:.2} ms, lock waited {:.2} ms, {:.2} ms in the fault handler; submission lock waited \
          {:.2} ms; from a present to the first list call the process ran {:.1} ms (all threads), \
          {:.1} ms of the title's frame waits fell in it; title memory's mapping lock: {:.0} remaps \
-         waited {:.1} ms held {:.1} ms, {:.0} reads in place waited {:.1} ms held {:.1} ms; page \
+         waited {:.1} ms held {:.1} ms, {:.0} reads in place ({:.0} met a remap of their range) waited {:.1} ms held {:.1} ms; page \
          mappings: the GPU's {:.0} calls {:.0} pages ({:.0} already so) {:.1} ms, physical {:.0} \
          calls {:.0} pages ({:.0} already so) {:.1} ms; in them {:.0} memory calls {:.1} ms, our notes \
          {:.1} ms ({:.1} ms waiting for the guards' lock); the GPU's page mappings by kind: {:.0} pages \
          in runs, {:.0} one pool page over many ({:.0} of them a page of zeros), {:.0} unmapped, {:.0} \
-         left; views of physical pages alive {} (at most {}); mappings that could join a neighbouring \
+         left; views of physical pages alive {} (at most {}; the GPU's mappings' {}); mappings that could join a neighbouring \
          view {:.0}, joined {:.0}, joins failed {:.0}",
         c[C::KernelCalls as usize],
         ms(c[C::KernelUs as usize]),
@@ -1343,6 +1348,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::RemapWaitUs as usize]),
         ms(c[C::RemapHeldUs as usize]),
         c[C::ReadingCalls as usize],
+        c[C::ReadingMet as usize],
         ms(c[C::ReadingWaitUs as usize]),
         ms(c[C::ReadingHeldUs as usize]),
         c[C::AliasCalls as usize],
@@ -1364,6 +1370,7 @@ pub(crate) fn log(frames: f64) {
         c[C::PagesLeft as usize],
         VIEWS[0].load(Relaxed),
         VIEWS[1].load(Relaxed),
+        VIEWS[2].load(Relaxed),
         c[C::JoinCould as usize],
         c[C::JoinDone as usize],
         c[C::JoinFailed as usize],

@@ -372,6 +372,40 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each page is shown, by section and index in it.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// Diagnostics: whether the mapping under way is the GPU's
+    /// (`map_alias`), and the views such mappings made.
+    #[cfg(feature = "diagnostics")]
+    alias_now: bool,
+    #[cfg(feature = "diagnostics")]
+    alias_views: std::collections::HashSet<usize>,
+}
+
+impl Physical {
+    /// All the title memory a change of mapping of `[base, base + len)`
+    /// may touch: the views that meet it are taken away whole and what
+    /// stays of them mapped again (`unmap`), and with `join` a view joins
+    /// neighbours up to [`JOIN_MAX`] on either side (`map_joined`). What
+    /// the change holds against reads in place
+    /// (`victory_gpu::title_memory_remapping`).
+    fn touched(&self, base: usize, len: usize, join: bool) -> (usize, usize) {
+        let end = base.saturating_add(len.max(1));
+        let mut from = self
+            .views
+            .range(..=base)
+            .next_back()
+            .filter(|(at, (size, _))| *at + size > base)
+            .map_or(base, |(at, _)| *at);
+        let mut to = self
+            .views
+            .range(..end)
+            .next_back()
+            .map_or(end, |(at, (size, _))| end.max(at + size));
+        if join {
+            from = from.saturating_sub(JOIN_MAX);
+            to = to.saturating_add(JOIN_MAX);
+        }
+        (from, to - from)
+    }
 }
 
 impl Slice {
@@ -688,7 +722,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let (from, len) = physical.touched(base, n * PAGE, false);
+    let _changing = victory_gpu::title_memory_remapping(from, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        physical.alias_now = false;
+    }
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -764,7 +803,12 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         Counted(true, n, same, started)
     };
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let (at, span) = physical.touched(to, len, join_views());
+    let _changing = victory_gpu::title_memory_remapping(at, span);
+    #[cfg(feature = "diagnostics")]
+    {
+        physical.alias_now = true;
+    }
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -951,7 +995,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     physical.views.insert(base, (len, slice));
     #[cfg(feature = "diagnostics")]
-    victory_gpu::views_alive(physical.views.len());
+    {
+        if physical.alias_now {
+            physical.alias_views.insert(base);
+        }
+        victory_gpu::views_alive(physical.views.len(), physical.alias_views.len());
+    }
     true
 }
 
@@ -1029,6 +1078,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        // What stays of the view is mapped again as what it was.
+        #[cfg(feature = "diagnostics")]
+        let was = std::mem::replace(&mut physical.alias_now, physical.alias_views.remove(&at));
         for k in 0..size / PAGE {
             if let std::collections::hash_map::Entry::Occupied(mut o) =
                 physical.shown.entry(slice.key(k))
@@ -1060,6 +1112,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            physical.alias_now = was;
         }
     }
 }
@@ -1398,7 +1454,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = victory_gpu::title_memory_reading();
+                    let _reading = victory_gpu::title_memory_reading(first, 3 * PAGE);
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.

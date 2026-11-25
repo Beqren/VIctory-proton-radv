@@ -5459,6 +5459,8 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackWriteCalls, 1);
         if direct {
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot (the caller opened its guards:

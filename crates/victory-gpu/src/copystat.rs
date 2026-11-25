@@ -212,6 +212,20 @@ pub(crate) enum C {
     CopyDiffered,
     CopyRewritten,
     CopyUnchecked,
+    /// What shaders wrote, put into title memory (`crate::shadow::put_back`):
+    /// pieces that differed from the title's bytes; bytes from the first to
+    /// the last byte the card wrote in them; of those, bytes in 4 KiB pages
+    /// of title memory whose bytes changed; bytes written; microseconds
+    /// reading title memory, opening the guards (`crate::watch::writing`)
+    /// and writing; the kernel's write calls (`crate::host::write_mapped`).
+    BackPieces,
+    BackSpanBytes,
+    BackPageBytes,
+    BackWrittenBytes,
+    BackReadUs,
+    BackOpenUs,
+    BackWriteUs,
+    BackWriteCalls,
 }
 
 /// What became of a copy of a physical page: 0 made, 1 taken away the
@@ -281,8 +295,8 @@ pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
     add(s, same);
     add(t, us);
 }
-const COUNTERS: usize = 120;
-const _: () = assert!((C::CopyUnchecked as usize) < COUNTERS);
+const COUNTERS: usize = 128;
+const _: () = assert!((C::BackWriteCalls as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1344,6 +1358,19 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    tracing::info!(
+        "copy back per frame: {:.0} pieces differed, {:.1} MB from the first to the last byte the card wrote, \
+         {:.1} MB of it in 4 KiB pages the title's bytes changed in, {:.1} MB written in {:.0} write calls; \
+         {:.1} ms reading title memory, {:.1} ms opening its guards, {:.1} ms writing",
+        c[C::BackPieces as usize],
+        mb(c[C::BackSpanBytes as usize]),
+        mb(c[C::BackPageBytes as usize]),
+        mb(c[C::BackWrittenBytes as usize]),
+        c[C::BackWriteCalls as usize],
+        ms(c[C::BackReadUs as usize]),
+        ms(c[C::BackOpenUs as usize]),
+        ms(c[C::BackWriteUs as usize]),
     );
     // The write watch and the guards taken apart, and the locks around
     // them; and what the process did from a present to the first list call.

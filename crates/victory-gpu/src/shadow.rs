@@ -878,6 +878,157 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .map(|i| word + i)
 }
 
+/// The 4 KiB pages of title memory what shaders wrote is put back by.
+const TITLE_PAGE: usize = 4 << 10;
+
+/// Whether only the 4 KiB pages of title memory whose bytes change are
+/// written back, not everything from the first to the last byte the card
+/// wrote in a 64 KiB piece (`VICTORY_BACK_PAGES=1`; off by default).
+///
+/// Measured on the viewtree Wine (2026-11-25, diagnostics, late world
+/// frames): of 77 MB a frame from the first to the last byte the card wrote
+/// in the 1,780 pieces that differ, 63 MB lie in pages whose bytes change;
+/// written 77 -> 63 MB a frame. Pages left alone are not opened either, so
+/// they are not noted as title writes, and no copy takes them again at its
+/// next refresh. The pieces mostly change all over: a small cut.
+pub(crate) fn back_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_PAGES").is_some_and(|v| v == "1"))
+}
+
+/// Whether what shaders wrote is written into title memory from user mode
+/// (`crate::watch::write_title_memory`) and not with the kernel's write
+/// (`VICTORY_BACK_USER=1`; off by default): see [`write_user`].
+///
+/// Measured on the viewtree Wine (2026-11-25, diagnostics, late world
+/// frames, with [`back_pages`]): the write 21 ms a frame in 1,790 kernel
+/// calls (77 MB) -> 13.6 ms with no kernel call (63 MB); "putting them
+/// back" 42 -> 37 ms, the frame line's copying back 75-79 -> 70-75 ms.
+/// The guards' opening (`crate::watch::writing`, 11.8 ms) is unchanged.
+pub(crate) fn back_user() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_USER").is_some_and(|v| v == "1"))
+}
+
+/// Merges `n` bytes that go to title address `address` page by page of
+/// title memory: `merge(lo, hi)` merges offsets `[lo, hi)` and says whether
+/// the result differs from the title's bytes there. The runs of pages that
+/// do, as offsets.
+fn merged_runs(address: usize, n: usize, mut merge: impl FnMut(usize, usize) -> bool) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut lo = 0;
+    while lo < n {
+        let hi = ((address + lo) / TITLE_PAGE + 1) * TITLE_PAGE - address;
+        let hi = hi.min(n);
+        if merge(lo, hi) {
+            match runs.last_mut() {
+                Some(last) if last.1 == lo => last.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+        lo = hi;
+    }
+    runs
+}
+
+/// [`crate::host::read_into`], timed for the copy-back's account.
+fn read_title(address: usize, into: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let reading = std::time::Instant::now();
+    let read = crate::host::read_into(address as *const u8, into);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::BackReadUs, reading.elapsed().as_micros() as u64);
+    read
+}
+
+/// [`back_user`]: writes `bytes` into title memory at `at` with a plain
+/// copy, after [`crate::watch::writing`] opened the guards there; false,
+/// with nothing written, where that cannot be done safely: the runtime is
+/// changing a mapping there (the lock is not waited for: the caller may
+/// hold another reading), or a page is not committed or not writable now
+/// (read-only for a reason not ours, or guarded again by a copy since the
+/// guards were opened). The kernel's write (`crate::host::write_mapped`)
+/// does those. A block a copy guards again between the look and the copy
+/// faults into the guards' handler, which opens it and notes it written,
+/// as for the title's own writes; write-watched pages see the write, as
+/// they see the kernel's.
+///
+/// Why: under Wine `NtWriteVirtualMemory` is a request to wineserver that
+/// carries the bytes (run of 2026-11-25 on the viewtree Wine, defaults: 1,790
+/// calls a frame for 77 MB took 21 ms, 12 us a call), and wineserver is the
+/// one thread every memory call of the process waits for.
+fn write_user(at: usize, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE, VirtualQuery,
+    };
+    let end = at + bytes.len();
+    let Some(_mapped) = crate::watch::title_memory_reading_now(at, bytes.len()) else {
+        return false;
+    };
+    let mut p = at;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & PAGE_GUARD != 0
+            || !matches!(info.Protect & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+        {
+            return false;
+        }
+        let stop = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if stop <= p {
+            return false;
+        }
+        p = stop;
+    }
+    // SAFETY: `[at, end)` is committed and was writable just now, and stays
+    // mapped while `_mapped` is held; a block guarded since faults into our
+    // handler, which opens it. `bytes` is our own memory.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
+    true
+}
+
+/// Puts `merged` (the title's bytes at `address` with what shaders wrote
+/// put in) into title memory; `runs` ([`merged_runs`]) are the parts that
+/// differ from what title memory held. Returns the bytes written.
+fn put_back(address: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
+    if runs.is_empty() {
+        return 0;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::BackPieces, 1);
+        add(C::BackSpanBytes, merged.len() as u64);
+        add(C::BackPageBytes, runs.iter().map(|&(lo, hi)| (hi - lo) as u64).sum());
+    }
+    let whole = [(0, merged.len())];
+    let parts: &[(usize, usize)] = if back_pages() { runs } else { &whole };
+    let mut written = 0;
+    for &(lo, hi) in parts {
+        let (at, bytes) = (address + lo, &merged[lo..hi]);
+        #[cfg(feature = "diagnostics")]
+        let opening = std::time::Instant::now();
+        crate::watch::writing(at, bytes.len());
+        #[cfg(feature = "diagnostics")]
+        let writing = {
+            crate::copystat::add(crate::copystat::C::BackOpenUs, opening.elapsed().as_micros() as u64);
+            std::time::Instant::now()
+        };
+        if !(back_user() && write_user(at, bytes)) {
+            crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackWriteUs, writing.elapsed().as_micros() as u64);
+        written += bytes.len();
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::BackWrittenBytes, written as u64);
+    written
+}
+
 #[cfg(test)]
 mod difference_tests {
     use super::{first_difference, last_difference};
@@ -1931,7 +2082,7 @@ impl Shadow {
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
+                if !read_title(start + at, title) {
                     continue;
                 }
                 // Title memory with the GPU's bytes put in; the copy takes
@@ -1940,19 +2091,18 @@ impl Shadow {
                 // the GPU's byte where the copy's byte is not what it was
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
-                }
+                let runs = merged_runs(start + at, n, |lo, hi| {
+                    let mut differs = 0u8;
+                    for ((t, h), o) in title[lo..hi].iter_mut().zip(host[lo..hi].iter_mut()).zip(&old[lo..hi]) {
+                        let gpu = if *h != *o { 0xffu8 } else { 0 };
+                        let merged = (*t & !gpu) | (*h & gpu);
+                        differs |= merged ^ *t;
+                        *t = merged;
+                        *h = merged;
+                    }
+                    differs != 0
+                });
+                written += put_back(start + at, title, &runs);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -2032,15 +2182,11 @@ impl Shadow {
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !read_title(start + at, title) {
             return 0;
         }
-        if !merge_piece(now, held, title) {
-            return 0;
-        }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        let runs = merged_runs(start + at, n, |lo, hi| merge_piece(&now[lo..hi], &mut held[lo..hi], &mut title[lo..hi]));
+        put_back(start + at, title, &runs)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -2554,22 +2700,21 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if read_title(start + at, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
-            }
+            let runs = merged_runs(start + at, n, |lo, hi| {
+                let mut differs = 0u8;
+                for ((t, g), o) in title[lo..hi].iter_mut().zip(&gpu[lo..hi]).zip(old[lo..hi].iter_mut()) {
+                    let wrote = if *g != *o { 0xffu8 } else { 0 };
+                    let merged = (*t & !wrote) | (*g & wrote);
+                    differs |= merged ^ *t;
+                    *t = merged;
+                    *o = merged;
+                }
+                differs != 0
+            });
+            written = put_back(start + at, title, &runs);
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
@@ -2630,20 +2775,21 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let mut changed = false;
+        let mapped = read_title(start + at, title);
+        let mut runs = Vec::new();
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            let found = merged_runs(start + at + a, b - a, |lo, hi| {
+                merge_piece(&gpu[a + lo..a + hi], &mut held[a + lo..a + hi], &mut title[a + lo..a + hi])
+            });
+            runs.extend(found.into_iter().map(|(lo, hi)| (a + lo, a + hi)));
         }
-        if !mapped || !changed {
+        if !mapped {
             return 0;
         }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        put_back(start + at, title, &runs)
     }
 }
 

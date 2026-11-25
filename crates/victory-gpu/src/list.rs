@@ -245,7 +245,10 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _)) => {
+            list.recording_taken();
+            Some(list)
+        }
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -269,6 +272,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+        host.recording_idle();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {

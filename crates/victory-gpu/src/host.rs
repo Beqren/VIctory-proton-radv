@@ -73,18 +73,55 @@ unsafe impl Sync for Host {}
 /// texture (a device hang).
 static RETIRED: Mutex<Vec<Grave>> = Mutex::new(Vec::new());
 
-/// An object in [`RETIRED`]: the submission count it waits for, and the
-/// frame and moment (ms) it was retired at, until its hold is over
-/// ([`grave_step`]).
+/// An object in [`RETIRED`]: the submissions started and the last list
+/// recording begun when it was retired, and the moment (ms) ([`grave_step`]).
 struct Grave {
     at: u64,
-    frame: u64,
+    recording: u64,
     ms: u64,
-    /// The hold of frames is over and `at` was set again to the
-    /// submissions started then.
-    held: bool,
     #[allow(dead_code)] // held to be dropped
     object: Retired,
+}
+
+/// Recordings of host lists not yet done with ([`recording_begins`]): by
+/// the number each was given when it began, the submission that last sent
+/// it (`u64::MAX`: none yet). A recording is done with when its list is
+/// reset, recycled or dropped, or when the submission that sent it has
+/// finished.
+static RECORDINGS: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std::collections::BTreeMap::new());
+/// The last number given to a recording.
+static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A host list begins a recording: its number.
+fn recording_begins() -> u64 {
+    let n = RECORDED.fetch_add(1, Ordering::AcqRel) + 1;
+    RECORDINGS.lock().unwrap_or_else(|e| e.into_inner()).insert(n, u64::MAX);
+    n
+}
+
+/// Recording `n` was sent with submission `submission`.
+fn recording_sent(n: u64, submission: u64) {
+    if let Some(at) = RECORDINGS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&n) {
+        *at = submission;
+    }
+}
+
+/// Recording `n` is done with (its list reset, recycled or dropped).
+fn recording_ends(n: u64) {
+    if n != 0 {
+        RECORDINGS.lock().unwrap_or_else(|e| e.into_inner()).remove(&n);
+    }
+}
+
+/// The lowest number of a recording still being made or on the card, with
+/// `finished` submissions finished (`u64::MAX`: none).
+fn oldest_recording(finished: u64) -> u64 {
+    RECORDINGS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|&(_, &sent)| sent == u64::MAX || sent > finished)
+        .map_or(u64::MAX, |(&n, _)| n)
 }
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -168,32 +205,34 @@ fn sweep() {
 }
 
 /// The one way to let go of a host object (a texture, a buffer, a staging
-/// buffer, a slot's old resource) that a command list may name: instead of
-/// dropping it, hand it here. It is dropped once
-/// 1. [`RETIRE_FRAMES`] frames have begun since and at least
-///    [`RETIRE_MS`] passed (so every list the title had recorded or was
-///    recording when it was let go, which may name it through a descriptor
-///    and holds no reference, has been submitted), and then
-/// 2. every submission started by that moment has finished on the card
-///    (flights sent ahead and the relay's included: `FINISHED` moves only
-///    as they land).
+/// buffer, a slot's old resource, a copy) that a command list may name:
+/// instead of dropping it, hand it here. It is dropped once every host list
+/// recording begun by then is done with: reset, recycled or dropped, or sent
+/// with a submission that has finished on the card ([`RECORDINGS`]); and
+/// every submission started by then has finished. A list being recorded on
+/// a title thread names textures and copies through descriptors and raw
+/// addresses without holding them, and a list held back with others before
+/// it is sent (`VICTORY_LATE_WAIT_LISTS`, flights sent ahead) runs late:
+/// neither is a submission running when the object is let go.
 ///
-/// `VICTORY_RETIRE_FRAMES=0` is the rule before: only (2), counted from
-/// the call, and at once when nothing runs.
+/// shortcut: [`RETIRE_MS_MOST`] is a ceiling (a list the title records and
+/// never sends nor resets would hold everything let go after it): past it
+/// the object goes all the same, and that is counted and logged.
+///
+/// `VICTORY_RETIRE_LISTS=0` is the rule before: the submissions started by
+/// then alone, and at once when nothing runs.
 ///
 /// Why: every device loss of 2026-11-25 (runs tail-1, tail-2, pairoff-1,
-/// bcb-1, race/run2, blend-4, tex-off) was a GPU page fault on a READ by
-/// the texture unit, in the submission begun just after a texture sweep
-/// (`resource::let_go_idle`) had dropped hundreds of host textures at once
-/// (no submission running, so nothing waited). With the sweep off
-/// (`VICTORY_TEXTURE_SWEEP=0`) no run of six lost the device, against 4 of
-/// 14 with it. The sweep's "no list, no slot" test counts references, and
-/// a list being recorded on a title thread names textures through
-/// descriptors without holding them. shortcut: the hold is counted in
-/// frames and time, not proven against every recording thread.
+/// bcb-1, race/run2, blend-4, tex-off, grave-4, val-2, valb-4, and the
+/// owner's play of 8 min 19 s on batch14) was a GPU page fault on a READ by
+/// the texture unit within about 3 s after a sweep had let hundreds of host
+/// textures and copies go; with the texture sweep off no run of six lost
+/// the device. A hold of 4 frames and 1 s (the rule before this one) did
+/// not stop it: under `VICTORY_RELAY=2` lists stay recorded and held back
+/// longer than that.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if retire_frames() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+    if !retire_lists() && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -201,104 +240,92 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
     let grave = Grave {
         at: started,
-        frame: crate::frame::current(),
+        recording: if retire_lists() { RECORDED.load(Ordering::Acquire) } else { 0 },
         ms: now_ms(),
-        held: retire_frames() == 0,
         object: Retired(Box::new(object)),
     };
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(grave);
 }
 
-/// Frames a retired object is held before its submissions are counted
-/// ([`retire`]; `VICTORY_RETIRE_FRAMES`, default 4: the title records a
-/// frame's lists within the frame and submits them by the next).
-pub(crate) fn retire_frames() -> u64 {
-    static N: OnceLock<u64> = OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_RETIRE_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+/// Whether retired objects wait for the list recordings begun before
+/// ([`retire`]; `VICTORY_RETIRE_LISTS=0`: no).
+pub(crate) fn retire_lists() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RETIRE_LISTS").is_none_or(|v| v != "0"))
 }
 
-/// The least time a retired object is held with its frames ([`retire`]).
-const RETIRE_MS: u64 = 1_000;
-/// Held this long, its frames are taken as passed even if the title waits
-/// for no frame (a loading screen): memory let go is not kept for ever.
-const RETIRE_MS_MOST: u64 = 10_000;
+/// The ceiling of a retired object's wait ([`retire`]).
+const RETIRE_MS_MOST: u64 = 30_000;
 
-/// What happens to a grave now: `None` dropped, else kept (with `at` and
-/// `held` as they now are). `started` and `finished` are the submission
-/// counts, `frame` and `ms` the present ones; `frames` is
-/// [`retire_frames`].
-fn grave_step(at: u64, held: bool, since: (u64, u64), now: (u64, u64), started: u64, finished: u64, frames: u64) -> Option<(u64, bool)> {
-    let (frame0, ms0) = since;
-    let (frame, ms) = now;
-    if !held {
-        let waited = ms.saturating_sub(ms0);
-        if (frame.saturating_sub(frame0) >= frames && waited >= RETIRE_MS) || waited >= RETIRE_MS_MOST {
-            // Every list recorded when it was let go has been submitted by
-            // now: wait for what was started up to here (read after the
-            // frame and the time). Never dropped in the same look.
-            return Some((started, true));
-        }
-        return Some((at, held));
+/// Retired objects dropped at the ceiling with a recording before them
+/// still not done with.
+static RETIRED_AT_CEILING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a grave is done with: the submissions started when it was
+/// retired (`at`) have finished, and every recording begun by then
+/// (numbers up to `recording`) is done with (`oldest`: the oldest that is
+/// not). `Some(true)`: dropped at the ceiling with a recording outstanding.
+fn grave_step(at: u64, recording: u64, waited_ms: u64, finished: u64, oldest: u64) -> Option<bool> {
+    if at <= finished && oldest > recording {
+        return Some(false);
     }
-    if at <= finished { None } else { Some((at, held)) }
+    (waited_ms >= RETIRE_MS_MOST).then_some(true)
 }
 
 #[cfg(test)]
 mod grave_tests {
-    use super::{RETIRE_MS, RETIRE_MS_MOST, grave_step};
+    use super::{RETIRE_MS_MOST, grave_step};
 
     #[test]
-    fn a_retired_object_waits_for_its_frames_then_for_the_submissions_begun_by_then() {
-        // Retired at frame 10, 0 ms, with submissions 1..=5 started and 5
-        // finished (nothing running): not dropped at once.
-        let since = (10, 0);
-        assert_eq!(grave_step(5, false, since, (10, 0), 5, 5, 4), Some((5, false)));
-        // Three frames later, 2 s: still held (four frames).
-        assert_eq!(grave_step(5, false, since, (13, 2000), 9, 9, 4), Some((5, false)));
-        // Four frames, but under a second: held.
-        assert_eq!(grave_step(5, false, since, (14, RETIRE_MS - 1), 9, 9, 4), Some((5, false)));
-        // Four frames and a second: it now waits for submission 12, the
-        // last started, which the card has not finished.
-        assert_eq!(grave_step(5, false, since, (14, RETIRE_MS), 12, 9, 4), Some((12, true)));
-        // Not before 12 has finished, whatever the frame.
-        assert_eq!(grave_step(12, true, since, (40, 60_000), 20, 11, 4), Some((12, true)));
-        assert_eq!(grave_step(12, true, since, (40, 60_000), 20, 12, 4), None);
-        // No frames at all (a loading screen): the time bound passes them.
-        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST - 1), 7, 7, 4), Some((5, false)));
-        assert_eq!(grave_step(5, false, since, (10, RETIRE_MS_MOST), 7, 7, 4), Some((7, true)));
-        assert_eq!(grave_step(7, true, since, (10, RETIRE_MS_MOST), 8, 7, 4), None);
-        // With the rule off (held from the start): the submissions running
-        // when it was retired, as before.
-        assert_eq!(grave_step(5, true, since, (10, 0), 6, 4, 0), Some((5, true)));
-        assert_eq!(grave_step(5, true, since, (10, 0), 6, 5, 0), None);
+    fn a_retired_object_waits_for_the_recordings_and_submissions_before_it() {
+        // Retired with submissions up to 5 started and recordings up to 40
+        // begun. Submission 5 has finished; recording 38 (begun before) is
+        // still being made or on the card: kept.
+        assert_eq!(grave_step(5, 40, 0, 5, 38), None);
+        // Recording 38 done; the oldest left is 41, begun after: dropped.
+        assert_eq!(grave_step(5, 40, 0, 5, 41), Some(false));
+        // No recording left at all.
+        assert_eq!(grave_step(5, 40, 0, 5, u64::MAX), Some(false));
+        // Submission 5 not finished: kept, whatever the recordings.
+        assert_eq!(grave_step(5, 40, 0, 4, u64::MAX), None);
+        // Held back past the ceiling: dropped, counted as forced.
+        assert_eq!(grave_step(5, 40, RETIRE_MS_MOST, 5, 38), Some(true));
+        // The rule off (recording 0: none waited for).
+        assert_eq!(grave_step(5, 0, 0, 5, 1), Some(false));
     }
 }
 
 /// Drops what [`grave_step`] says is done with, `finished` being the
 /// submissions finished.
 fn bury(finished: u64) {
-    let done: Vec<Grave> = {
+    let (done, forced): (Vec<Grave>, u64) = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
         }
-        let (now, frames) = ((crate::frame::current(), now_ms()), retire_frames());
-        let started = STARTED.load(Ordering::Acquire);
-        let mut done = Vec::new();
+        let oldest = oldest_recording(finished);
+        let now = now_ms();
+        let (mut done, mut forced) = (Vec::new(), 0u64);
         let mut keep = Vec::with_capacity(retired.len());
-        for mut g in std::mem::take(&mut *retired) {
-            match grave_step(g.at, g.held, (g.frame, g.ms), now, started, finished, frames) {
-                Some((at, held)) => {
-                    g.at = at;
-                    g.held = held;
-                    keep.push(g);
+        for g in std::mem::take(&mut *retired) {
+            match grave_step(g.at, g.recording, now.saturating_sub(g.ms), finished, oldest) {
+                None => keep.push(g),
+                Some(f) => {
+                    forced += u64::from(f);
+                    done.push(g);
                 }
-                None => done.push(g),
             }
         }
         *retired = keep;
-        done
+        (done, forced)
     };
+    if forced > 0 && RETIRED_AT_CEILING.fetch_add(forced, Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            forced,
+            oldest = oldest_recording(finished),
+            "retired objects dropped at the ceiling with a list recording before them not done with (counted from now on)"
+        );
+    }
     drop(done);
 }
 
@@ -862,6 +889,9 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// The number of the recording the list holds ([`RECORDINGS`]; 0 while
+    /// it is idle in the pool).
+    recording: Recording,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1353,6 +1383,16 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     {
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
+    }
+}
+
+/// A host list's recording number ([`RECORDINGS`]), ended when the list
+/// goes.
+struct Recording(std::sync::atomic::AtomicU64);
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        recording_ends(*self.0.get_mut());
     }
 }
 
@@ -3087,6 +3127,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
+                recording: Recording(std::sync::atomic::AtomicU64::new(recording_begins())),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4202,6 +4243,9 @@ impl Host {
         // lists that may read them run.
         crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        for list in runs {
+            list.recording_sent(this_submission);
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -4634,6 +4678,21 @@ impl Host {
 }
 
 impl HostList {
+    /// The list goes idle into the pool: it records nothing ([`RECORDINGS`]).
+    pub(crate) fn recording_idle(&self) {
+        recording_ends(self.recording.0.swap(0, Ordering::AcqRel));
+    }
+
+    /// The list is taken from the pool to be recorded.
+    pub(crate) fn recording_taken(&self) {
+        recording_ends(self.recording.0.swap(recording_begins(), Ordering::AcqRel));
+    }
+
+    /// The list was sent with submission `submission`.
+    fn recording_sent(&self, submission: u64) {
+        recording_sent(self.recording.0.load(Ordering::Acquire), submission);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -4735,6 +4794,9 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        // The recording before is done with (every submission of the list
+        // has run); a new one begins.
+        recording_ends(self.recording.0.swap(recording_begins(), Ordering::AcqRel));
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();

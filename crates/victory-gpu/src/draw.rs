@@ -557,6 +557,25 @@ fn early_budgets() -> (u64, u64) {
 /// the texture pass has run in this frame before it: the pass runs only
 /// where a shader picks buffers by index (`SLOT_STRIDES`), which a bake
 /// shader need not.
+/// The face network's tensor programs (the 65 `compute_graph_ops` of the
+/// pack), for the blend-shape probe.
+#[cfg(feature = "diagnostics")]
+const GRAPH_PROGRAMS: [&str; 65] = [
+    "0709e8356abd9082", "088735d999e0c9f4", "0aa7934094794dbf", "13c8daa0bad76f2a", "164a8fa92a2c699f",
+    "17fba369586b4b79", "1c149749f2e45123", "20888698baa6ea53", "21e30428bed8410d", "24a83bd1f400880f",
+    "25c0eac2493ca478", "2666062bd7f4c95d", "276807e09cc5ac96", "2d2bf473555f8dd5", "305809281f57812f",
+    "38a65783327c30b6", "3931481a3e2ff49f", "3a738c1d82dd3fe3", "3d65925d7cd4a39a", "3eed5349508763fb",
+    "433e7b2c5496ceea", "44679bc29abcf17a", "52a3f6d2c90c9919", "5a07a7d6687e7087", "5a8a378f351c86c3",
+    "5b10547f431b1355", "5e5d98e4ff3a7cf9", "60c4f9d76c3aed89", "66177c4264e3c6bc", "6831220e1ed5878f",
+    "6a04b371a8e26853", "6b176df5514d9a3f", "6b1ec09dad51d662", "6b60e7642632c2b9", "6eea8cd13a310ddc",
+    "7031554d409c394f", "7519e7515cb3d703", "77c639e3289f168d", "7a38ed7f5205f384", "7de0f9db96ddd295",
+    "7dfd9a07e164f011", "8184d60481fa0125", "862579ca496e9d31", "918081d4df02c5bc", "94ed3044f86cc704",
+    "95efe597345a9e17", "a06ef09446bd6e70", "a26a38d61f256901", "aaf7da7a94dc72a9", "b22a16a178976e1b",
+    "c41ee78453b1eed8", "d4bc666022520dfd", "d603b4c3b6505026", "e45172602f6280b6", "e4576c6eca0f8ce3",
+    "e4d850a7baf18270", "e52a6557e730c889", "e72489e94f2e167a", "e8820cb254b5c681", "eb109d093eb4ddbe",
+    "f3a16846866f61ab", "f42156fd1b46c292", "f8425d3c03df62a0", "fcbb2e25040a325b", "fd49b6d7aca608d3",
+];
+
 fn bake_probe(p: &HostPipeline) -> bool {
     let Some(stage) = p.stages.iter().find(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())) else {
         return false;
@@ -2530,22 +2549,66 @@ impl State {
     /// the ones missing.
     #[cfg(feature = "diagnostics")]
     fn probe_blendshapes(&self, p: &HostPipeline) {
-        const NAMES: [&[u8]; 5] = [
+        const NAMES: [&[u8]; 6] = [
             b"CS_BlendshapeTranslationsHSSGraphOutputExtract",
             b"CS_ComputeStickyLips",
             b"CS_ReconstructBlendshapeNormals",
             b"CS_PedStandardSkinning_11",
             b"CS_ComputeBlendshapeMappings",
+            // The face network's tensor programs (65 `compute_graph_ops`,
+            // picked by hash below): a line a frame with the number recorded
+            // in the frame before, every dispatch in full in frames
+            // `VICTORY_GRAPH_FRAMES=<first>,<count>` (default 1040,10).
+            b"\0compute_graph_ops",
         ];
-        static SEEN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-        let Some(which) = NAMES.iter().position(|n| crate::pipeline::holds_name(self.pipeline as This, n)) else {
-            return;
+        static SEEN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+        let frame = crate::queue::presented() + 1;
+        let graph = p.stages.iter().any(|s| GRAPH_PROGRAMS.contains(&s.shader.hash.as_str()));
+        let which = if graph {
+            5
+        } else {
+            let Some(which) = NAMES[..5].iter().position(|n| crate::pipeline::holds_name(self.pipeline as This, n))
+            else {
+                return;
+            };
+            which
         };
         let name = NAMES[which];
         let n = SEEN[which].fetch_add(1, Ordering::Relaxed);
-        if n >= 48 && n % 400 != 0 {
+        // Once a frame (the first dispatch of the program in the frame): the
+        // compact line with each view's content hash.
+        static LAST_FRAME: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+        let first_in_frame = LAST_FRAME[which].swap(frame, Ordering::Relaxed) != frame;
+        if which == 5 {
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            static COUNTED: AtomicU64 = AtomicU64::new(0);
+            if COUNTED.swap(frame, Ordering::Relaxed) != frame {
+                let k = COUNT.swap(0, Ordering::Relaxed);
+                tracing::info!(frame, before = k, "face network: graph dispatches recorded in the frame before this one's first");
+            }
+            COUNT.fetch_add(1, Ordering::Relaxed);
+            static WINDOW: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+            let (first, count) = *WINDOW.get_or_init(|| {
+                std::env::var("VICTORY_GRAPH_FRAMES")
+                    .ok()
+                    .and_then(|v| {
+                        let (a, b) = v.split_once(',')?;
+                        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                    })
+                    .unwrap_or((1040, 10))
+            });
+            if !(first..first + count).contains(&frame) {
+                return;
+            }
+        }
+        let full = which == 5 || n < 48 || n % 400 == 0;
+        if !full && !(first_in_frame && matches!(which, 0 | 3)) {
             return;
         }
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+        };
+        let mut compact = String::new();
         let stats = |bytes: &[u8]| {
             let (mut nan, mut inf, mut huge, mut zero) = (0, 0, 0, 0);
             for w in bytes.chunks_exact(4) {
@@ -2611,9 +2674,13 @@ impl State {
                     continue;
                 };
                 ranges.push(((u.slot, u.table_offset_dwords), (address, len)));
-                let mut title = vec![0u8; len.min(64 << 10) as usize & !3];
+                let mut title = vec![0u8; len.min(4 << 20) as usize & !3];
                 if title.is_empty() || !crate::host::read_into(address as *const u8, &mut title) {
                     text.push_str(&format!("\n    {label} {address:#x}+{len:#x} unreadable: view {desc}"));
+                    continue;
+                }
+                compact.push_str(&format!(" {label}={address:#x}:{:016x}", fnv(&title)));
+                if !full {
                     continue;
                 }
                 let mut host = vec![0u8; title.len()];
@@ -2630,10 +2697,26 @@ impl State {
                     format!("{} of {start:#x}+{size:#x}", s.id())
                 });
                 text.push_str(&format!(
-                    "\n    {label} {address:#x}+{len:#x} (copy {span:?}) view {desc}: title {}; {differ}",
-                    stats(&title)
+                    "\n    {label} {address:#x}+{len:#x} (copy {span:?}) view {desc}: title {} hash {:016x}; {differ}",
+                    stats(&title),
+                    fnv(&title)
                 ));
             }
+        }
+        if !full {
+            // The once-a-frame line: each view's hash, and for the extract
+            // the face network's output (table 0 dword 16) whole.
+            if which == 0
+                && let Some(&(_, (out, len))) = ranges.iter().find(|(k, _)| *k == (0, 16))
+            {
+                let mut b = vec![0u8; len.min(4 << 20) as usize & !1];
+                if crate::host::read_into(out as *const u8, &mut b) {
+                    let nz = b.chunks_exact(2).filter(|h| h != &[0u8, 0]).count();
+                    compact.push_str(&format!(" network output {nz} halves not zero, hash {:016x}", fnv(&b)));
+                }
+            }
+            tracing::info!("blend-shape probe {} frame {frame} compact:{compact}", String::from_utf8_lossy(name));
+            return;
         }
         let constant = |slot: u8, dword: u32, index: usize| {
             constants.iter().find(|(k, _)| *k == (slot, dword)).and_then(|(_, w)| w.get(index).copied())
@@ -2769,7 +2852,27 @@ impl State {
                     text.push_str(&format!("\n    map {map:#x}+{len:#x}: {}", at(map, 32)));
                 }
             }
+            5 => {
+                let hashes: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
+                text.push_str(&format!("\n    programs {hashes:?}"));
+            }
             _ => {}
+        }
+        if which == 0 {
+            // The face network's output the extract reads (table 0 dword 16,
+            // R16_UINT halves): of the whole view, how many halves are not
+            // zero, in title memory.
+            if let Some((out, len)) = range(0, 16) {
+                let mut b = vec![0u8; len.min(4 << 20) as usize & !1];
+                if crate::host::read_into(out as *const u8, &mut b) {
+                    let nz = b.chunks_exact(2).filter(|h| h != &[0u8, 0]).count();
+                    let first = b.chunks_exact(2).position(|h| h != [0u8, 0]);
+                    text.push_str(&format!(
+                        "\n    network output {out:#x}+{len:#x}: {nz} of {} halves not zero (title), the first at {first:?}",
+                        b.len() / 2
+                    ));
+                }
+            }
         }
         tracing::info!(
             "blend-shape probe {} #{n} frame {}:{text}",

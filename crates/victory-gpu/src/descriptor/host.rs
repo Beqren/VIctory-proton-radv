@@ -560,6 +560,22 @@ impl TextureQueue {
         order
     }
 
+    /// Up to `max` slots due at `frame`, the ones written longest ago
+    /// first, with the frame each was written in: the order of a pass while
+    /// the card is at its limit (`draw.rs`, `starved`), where what is
+    /// admitted at all goes to the slots that have waited longest.
+    fn due_oldest(&self, frame: u64, max: usize) -> Vec<(u32, u64, u64)> {
+        let mut due: Vec<(u64, u64, u32)> = self
+            .slots
+            .iter()
+            .filter(|(_, w)| w.due <= frame)
+            .map(|(&index, w)| (w.written, w.write, index))
+            .collect();
+        due.sort_unstable();
+        due.truncate(max);
+        due.into_iter().map(|(written, write, index)| (index, write, written)).collect()
+    }
+
     /// The entry of `index` if it is still the write the pass was handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
         self.slots.get_mut(&index).filter(|w| w.write == write)
@@ -1015,6 +1031,13 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+    }
+
+    /// [`HostHeap::texture_slots_due`] in the order of a pass on a full
+    /// card ([`TextureQueue::due_oldest`]): slot, write, frame written.
+    pub(crate) fn texture_slots_due_oldest(&self, frame: u64, max: usize) -> (Vec<(u32, u64, u64)>, [u64; 5]) {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        (textures.due_oldest(frame, max), textures.census(frame))
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)

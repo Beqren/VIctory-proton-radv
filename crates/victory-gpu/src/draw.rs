@@ -352,6 +352,18 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Textures made in the reserve band on a full card (`starved`).
+pub(crate) static HEAP_TEXTURES_RESERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a pass on a full card serves the slots written longest ago
+/// first and lets those due for some frames take the reserve band
+/// (`crate::resource::reserve_room`); `VICTORY_TEXTURE_STARVED=0`: no, as
+/// before (nothing new was made, and the pass gave up after 256 slots in
+/// its order of newest and oldest writes).
+fn starved() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_STARVED").is_none_or(|v| v != "0"))
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, that found it changed (uploaded again), since the start; and the
@@ -1736,7 +1748,20 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        // On a full card: the slots written longest ago first, and those
+        // due for `STARVED` frames or more may still take the reserve band
+        // (`resource::reserve_room`), at most `RESERVE_BYTES` a pass.
+        let starving = !room && starved();
+        let reserve = starving && crate::resource::reserve_room();
+        const STARVED: u64 = 8;
+        const RESERVE_BYTES: u64 = 64 << 20;
+        let (due, census) = if starving {
+            let (due, census) = host.texture_slots_due_oldest(frame, 4096);
+            (due, census)
+        } else {
+            let (due, census) = host.texture_slots_due(frame, 4096);
+            (due.into_iter().map(|(index, write)| (index, write, u64::MAX)).collect(), census)
+        };
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1792,7 +1817,8 @@ impl State {
             None => (per_frame, span),
         };
         let began = std::time::Instant::now();
-        for (index, write) in due {
+        let spent_before = SPENT.load(Ordering::Relaxed);
+        for (index, write, written) in due {
             if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
@@ -1846,7 +1872,14 @@ impl State {
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.
-            if !room {
+            // The reserve band: a slot that has waited `STARVED` frames.
+            let admitted = reserve
+                && written.saturating_add(STARVED) <= frame
+                && SPENT.load(Ordering::Relaxed).saturating_sub(spent_before) < RESERVE_BYTES;
+            if admitted {
+                HEAP_TEXTURES_RESERVED.fetch_add(1, Ordering::Relaxed);
+            }
+            if !room && !admitted {
                 #[cfg(feature = "diagnostics")]
                 host.tint(index, crate::descriptor::host::Tint::Refused);
                 refused += 1;

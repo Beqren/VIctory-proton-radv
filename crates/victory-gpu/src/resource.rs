@@ -1412,6 +1412,32 @@ pub(crate) fn room() -> bool {
     }
 }
 
+/// Past [`room`]: whether the card's memory in use is still under
+/// `VICTORY_TEXTURE_RESERVE_PERCENT` of the budget (96; 0: no reserve),
+/// a band kept for the textures picked by index that have waited longest
+/// (`draw.rs`, `starved`). The pass admitted nothing once the card was at
+/// nine tenths: in run D (2026-11-25) the main character's head textures,
+/// due from frame 835, were still waiting at frame 866 among some 9,000
+/// due slots, and her face was black. The band is a share of the same
+/// budget, so the system does not move memory out because of it.
+#[cfg(windows)]
+pub(crate) fn reserve_room() -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_RESERVE_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(96, |p| p.min(98))
+    });
+    if percent <= 90 || std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
+        return false;
+    }
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => used < budget / 100 * percent,
+        None => false,
+    }
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after

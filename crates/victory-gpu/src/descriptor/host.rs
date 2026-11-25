@@ -163,6 +163,11 @@ impl Spans {
                 return stale;
             }
             if let Some((_, slots)) = self.spans.remove(&span) {
+                // Diagnostics: stale though the newer view starts 4 KiB or
+                // more from it (victory-fork 310c6eb keeps those).
+                if span.0.abs_diff(start) >= 4096 {
+                    STALE_FAR.fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 for slot in slots {
                     self.by_slot.remove(&slot);
                     stale.push(slot);
@@ -256,6 +261,11 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Of the slots made stale (`STALE[0]`), the ones whose span starts 4 KiB
+/// or more from the newer view's start: victory-fork's rule (310c6eb,
+/// `VICTORY_STALE_TEXTURES` there) would have kept them.
+pub(crate) static STALE_FAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether a view written over memory that older views describe otherwise
 /// makes those stale; `VICTORY_STALE_TEXTURES=0` leaves them as they are.

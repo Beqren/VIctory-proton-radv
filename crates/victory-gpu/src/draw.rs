@@ -382,6 +382,83 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// The frame the texture pass ([`State::heap_textures`]) last ran in.
+static TEXTURE_PASS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The pixel shaders of the title's decoration bake (the title:
+/// `PS_BakeDecorations_*`), by hash as logged; from victory-fork c96b4f2.
+/// They draw into a 256x256 corner of 2048x2048 targets, name no texture
+/// in a table and pick their sources by index, once, while a world loads:
+/// what is not on the card then is baked as nothing for the run.
+const BAKE_PIXEL_SHADERS: [&str; 4] =
+    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+
+/// Bake draws bound so far.
+static BAKE_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+/// Since the start: early runs of the texture pass, and those of them
+/// made for a bake draw ([`State::early_textures`]).
+pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// While [`State::early_textures`] runs the texture pass: the
+    /// milliseconds and the bytes that run may take, in place of the
+    /// pass's own per frame.
+    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The milliseconds of every frame the texture pass takes at the frame's
+/// first draw, before a shader that picks buffers by index has run it
+/// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never), and the milliseconds the
+/// bake draws of a frame may give it (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0:
+/// nothing special). From victory-fork c96b4f2, written anew on this
+/// queue.
+///
+/// The pass runs where a shader picks buffers by index (`SLOT_STRIDES`),
+/// which the bake's shaders do not. In run 1 of 2026-11-25 (diagnostics,
+/// this machine) the bake drew at frames 1031 (6 draws) and 1589 (2) with
+/// the pass never run and no texture picked by index uploaded; the pass
+/// first ran at frame 1715 and met 34,299 slots due at once.
+fn early_budgets() -> (u64, u64) {
+    static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = |name: &str, default: u64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
+        };
+        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+    })
+}
+
+/// Says (the first 8 and then every power of two) what the queue of
+/// textures picked by index holds when a bake draw is bound, and whether
+/// the texture pass has run in this frame before it: the pass runs only
+/// where a shader picks buffers by index (`SLOT_STRIDES`), which a bake
+/// shader need not.
+fn bake_probe(p: &HostPipeline) -> bool {
+    let Some(stage) = p.stages.iter().find(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str())) else {
+        return false;
+    };
+    let n = BAKE_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        let frame = crate::frame::current();
+        let [queued, due, away, partly, oldest] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+        let strides = p.stages.iter().any(|s| s.root_srvs.iter().any(|&(slot, _)| slot == victory_shader::emit::SLOT_STRIDES));
+        tracing::info!(
+            frame,
+            bake_draws = n,
+            shader = %stage.shader.hash,
+            picks_buffers_by_index = strides,
+            pass_ran_this_frame = TEXTURE_PASS_FRAME.load(Ordering::Relaxed) == frame,
+            last_pass_frame = TEXTURE_PASS_FRAME.load(Ordering::Relaxed),
+            queued, due, away, partly, oldest,
+            uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+            full_passes = HEAP_TEXTURES_FULL.load(Ordering::Relaxed),
+            "a draw of the title's decoration bake is bound"
+        );
+    }
+    true
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -893,6 +970,10 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // Textures picked by index, before anything asks for them.
+        if !compute {
+            self.early_textures(list, p);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -1464,6 +1545,75 @@ impl State {
         Some(gpu)
     }
 
+    /// Runs the texture pass ([`State::heap_textures`]) where nothing has
+    /// asked for it yet ([`early_budgets`]): once a frame for a few
+    /// milliseconds at the frame's first draw with a view heap set, and
+    /// with a larger budget of its own before every draw whose pixel
+    /// shader is one of the title's bake programs ([`BAKE_PIXEL_SHADERS`]).
+    /// The uploads are recorded into `list` ahead of the draw being bound,
+    /// as the world's pass records them.
+    fn early_textures(&self, list: &HostList, p: &HostPipeline) {
+        let bake = bake_probe(p);
+        let (early_ms, bake_ms) = early_budgets();
+        if early_ms == 0 && bake_ms == 0 {
+            return;
+        }
+        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        // The milliseconds this frame's bake draws have taken so far: a
+        // frame has several, and together they get `bake_ms`.
+        static BAKED_MS: AtomicU64 = AtomicU64::new(0);
+        let frame = crate::frame::current();
+        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        if first {
+            BAKED_MS.store(0, Ordering::Relaxed);
+        }
+        let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        let bake = bake && left > 0;
+        let budget = if bake {
+            // What a bake may read must be there now: up to 2 GiB.
+            (left, 2 << 30)
+        } else if first && early_ms > 0 {
+            (early_ms, 64 << 20)
+        } else {
+            return;
+        };
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed);
+        let began = std::time::Instant::now();
+        PASS_BUDGET.set(Some(budget));
+        self.heap_textures(list, heap, host);
+        PASS_BUDGET.set(None);
+        if bake {
+            BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            let n = BAKE_DRAWS.load(Ordering::Relaxed);
+            if n <= 8 || n.is_power_of_two() {
+                let [queued, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+                tracing::info!(
+                    frame,
+                    bake_draws = n,
+                    ms = began.elapsed().as_millis(),
+                    queued,
+                    due,
+                    uploaded_so_far = HEAP_TEXTURES.load(Ordering::Relaxed),
+                    full_passes = HEAP_TEXTURES_FULL.load(Ordering::Relaxed),
+                    "textures picked by index uploaded before a draw of the title's decoration bake \
+                     (VICTORY_BAKE_TEXTURES_MS=0: not)"
+                );
+            }
+        }
+    }
+
     /// The texture side of [`State::heap_buffers`]: textures the title fills
     /// itself (streamed pages, layout-library copies) whose views sit in the
     /// view heap are created (placed textures have no host texture until
@@ -1502,6 +1652,7 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
+        TEXTURE_PASS_FRAME.store(frame, Ordering::Relaxed);
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -1536,10 +1687,19 @@ impl State {
         // half a frame per second, while the title streams by the clock.
         // (About a second before the runtime told of the memory it maps:
         // the looks are now only for what that does not tell.)
+        // A run made early (`State::early_textures`) runs between the
+        // frame's own passes: it neither times them nor stretches the wait
+        // (from it, every pass of a frame looked a millisecond apart, and
+        // the wait 256 frames: ten minutes at half a frame per second).
+        let early = PASS_BUDGET.get();
         static PASSED: AtomicU64 = AtomicU64::new(0);
-        let now = crate::host::now_ms();
-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        let most = if early.is_some() {
+            16
+        } else {
+            let now = crate::host::now_ms();
+            let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+            (4000 / took).clamp(16, 256)
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1561,6 +1721,15 @@ impl State {
             (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
         } else {
             (PER_FRAME, SPAN)
+        };
+        // A run made early (`State::early_textures`) has a budget of its
+        // own: its bytes on top of what the frame has spent so far, and its
+        // time is not taken from the world's catching up.
+        let (per_frame, span) = match early {
+            Some((ms, bytes)) => {
+                (SPENT.load(Ordering::Relaxed).saturating_add(bytes), std::time::Duration::from_millis(ms))
+            }
+            None => (per_frame, span),
         };
         let began = std::time::Instant::now();
         for (index, write) in due {
@@ -1701,7 +1870,9 @@ impl State {
                 host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len));
             }
         }
-        catching_up(began.elapsed().saturating_sub(SPAN));
+        if early.is_none() {
+            catching_up(began.elapsed().saturating_sub(SPAN));
+        }
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group

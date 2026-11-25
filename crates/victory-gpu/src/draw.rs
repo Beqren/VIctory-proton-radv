@@ -1202,6 +1202,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.names();
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         if !compute {

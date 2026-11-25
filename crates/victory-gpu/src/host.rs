@@ -92,11 +92,26 @@ static RECORDINGS: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std:
 /// The last number given to a recording.
 static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// In [`RECORDINGS`]: a recording that has named nothing yet (no draw,
+/// dispatch or copy): it cannot read anything let go, and a list made and
+/// never used (run lists-1: number 2, from the start) would hold every
+/// retired object to the ceiling.
+const UNUSED: u64 = u64::MAX - 1;
+
 /// A host list begins a recording: its number.
 fn recording_begins() -> u64 {
     let n = RECORDED.fetch_add(1, Ordering::AcqRel) + 1;
-    RECORDINGS.lock().unwrap_or_else(|e| e.into_inner()).insert(n, u64::MAX);
+    RECORDINGS.lock().unwrap_or_else(|e| e.into_inner()).insert(n, UNUSED);
     n
+}
+
+/// Recording `n` names something (a draw, a dispatch, a copy).
+fn recording_used(n: u64) {
+    if let Some(at) = RECORDINGS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&n)
+        && *at == UNUSED
+    {
+        *at = u64::MAX;
+    }
 }
 
 /// Recording `n` was sent with submission `submission`.
@@ -120,7 +135,7 @@ fn oldest_recording(finished: u64) -> u64 {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .find(|&(_, &sent)| sent == u64::MAX || sent > finished)
+        .find(|&(_, &sent)| sent != UNUSED && (sent == u64::MAX || sent > finished))
         .map_or(u64::MAX, |(&n, _)| n)
 }
 /// Submissions started and finished (waited for).
@@ -1387,8 +1402,8 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
 }
 
 /// A host list's recording number ([`RECORDINGS`]), ended when the list
-/// goes.
-struct Recording(std::sync::atomic::AtomicU64);
+/// goes, and whether the recording has named something yet.
+struct Recording(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicBool);
 
 impl Drop for Recording {
     fn drop(&mut self) {
@@ -3127,7 +3142,10 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
-                recording: Recording(std::sync::atomic::AtomicU64::new(recording_begins())),
+                recording: Recording(
+                    std::sync::atomic::AtomicU64::new(recording_begins()),
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4686,6 +4704,15 @@ impl HostList {
     /// The list is taken from the pool to be recorded.
     pub(crate) fn recording_taken(&self) {
         recording_ends(self.recording.0.swap(recording_begins(), Ordering::AcqRel));
+        self.recording.1.store(false, Ordering::Release);
+    }
+
+    /// The recording names something (a draw, a dispatch, a copy): it now
+    /// holds back what is retired after it ([`retire`]).
+    pub(crate) fn names(&self) {
+        if !self.recording.1.swap(true, Ordering::AcqRel) {
+            recording_used(self.recording.0.load(Ordering::Acquire));
+        }
     }
 
     /// The list was sent with submission `submission`.
@@ -4797,6 +4824,7 @@ impl HostList {
         // The recording before is done with (every submission of the list
         // has run); a new one begins.
         recording_ends(self.recording.0.swap(recording_begins(), Ordering::AcqRel));
+        self.recording.1.store(false, Ordering::Release);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4834,6 +4862,7 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
+        self.names();
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);

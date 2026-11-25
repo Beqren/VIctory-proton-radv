@@ -114,10 +114,38 @@ pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_INTEGER, SLOT_MEMORY, SLOT_SIGNED,
-    SLOT_STRIDE_BITS, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, VIEW_MARK_NONE,
-    VIEW_MARK_SLOTS, VIEW_WRITE_BITS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDE_BITS, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_READS, SLOT_VIEW_WRITES, USER_DATA_SPACE,
+    VIEW_MARK_NONE, VIEW_MARK_SLOTS, VIEW_READ_BITS, VIEW_WRITE_BITS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
+
+/// Read marks (`VICTORY_READ_MARKS`, off by default; after upstream 52d14b1
+/// and 2d6c0df, "read marks"): every image instruction that reads a texture
+/// shader view the program picks from the view heap by an index the host
+/// cannot follow (a descriptor loaded through the heap root, or through a
+/// table at a computed offset) also sets bit `index` (the view's heap
+/// index, at most [`VIEW_READ_BITS`] - 1) of the bitmap
+/// `u<SLOT_VIEW_READS>`, in the lanes that run the instruction. The word is
+/// read first and the atomic OR made only where the bit is clear (most reads
+/// find their slot marked). Reads through a table entry at a fixed offset are
+/// not marked: the host makes and sees those for the draw. The host copies
+/// the bitmap down and clears it behind each submission, so it learns which
+/// slots shaders read: what it makes textures for, and what it may let go.
+/// Part of the translation: the shader cache keys on it.
+pub fn read_marks() -> bool {
+    #[cfg(test)]
+    if let Some(on) = READ_MARKS_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_MARKS").is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`read_marks`] for this thread, whatever the environment says.
+    pub(crate) static READ_MARKS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 /// Page marks (`VICTORY_PAGE_MARKS`, off by default; ported from upstream
 /// cd94d35 and 940d32f, "page marks"): every store or atomic through an

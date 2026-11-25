@@ -305,6 +305,11 @@ struct Lower<'a> {
     /// The immediate sampler an image instruction whose sampler is chosen
     /// by control flow is being lowered with ([`Self::image_each_sampler`]).
     sampler_alt: Option<u32>,
+    /// Read marks (`super::read_marks`): the heap indices of the texture
+    /// views the image instruction being lowered picks by index, and the
+    /// marks made so far (block, index, guard), each once.
+    texture_reads: Vec<V>,
+    read_marked: HashSet<(usize, V, Option<V>)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -1639,6 +1644,8 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             sampler_alt: None,
+            texture_reads: Vec::new(),
+            read_marked: HashSet::new(),
             descriptors: x
                 .res
                 .descriptors
@@ -6522,8 +6529,45 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    /// A handle for the descriptor `src` read at `site`.
-    fn handle(
+    /// A handle for the descriptor `src` read at `site`; the heap index of
+    /// a texture shader view the program picks by index
+    /// ([`Self::read_by_index`]) is noted for the instruction's read mark
+    /// (`super::read_marks`). Noted on every call, a handle made before in
+    /// the block included: each image instruction marks its own reads.
+    fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
+        let h = self.handle_made(site, src, sampler, props)?;
+        if !sampler
+            && let Some(&index) = self.s.texture_index.get(&h)
+            && self.read_by_index(src)
+        {
+            self.texture_reads.push(index);
+        }
+        Ok(h)
+    }
+
+    /// Whether the descriptor `src` is one the host cannot tell is read:
+    /// any of its leaves loaded through the heap root itself (upstream
+    /// 2d6c0df's test), or through a table at an offset the program computes
+    /// (or each lane's own, a waterfall loop's). A table entry at a fixed
+    /// offset is one the host makes and sees for the draw (`draw.rs`,
+    /// `tables`).
+    fn read_by_index(&self, src: &Source) -> bool {
+        src.leaves().iter().any(|l| match l {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => {
+                let Some(a) = self.scalar.get(load) else {
+                    return true;
+                };
+                match self.x.native.layout.get(a.param).map(|p| p.root) {
+                    Some(RootType::ResourceHeap) => true,
+                    Some(RootType::Table) => a.dynamic.is_some() || self.x.res.waterfall.loads.contains(load),
+                    _ => false,
+                }
+            }
+            _ => false,
+        })
+    }
+
+    fn handle_made(
         &mut self,
         site: Site,
         src: &Source,
@@ -9735,7 +9779,59 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
+    /// An image instruction, its reads of texture views picked by index
+    /// marked after it (read marks, `super::read_marks`), in the lanes that
+    /// run it.
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        self.texture_reads.clear();
+        let lowered = self.image_op(inst, b, i);
+        let reads = std::mem::take(&mut self.texture_reads);
+        if lowered.is_ok() && !reads.is_empty() {
+            let guard = self.guard(b, i)?;
+            for index in reads {
+                self.mark_view_read(b, index, guard);
+            }
+        }
+        lowered
+    }
+
+    /// Sets bit `index` (a view-heap index, clamped to the bitmap: a root
+    /// UAV has no bounds check, and a lane the guard leaves out may hold
+    /// anything) of the read-slots bitmap `u<SLOT_VIEW_READS>` where it is
+    /// still clear, under `guard`; once per IR block `b`, index and guard.
+    fn mark_view_read(&mut self, b: usize, index: V, guard: Option<V>) {
+        use super::shader::{SLOT_VIEW_READS, VIEW_READ_BITS};
+        if !self.read_marked.insert((b, index, guard)) {
+            return;
+        }
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let outer = self.begin_guarded(guard);
+        let c = self.cur;
+        let last = k(self, VIEW_READ_BITS - 1);
+        let n = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.s.m.tag(n, Tag::Clamp);
+        let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+        let word = self.s.m.bin(c, Bin::LShr, n, k5);
+        let word = self.s.m.bin(c, Bin::Shl, word, k2);
+        let bit = self.s.m.bin(c, Bin::And, n, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let bitmap = self.s.root_uav_handle(SLOT_VIEW_READS);
+        let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), k(self, 4));
+        // Most reads find their slot marked: a load, not an atomic.
+        let old = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[bitmap, word, iu, mask, align]);
+        let old = self.s.m.extract(c, old, 0);
+        let old = self.as_int(old);
+        let set = self.s.m.bin(c, Bin::And, old, bit);
+        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+        let inner = self.begin_guarded(Some(clear));
+        // Operation 2 is OR.
+        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.end_guarded(inner, &[]);
+        self.end_guarded(outer, &[]);
+    }
+
+    fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -12600,6 +12696,60 @@ mod tests {
         assert!(marked.root_uavs.contains(&super::super::shader::SLOT_VIEW_WRITES));
         assert!(plain.root_srvs.is_empty() && plain.root_uavs.is_empty());
         assert!(marked.dxil.len() > plain.dxil.len(), "the marks are code");
+    }
+
+    /// Read marks: a texture sampled through a table entry at a fixed offset
+    /// marks nothing (the host makes and sees it for the draw); the same
+    /// texture taken from the heap itself, or each lane's own from a table
+    /// (a waterfall loop), marks its read in the read-slots bitmap; without
+    /// the switch nothing does.
+    #[test]
+    fn texture_reads_by_index_mark_their_slot_with_the_switch() {
+        use super::super::shader::SLOT_VIEW_READS;
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let heap = || {
+            let (mut layout, used) = texture_tables();
+            layout[0] = root(RootType::ResourceHeap, 0, 0);
+            (layout, used)
+        };
+        let lowered = |on: bool, (layout, used): (Vec<RootParam>, Vec<UsedResource>)| {
+            super::super::READ_MARKS_TEST.set(Some(on));
+            let l = lower_with(&words, layout, used);
+            super::super::READ_MARKS_TEST.set(None);
+            l.unwrap()
+        };
+        let tabled = lowered(true, texture_tables());
+        assert!(!tabled.root_uavs.contains(&SLOT_VIEW_READS), "a fixed table entry is the host's to see");
+        let marked = lowered(true, heap());
+        let plain = lowered(false, heap());
+        assert!(marked.root_uavs.contains(&SLOT_VIEW_READS));
+        assert!(plain.root_uavs.is_empty());
+        assert!(marked.dxil.len() > plain.dxil.len(), "the marks are code");
+        // Each lane's own descriptor from a table: a waterfall loop.
+        use crate::resource::tests::WATERFALL_FETCHED_WAVE32;
+        super::super::READ_MARKS_TEST.set(Some(true));
+        let (layout, used) = texture_tables();
+        let waterfall = lower_wave(WATERFALL_FETCHED_WAVE32, layout, used, false);
+        super::super::READ_MARKS_TEST.set(None);
+        assert!(waterfall.unwrap().root_uavs.contains(&SLOT_VIEW_READS));
     }
 
     #[test]

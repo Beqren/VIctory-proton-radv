@@ -5450,9 +5450,28 @@ fn direct_writes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
 }
 
+/// The kernel's write of `n` bytes from `src` to `at` in this process, as
+/// [`write_mapped`] makes it: the NTSTATUS and the bytes written.
+#[cfg(test)]
+pub(crate) fn kernel_write(at: usize, src: *const u8, n: usize) -> (i32, usize) {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    // SAFETY: the caller's source; the kernel checks the destination.
+    let status = unsafe { NtWriteVirtualMemory(GetCurrentProcess(), at as _, src.cast(), n, &mut done) };
+    (status, done)
+}
+
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+/// wrote), leaving pages that cannot be written alone; returns those, as
+/// runs of 4 KiB pages of the destination (address, bytes), in order.
+///
+/// Under Wine the kernel's write is a wineserver request that writes with
+/// `process_vm_writev`, which honours the pages' protection: a page made
+/// read-only (a guard of ours put back by a copy's refresh, or the title's)
+/// fails it with `STATUS_PARTIAL_COPY` and is not written (shown by the
+/// test `a_kernel_write_into_a_guarded_block_is_refused`). These used to
+/// be dropped without a word.
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> Vec<(usize, usize)> {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
@@ -5473,16 +5492,23 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
+    let mut failed: Vec<(usize, usize)> = Vec::new();
     if len == 0 || write(dst as usize, len) {
-        return;
+        return failed;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                if !write(at, n) {
+                    match failed.last_mut() {
+                        Some(last) if last.0 + last.1 == at => last.1 += n,
+                        _ => failed.push((at, n)),
+                    }
+                }
             });
         }
     });
+    failed
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of

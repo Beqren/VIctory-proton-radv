@@ -300,6 +300,35 @@ struct Lower<'a> {
     abort: Option<usize>,
 }
 
+/// The SGPR holding the collision wave id of a pixel program the console
+/// runs in primitive order (POPS: `DB_SHADER_CONTROL` bit 16,
+/// `PRIMITIVE_ORDERED_PIXEL_SHADER`), if this is one: the one after the
+/// primitive mask, which follows the user SGPRs (the end of the root
+/// layout's). The title's ten such programs (e.g. #a76619e2dcb45652, 17 user
+/// SGPRs) decode it into a packer id for `HW_REG_POPS_PACKER` and wait in an
+/// `s_sleep` loop on `src_pops_exiting_wave_id` until the overlapping waves
+/// before them are done, then read and write their UAVs (`glc dlc` image
+/// loads and stores); the host gets that order from rasterizer-ordered
+/// views.
+fn pops_collision(native: &NativeProgram) -> Option<u8> {
+    let StageIo::Ps {
+        db_shader_control, ..
+    } = native.io
+    else {
+        return None;
+    };
+    if native.stage != HwStage::Ps || db_shader_control & 1 << 16 == 0 {
+        return None;
+    }
+    let user = native
+        .layout
+        .iter()
+        .filter(|p| p.sgprs > 0)
+        .map(|p| u32::from(p.user_data) + p.sgprs)
+        .max()?;
+    u8::try_from(user + 1).ok()
+}
+
 /// Iterations after which a loop is left (per entry into it), unless
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
@@ -1239,6 +1268,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.ordered = pops_collision(x.native).is_some();
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -2256,6 +2286,12 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // A primitive-ordered pixel program's collision wave id
+                    // (`pops_collision`): its bit 31 clear says no earlier
+                    // wave overlaps this one, so the code's wait for one is
+                    // skipped. The host's rasterizer-ordered views order the
+                    // UAV accesses instead (`Shader::ordered`).
+                    None if pops_collision(self.x.native) == Some(n) => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3126,6 +3162,9 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id`: read only by the wait the
+            // collision wave id of 0 skips (see `inputs`).
+            Operand::Const(239) if self.s.ordered => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -6180,6 +6219,11 @@ impl<'a> Lower<'a> {
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
+                    // (In a primitive-ordered program it would have to be a
+                    // rasterizer-ordered view, which a root UAV is not made as.)
+                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) if self.s.ordered => {
+                        Err("a root UAV of a primitive-ordered pixel program")
+                    }
                     (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }

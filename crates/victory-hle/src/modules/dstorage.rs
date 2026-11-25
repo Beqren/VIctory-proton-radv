@@ -1079,9 +1079,9 @@ static BUFFERED: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU
 /// Writes a request's bytes into its title address from user mode
 /// ([`victory_gpu::write_title_memory`]): a block guarded meanwhile faults
 /// into the guard and is opened and noted written. A destination with a
-/// page that cannot be written now (not committed, or read-only not by
-/// our hand) is tried again; the request fails only when the tries are used
-/// up.
+/// committed page that cannot be written now (read-only not by our hand,
+/// or a guard page) is tried again, and the request fails when the tries
+/// are used up; one with a page not committed fails at once.
 fn copy_in(request: &Request, data: &[u8]) -> Result<(), HRESULT> {
     use victory_gpu::TitleWrite;
     let at = request.destination as usize;
@@ -1108,8 +1108,11 @@ fn copy_in(request: &Request, data: &[u8]) -> Result<(), HRESULT> {
                 }
                 return Ok(());
             }
-            TitleWrite::Refused { at: page, state, protect, kind } => {
-                if tries >= retries() {
+            refused @ TitleWrite::Refused { at: page, state, protect, kind } => {
+                // Only a committed page read-only for now is waited for:
+                // memory freed under the request may be another
+                // allocation's by the next try.
+                if tries >= retries() || !refused.transient() {
                     let given_up = BUFFERED[2].fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::warn!(
                         page = format_args!("{page:#x}"),
@@ -1685,8 +1688,25 @@ mod tests {
     /// copy guards again after `kernel_will_write` opened it. Read in place
     /// it fails with ERROR_NOACCESS; read beside it lands, and the block is
     /// reported written to the copies.
+    /// Tests that set the process-wide test switches (`BESIDE_TEST`,
+    /// `REGUARD`, `victory_gpu::test_between`), one at a time; they are
+    /// reset when the test ends, passed or not.
+    static SWITCHES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ResetSwitches;
+
+    impl Drop for ResetSwitches {
+        fn drop(&mut self) {
+            BESIDE_TEST.store(0, Ordering::Relaxed);
+            REGUARD.store(false, Ordering::Relaxed);
+            victory_gpu::test_between(None);
+        }
+    }
+
     #[test]
     fn raw_reads_into_a_view_guarded_again_land() {
+        let _one_at_a_time = SWITCHES.lock().unwrap_or_else(|e| e.into_inner());
+        let _reset = ResetSwitches;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
         };

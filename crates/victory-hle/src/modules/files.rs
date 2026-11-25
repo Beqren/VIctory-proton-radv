@@ -546,14 +546,15 @@ pub extern "system" fn ReadFile(
 /// before.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
-    let total = size.saturating_mul(count);
     static BESIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let beside = *BESIDE.get_or_init(|| std::env::var_os("VICTORY_READ_BESIDE").is_none_or(|v| v != "0"));
-    if !beside || buffer.is_null() || total == 0 {
-        victory_gpu::kernel_will_write(buffer as usize, total);
-        // The CRT's own checks and answer (EINVAL, or nothing to read).
+    let total = size.checked_mul(count).filter(|_| beside && !buffer.is_null());
+    let Some(total) = total.filter(|&t| t != 0 && (buffer as usize).checked_add(t).is_some()) else {
+        victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+        // The CRT's own checks and answer (EINVAL, an overflowing size,
+        // or nothing to read).
         return read(buffer, size, count, stream);
-    }
+    };
     const CHUNK: usize = 1 << 20;
     let mut chunk = vec![0u8; total.min(CHUNK)];
     let mut done = 0;
@@ -561,7 +562,9 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         let want = (total - done).min(CHUNK);
         let n = read(chunk.as_mut_ptr(), 1, want, stream);
         if n > 0 {
-            let to = buffer as usize + done;
+            let Some(to) = (buffer as usize).checked_add(done) else {
+                break; // not reached: `buffer + total` was checked
+            };
             if let victory_gpu::TitleWrite::Refused { at, state, protect, .. } =
                 victory_gpu::write_title_memory(to, &chunk[..n])
             {

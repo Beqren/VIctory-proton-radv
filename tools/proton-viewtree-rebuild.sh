@@ -108,9 +108,13 @@ if cmp -s "$STOCK_SERVER" "$STAGE/files/bin/wineserver"; then die "staged server
 # 7. replace the copy and fix the prefix, under the Proton lock
 exec 8>"$LOCK"
 flock -w "$LOCK_WAIT" 8 || die "a Proton job holds $LOCK; the old copy is untouched. Try again when it ends (LOCK_WAIT=<seconds> waits for it)."
-if ps -eo args | grep -F "$COPY/" | grep -qv grep; then
-  die "a process is running from $COPY; the old copy is untouched"
-fi
+# a wineserver lingers a few seconds after a job: wait for processes running from the copy (by exe)
+in_use() { for e in /proc/[0-9]*/exe; do case $(readlink "$e" 2>/dev/null) in "$COPY"/*) return 0 ;; esac; done; return 1; }
+n=0
+while in_use; do
+  n=$((n + 1)); [ "$n" -le 30 ] || die "a process is still running from $COPY; the old copy is untouched"
+  sleep 2
+done
 rm -rf "$COPY"
 mv "$STAGE" "$COPY"
 trap - EXIT

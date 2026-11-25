@@ -342,6 +342,19 @@ Fixes, helped by the faster frames of the patched wineserver:
 - Eviction of host textures by their last read (`VICTORY_TEXTURE_EVICT=1`) is off:
   the host sees no reads of 6.2 of the 6.4 GB of textures slots show (programs
   pick them by index), and what it can see is read again within seconds.
+- Read marks (branch texture-on-read, all off; after upstream 52d14b1, 2d6c0df,
+  69d1e8e): `VICTORY_READ_MARKS=1` makes translated shaders set a bit per heap slot
+  they read by index (a root UAV `u250`, copied down and cleared behind every
+  submission), so the host sees every read: 0 MB of shown textures with unseen
+  reads (6.3-7.3 GB without), and of 7.3 GB shown only 1.15 GB was read in the
+  last frames. `VICTORY_TEXTURE_ON_READ=1` makes slots only once read;
+  `VICTORY_TEXTURE_EVICT=1` with marks evicts after 120 s/300 frames unread and
+  past 90% of the budget down to 85%. Runs onread-3 to -7 (155-158 s of world, no
+  fault with the merge of world-start-crash): the card settles at 72-86% instead of
+  96-98%, slot makings refused for room 12-75 thousand instead of 281 thousand; but
+  16-53 thousand textures are made again within 10 s of their eviction (most in the
+  world's first minute), and a bake reads what was evicted (skin baked plastic until
+  evicted slots go back before a bake). Off until the thrash is near zero.
 - `tools/face_time.py` measures the result: from the per-frame log line of character
   textures asked for and missing on the card, it prints the frames and seconds after
   the world's first frame until none is missing.

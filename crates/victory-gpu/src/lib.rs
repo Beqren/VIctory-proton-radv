@@ -62,5 +62,9 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    TitleWrite, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    write_title_memory, writing as kernel_will_write,
 };
+#[cfg(all(windows, feature = "test-hooks"))]
+#[doc(hidden)]
+pub use watch::{test_between, test_guard};

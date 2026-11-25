@@ -46,6 +46,8 @@ windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Its tests guard title memory as the GPU side's copies do.
+victory-gpu = { workspace = true, features = ["test-hooks"] }
 
 [features]
 # Debugging switches (scripted keys and the like).

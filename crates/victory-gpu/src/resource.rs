@@ -1245,6 +1245,34 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// Diagnostics: for `this`, a texture made for a view the title placed in
+/// memory that [`alias_of`] found no texture for: the title texture the
+/// host writes whose memory it lies in, if any (its start, the offset into
+/// it, and both descriptions). Such a view reads title memory, which the
+/// host's writes never reach.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn alias_miss(this: This) -> Option<(This, String)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if !r.host.placed.load(Relaxed) || !fills(&r.desc) {
+        return None;
+    }
+    let at = r.data() as u64;
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let (&start, &other) = targets.range(..=at).next_back()?;
+    let o = resource(other as This);
+    let size = footprint(&o.desc).map_or(0, |f| f.size);
+    (at < start + size).then(|| {
+        (
+            other as This,
+            format!("target {other:#x} at {start:#x} (+{:#x} of {size:#x}) {:?}; view's texture {:?}", at - start, o.desc, r.desc),
+        )
+    })
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.
@@ -1381,6 +1409,37 @@ pub(crate) fn room() -> bool {
     match crate::host::host().and_then(|h| h.video_memory()) {
         Some([budget, used, ..]) => used < budget / 10 * 9,
         None => filled < WITHOUT_BUDGET,
+    }
+}
+
+/// Past [`room`]: whether the card's memory in use is still under
+/// `VICTORY_TEXTURE_RESERVE_PERCENT` of the budget (96; 0: no reserve),
+/// a band kept for the textures picked by index that have waited longest
+/// (`draw.rs`, `starved`). The pass admitted nothing once the card was at
+/// nine tenths: in run D (2026-11-25) the main character's head textures,
+/// due from frame 835, were still waiting at frame 866 among some 9,000
+/// due slots, and her face was black. The band is a share of the same
+/// budget, so the system does not move memory out because of it.
+/// `asked`: for the textures draws asked for lately, the edge of the
+/// budget instead (99%): they are a few MB a frame (the head's three maps
+/// are 3.2 MB), and in run E the card stood at 97% of its budget for
+/// minutes, past the reserve, with the head's normal map still waiting.
+#[cfg(windows)]
+pub(crate) fn reserve_room(asked: bool) -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_RESERVE_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(96, |p| p.min(98))
+    });
+    if percent <= 90 || std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
+        return false;
+    }
+    let percent = if asked { 99 } else { percent };
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => used < budget / 100 * percent,
+        None => false,
     }
 }
 
@@ -2063,6 +2122,15 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
         [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
         _ => 0,
     }
+}
+
+/// The resource [`texture_at`] made for a texture placed at `address` with
+/// the description `desc`, if it has made one: never made here (for the
+/// frame listing, which must not count as a use).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(address, *desc)).map(|&r| r as This)
 }
 
 /// The resource for a texture placed at `address` with the resource

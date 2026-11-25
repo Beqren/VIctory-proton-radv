@@ -5747,9 +5747,13 @@ impl Meter {
                 tracing::info!(
                     "textures picked by index, looked at again after their upload: {same} looks found them unchanged, \
                      {changed} changed (uploaded again), {waiting} wait for a look; early passes: {} at a frame's first draw, \
-                     {} before a draw of the decoration bake",
+                     {} before a draw of the decoration bake; {} made in the reserve band of a full card; \
+                     slots draws asked for: {} noted, {} made on a full card",
                     crate::draw::EARLY_TEXTURE_PASSES[0].load(Ordering::Relaxed),
-                    crate::draw::EARLY_TEXTURE_PASSES[1].load(Ordering::Relaxed)
+                    crate::draw::EARLY_TEXTURE_PASSES[1].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_RESERVED.load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_ASKED[0].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_ASKED[1].load(Ordering::Relaxed)
                 );
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
@@ -5782,6 +5786,15 @@ impl Meter {
                      {own} of their own memory, {free} of memory no other view describes, {start} of memory another texture \
                      begins at, {other} of another's memory ({shows} of all these show another view); {back} put back into the \
                      queue since the start"
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                let [waiting, stale, gone, refused] =
+                    [0, 1, 2, 3].map(|i| crate::descriptor::host::TINTED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "null texture slots shown in colour (VICTORY_NULL_MAGENTA=1) since the start: {stale} cyan (stale), \
+                     {gone} green (unmapped), {refused} yellow (no room on the card); {waiting} other"
                 );
             }
             #[cfg(feature = "diagnostics")]

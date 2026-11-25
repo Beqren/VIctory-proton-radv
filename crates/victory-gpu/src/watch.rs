@@ -446,8 +446,14 @@ impl Guards {
 /// failed asking costs as much as one that works: run 1 of the frame study
 /// had 7,800-9,600 failed `GetWriteWatch` calls a frame, 24-27 GB passed to
 /// them, 267-291 ms a frame (of 280-300 ms for all calls), most from
-/// `ask_run` halving merged spans that hold views and failing again. The
-/// answers do not change: a range that begins in a view fails the asking
+/// `ask_run` halving merged spans that hold views and failing again.
+/// Measured on late world frames (off-screen, `VICTORY_VIEWS_KNOWN=0` in
+/// run 3 against on in run 4): GetWriteWatch calls 4,980-8,314 a frame,
+/// 568-1,093 ms, 37.6-44.7 GB passed, against 973-1,156, 228-397 ms,
+/// 3.0-3.5 GB; failed ones 4,536-7,852 (551-1,036 ms) against 536-687
+/// (135-209 ms). Frame times did not move beyond the runs' noise: the
+/// frame waits mostly on the runtime's page remaps (see the frame study's
+/// breakdown). The answers do not change: a range that begins in a view fails the asking
 /// whole, and went to the guards anyway. The guards' sets are cleared where
 /// the runtime maps or unmaps ([`title_memory_remapped`]); memory released
 /// and reserved again write-watched with no remapping told would be guarded

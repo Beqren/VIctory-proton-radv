@@ -127,6 +127,12 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
+    // View memory is not asked about: the asking fails, and halves, and
+    // fails again (see [`views_known`]).
+    if views_known() {
+        let g = guards();
+        pieces.retain(|p| !g.known(p.0));
+    }
     if pieces.len() < 2 {
         return;
     }
@@ -224,6 +230,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
+    // What view memory there is, left to `writes` (as a failed asking
+    // would leave it).
+    let views: Vec<bool> = if views_known() {
+        let g = guards();
+        ranges.iter().map(|r| r.0 < r.1 && g.known(r.0 / PAGE)).collect()
+    } else {
+        vec![false; ranges.len()]
+    };
     let mut j = journal();
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -236,8 +250,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
-        if start >= end {
+    for (&(start, end), view) in ranges.iter().zip(views) {
+        if start >= end || view {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -354,7 +368,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     j.found.resize(count.max(j.found.len()), 0);
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let failed = !kernel_writes(first, last, &mut j.found, &mut count);
+    let view = guarded && views_known() && guards().known(first);
+    let failed = view || !kernel_writes(first, last, &mut j.found, &mut count);
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -414,6 +429,34 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
 });
+
+impl Guards {
+    /// Whether the guards hold `block` (read-only by our hand, or noted
+    /// absent): it is view memory, which the write watch refuses.
+    fn known(&self, block: usize) -> bool {
+        self.protected.contains(&block) || self.absent.contains(&block)
+    }
+}
+
+/// Whether a range whose first block the guards hold goes to the guards
+/// without asking the write watch first (`VICTORY_VIEWS_KNOWN=0` asks, as
+/// before).
+///
+/// Views are never write-watched, so the asking fails, and under Wine a
+/// failed asking costs as much as one that works: run 1 of the frame study
+/// had 7,800-9,600 failed `GetWriteWatch` calls a frame, 24-27 GB passed to
+/// them, 267-291 ms a frame (of 280-300 ms for all calls), most from
+/// `ask_run` halving merged spans that hold views and failing again. The
+/// answers do not change: a range that begins in a view fails the asking
+/// whole, and went to the guards anyway. The guards' sets are cleared where
+/// the runtime maps or unmaps ([`title_memory_remapped`]); memory released
+/// and reserved again write-watched with no remapping told would be guarded
+/// instead of watched, which still sees every write (the guards work on
+/// any memory).
+fn views_known() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_KNOWN").is_none_or(|v| v != "0"))
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     #[cfg(feature = "diagnostics")]

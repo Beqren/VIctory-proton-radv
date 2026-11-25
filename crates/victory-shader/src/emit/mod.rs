@@ -1508,12 +1508,23 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_in(words, input_addr, 0, vec![], vec![])
+    }
+
+    /// [`pixel`] with `DB_SHADER_CONTROL` and a root layout.
+    fn pixel_in(
+        words: &[u32],
+        input_addr: u32,
+        db_shader_control: u32,
+        layout: Vec<crate::native::RootParam>,
+        used: Vec<crate::native::UsedResource>,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
             vgprs: 8,
-            layout: vec![],
-            used: vec![],
+            layout,
+            used,
             io: StageIo::Ps {
                 inputs: vec![PsInput {
                     usage: Usage::Generic,
@@ -1526,7 +1537,7 @@ mod barycentric_tests {
                     row2: 0,
                 }],
                 input_addr,
-                db_shader_control: 0,
+                db_shader_control,
                 patches: vec![],
             },
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -1542,6 +1553,68 @@ mod barycentric_tests {
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
         emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A primitive-ordered pixel program (POPS, `DB_SHADER_CONTROL` bit 16)
+    /// skips its wait for overlapping waves, and its UAVs become
+    /// rasterizer-ordered views; the same code in an unordered program
+    /// reads an SGPR the hardware does not give it.
+    #[test]
+    fn a_primitive_ordered_pixel_program_orders_its_uavs() {
+        let mut words = vec![
+            0x8F03_9F02, // 0x00: s_lshr_b32 s3, s2, 31 (s2: the collision wave id)
+            0xBF06_8003, // s_cmp_eq_u32 s3, 0
+            0xBF85_0003, // s_cbranch_scc1 -> 0x18
+            0xBF8E_0001, // 0x0c: s_sleep 1
+            0xBF0A_EF02, // s_cmp_lt_u32 s2, src_pops_exiting_wave_id
+            0xBF84_FFFD, // s_cbranch_scc0 -> 0x0c
+            0xBE84_0300, // 0x18: s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_02F2, // v_mov_b32 v4, 1.0
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0
+            0x7E0C_02F2, // v_mov_b32 v6, 1.0
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xF020_1F08,
+            0x0002_0402, // image_store v[4:7], v[2:3], s[8:15] dmask:0xf dim:2D unorm
+        ];
+        words.extend(exp_mrt0(4));
+        words.push(0xBF81_0000);
+        // A table of one 2D UAV at s0: s1 is the primitive mask, s2 the
+        // collision wave id.
+        let layout = || {
+            vec![crate::native::RootParam {
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let used = || {
+            vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Uav,
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let ordered = pixel_in(&words, PERSP_CENTER, 1 << 16, layout(), used()).unwrap();
+        let (features, _) = parts(&ordered);
+        assert_ne!(features & 0x1000, 0, "SFI0 {features:#x}: no ROVs");
+        let Err(e) = pixel_in(&words, PERSP_CENTER, 0, layout(), used()) else {
+            panic!("an unordered program read the collision wave id");
+        };
+        assert!(e.to_string().contains("hardware SGPR input"), "{e}");
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.

@@ -202,6 +202,9 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
+    /// The immediate sampler an image instruction whose sampler is chosen
+    /// by control flow is being lowered with ([`Self::image_each_sampler`]).
+    sampler_alt: Option<u32>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -295,6 +298,35 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+}
+
+/// The SGPR holding the collision wave id of a pixel program the console
+/// runs in primitive order (POPS: `DB_SHADER_CONTROL` bit 16,
+/// `PRIMITIVE_ORDERED_PIXEL_SHADER`), if this is one: the one after the
+/// primitive mask, which follows the user SGPRs (the end of the root
+/// layout's). The title's ten such programs (e.g. #a76619e2dcb45652, 17 user
+/// SGPRs) decode it into a packer id for `HW_REG_POPS_PACKER` and wait in an
+/// `s_sleep` loop on `src_pops_exiting_wave_id` until the overlapping waves
+/// before them are done, then read and write their UAVs (`glc dlc` image
+/// loads and stores); the host gets that order from rasterizer-ordered
+/// views.
+fn pops_collision(native: &NativeProgram) -> Option<u8> {
+    let StageIo::Ps {
+        db_shader_control, ..
+    } = native.io
+    else {
+        return None;
+    };
+    if native.stage != HwStage::Ps || db_shader_control & 1 << 16 == 0 {
+        return None;
+    }
+    let user = native
+        .layout
+        .iter()
+        .filter(|p| p.sgprs > 0)
+        .map(|p| u32::from(p.user_data) + p.sgprs)
+        .max()?;
+    u8::try_from(user + 1).ok()
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1236,6 +1268,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.ordered = pops_collision(x.native).is_some();
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -1485,6 +1518,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            sampler_alt: None,
             descriptors: x
                 .res
                 .descriptors
@@ -2252,6 +2286,12 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // A primitive-ordered pixel program's collision wave id
+                    // (`pops_collision`): its bit 31 clear says no earlier
+                    // wave overlaps this one, so the code's wait for one is
+                    // skipped. The host's rasterizer-ordered views order the
+                    // UAV accesses instead (`Shader::ordered`).
+                    None if pops_collision(self.x.native) == Some(n) => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3122,6 +3162,9 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id`: read only by the wait the
+            // collision wave id of 0 skips (see `inputs`).
+            Operand::Const(239) if self.s.ordered => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -4773,7 +4816,7 @@ impl<'a> Lower<'a> {
                     .bvh(inst, b, i)
                     .map_err(|why| unsupported(offset, why));
             }
-            Fields::Image { .. } => self.image(inst, b, i),
+            Fields::Image { .. } => self.image_each_sampler(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
@@ -5669,11 +5712,21 @@ impl<'a> Lower<'a> {
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
+                // Its record count too, for a buffer view the root layout lists:
+                // `ShallowWaterSimCS_MinTimestepReduce` (#ceb5eb68cd99cb07)
+                // loads a structured buffer's descriptor only to skip its
+                // work when the count is 0.
+                let records = if count > 2 {
+                    self.buffer_records(site).ok()
+                } else {
+                    None
+                };
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
+                    match (k, records) {
+                        (0, _) => self.write(inst, reg, lo, None),
+                        (1, _) => self.write(inst, reg, hi, None),
+                        (2, Some(n)) => self.write(inst, reg, n, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
@@ -5842,6 +5895,42 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The record count (dword 2) of the buffer view loaded at `site`, from
+    /// the host, as `descriptor_data` gives it for a buffer the code reads
+    /// through: elements for a view of elements of more than a byte.
+    fn buffer_records(&mut self, site: Site) -> Result<V, Why> {
+        let src = Source::Loaded {
+            load: site,
+            first: 0,
+        };
+        let used = self
+            .used_kind(&src)
+            .filter(|u| u.dwords == 4 && matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+            .ok_or("a descriptor that is no buffer view")?;
+        let (stride, u) = (used.stride, if used.kind == ResourceType::Uav { 0x1000 } else { 0 });
+        let props = if stride >= 4 && stride.is_multiple_of(4) {
+            (12 | u, stride)
+        } else {
+            (11 | u, 0)
+        };
+        let h = self.handle(site, &src, false, props)?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let iu = self.s.m.undef(i32t);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, iu]);
+        let n = self.s.m.extract(c, d, 0);
+        // A raw view counts bytes.
+        Ok(if props.0 & 0xFF == 11 && stride > 1 {
+            let k = self.s.m.i32(stride);
+            self.s.m.bin(c, Bin::UDiv, n, k)
+        } else {
+            n
+        })
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -6147,23 +6236,8 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
+                let n = self.static_sampler(words)?;
+                Ok(self.static_sampler_handle(n, props))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
@@ -6191,6 +6265,11 @@ impl<'a> Lower<'a> {
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the
                     // entry's stride (`buffer`).
+                    // (In a primitive-ordered program it would have to be a
+                    // rasterizer-ordered view, which a root UAV is not made as.)
+                    (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) if self.s.ordered => {
+                        Err("a root UAV of a primitive-ordered pixel program")
+                    }
                     (RootType::Descriptor, Some(ResourceType::Uav), 11 | 0x100b) => {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
@@ -6231,6 +6310,139 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// The immediate sampler of these words: its number among the program's
+    /// static samplers.
+    fn static_sampler(&mut self, words: &[u32]) -> Result<u32, Why> {
+        let words: [u32; 4] = words
+            .get(..4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or("a sampler constant")?;
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        Ok(n as u32)
+    }
+
+    /// A handle for immediate sampler `n`, in the current block.
+    fn static_sampler_handle(&mut self, n: u32, props: (u32, u32)) -> V {
+        if props.0 & 0x8000 != 0 {
+            // shortcut: one sampler used with and without comparison
+            // would need two static samplers; it becomes a comparison one.
+            self.s.cmp_samplers |= 1 << n;
+        }
+        self.s.sampler_handle(self.cur, n)
+    }
+
+    /// An image instruction, once per sampler its sampler may be when a
+    /// join picks it between immediate samplers. The title's
+    /// `PS_TexturedDeferred` family (40 programs of the pack, e.g.
+    /// #91321f9948435001) picks wrap or clamp by a constant-buffer flag:
+    /// `s_movk_i32 s0, 0x92` on one path, `s_mov_b32 s0, 0` on the other,
+    /// the sampler's other dwords after the join. Static samplers are
+    /// bindings and a handle cannot be joined: each choice is sampled in the
+    /// current block and the results are picked by the edge the join was
+    /// entered by (uniform: a scalar join). A join of an immediate sampler
+    /// with a heap one is still refused (none of the pack's; sampling the
+    /// heap's at a made-up index where the immediate one is chosen could
+    /// read a slot the host never wrote).
+    // shortcut: the samplers not chosen are sampled too and their results
+    // dropped.
+    fn image_each_sampler(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let src = match self.descriptors.get(&((b, i), true)) {
+            Some(&src @ Source::Phi { .. })
+                if src
+                    .leaves()
+                    .iter()
+                    .all(|l| matches!(l, Source::Constant(_))) =>
+            {
+                src
+            }
+            _ => return self.image(inst, b, i),
+        };
+        let Source::Phi { block, args } = src else {
+            unreachable!()
+        };
+        let mut statics = Vec::new();
+        let pick = self.sampler_choice(*block, args, 8, &mut statics)?;
+        let mut picked: Option<Vec<V>> = None;
+        for n in statics {
+            self.sampler_alt = Some(n);
+            let r = self.image(inst, b, i);
+            self.sampler_alt = None;
+            r?;
+            let vals = inst
+                .writes
+                .iter()
+                .map(|&(_, v)| match self.vals.get(&v) {
+                    Some(&Val::I32(x)) => Ok(x),
+                    _ => Err(WHY),
+                })
+                .collect::<Result<Vec<V>, Why>>()?;
+            picked = Some(match picked {
+                None => vals,
+                Some(before) => {
+                    let c = self.cur;
+                    let n = self.s.m.i32(n);
+                    let this = self.s.m.cmp(c, pred::EQ, pick, n);
+                    vals.into_iter()
+                        .zip(before)
+                        .map(|(x, y)| self.s.m.select(c, this, x, y))
+                        .collect()
+                }
+            });
+        }
+        for (&(_, v), x) in inst.writes.iter().zip(picked.ok_or(WHY)?) {
+            self.vals.insert(v, Val::I32(x));
+        }
+        Ok(())
+    }
+
+    /// [`Self::descriptor_phi`] for a sampler every edge gives an immediate
+    /// sampler: the number of the one the join picks (each listed in
+    /// `statics`).
+    fn sampler_choice(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        depth: u32,
+        statics: &mut Vec<u32>,
+    ) -> Result<V, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        let p = self.x.p;
+        let mut incoming = Vec::new();
+        for (&q, arg) in p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let pick = match arg {
+                Source::Constant(words) => {
+                    let n = self.static_sampler(words)?;
+                    if !statics.contains(&n) {
+                        statics.push(n);
+                    }
+                    self.s.m.i32(n)
+                }
+                Source::Phi {
+                    block: inner,
+                    args: inner_args,
+                } if depth > 0 => self.sampler_choice(*inner, inner_args, depth - 1, statics)?,
+                _ => return Err(WHY),
+            };
+            incoming.push((pick, at));
+        }
+        let join = self.block[block].ok_or(WHY)?;
+        let pick = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(pick, incoming);
+        Ok(pick)
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its
@@ -9486,7 +9698,11 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let sprops = (14 | if cmp { 0x8000 } else { 0 }, 0);
+            let sh = match self.sampler_alt {
+                Some(n) => self.static_sampler_handle(n, sprops),
+                None => self.handle(site, ss, true, sprops)?,
+            };
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -11754,5 +11970,116 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn a_sampler_joined_from_an_immediate_and_a_table_one_is_refused() {
+        // One path moves an immediate sampler into s[8:11], the other loads
+        // one from the sampler table at s1; the join samples with it.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xBF06_8001, // 0x20: s_cmp_eq_u32 s1, 0
+            0xBF85_0008, // s_cbranch_scc1 -> 0x48
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92
+            0xBE89_03FF,
+            0x00C0_0000, // s_mov_b32 s9, 0xc00000
+            0xBE8A_03FF,
+            0x1850_0000, // s_mov_b32 s10, 0x18500000
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xBF82_0002, // 0x44: s_branch -> 0x50
+            0xF408_0203,
+            0xFA00_0000, // 0x48: s_load_dwordx4 s[8:11], s[6:7], 0x0
+            0xBF8C_0070, // 0x50: s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        // (Where the immediate one is chosen there is no heap index.)
+        let Err(e) = lower_with(&words, layout, used) else {
+            panic!("lowered");
+        };
+        assert!(e.to_string().contains("chosen by control flow"), "{e}");
+    }
+
+    #[test]
+    fn a_buffer_descriptor_loaded_only_for_its_record_count_gets_it_from_the_host() {
+        // `ShallowWaterSimCS_MinTimestepReduce`: the work is skipped when a
+        // structured buffer's record count (dword 2) is 0.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF06_800A, // s_cmp_eq_u32 s10, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x24
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 16,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_sampler_joined_from_two_immediate_ones_samples_with_each() {
+        // `PS_TexturedDeferred` (#91321f9948435001): wrap or clamp, picked
+        // by a flag; the sampler's first dword differs by path.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0xBF06_8001, // 0x18: s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> 0x28
+            0xB008_0092, // s_movk_i32 s8, 0x92
+            0xBF82_0001, // 0x24: s_branch -> 0x2c
+            0xBE88_0380, // 0x28: s_mov_b32 s8, 0
+            0xBE89_03FF,
+            0x00C0_0000, // 0x2c: s_mov_b32 s9, 0xc00000
+            0xBE8A_03FF,
+            0x1850_0000, // s_mov_b32 s10, 0x18500000
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xD834_0000,
+            0x0000_0C00, // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (layout, used) = texture_tables();
+        let l = lower_with(&words, layout, used).unwrap();
+        let mut samplers = l.samplers.clone();
+        samplers.sort_unstable();
+        assert_eq!(
+            samplers,
+            vec![[0, 0xC0_0000, 0x1850_0000, 0], [0x92, 0xC0_0000, 0x1850_0000, 0]]
+        );
+        assert_eq!(l.nonuniform_handles, 0);
     }
 }

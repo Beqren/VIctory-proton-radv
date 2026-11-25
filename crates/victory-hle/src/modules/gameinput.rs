@@ -135,12 +135,16 @@ fn one_pad() -> bool {
 
 /// All the host pads as one, in the first slot: a button held on any of them
 /// (or its key on the keyboard's stand-in) is held, each trigger is the one
-/// pulled furthest, each stick axis the one pushed furthest. With no host
-/// pad nothing changes (the stand-in is its own device then).
+/// pulled furthest, each stick axis the one pushed furthest.
+///
+/// The first pad is there whether or not a host pad is: with none it is the
+/// keyboard's stand-in alone. So the title's pad never goes or comes when a
+/// controller is unplugged or plugged in. Before, with no controller at
+/// the start the title took the stand-in as its pad (another device), and
+/// when the controller was turned on the stand-in went: the title said its
+/// pad was disconnected and did not take the new one (the owner's session
+/// of 2026-11-25 20:13).
 fn as_one_pad(pads: [Option<PadState>; PADS], keys: &[KeyState]) -> [Option<PadState>; PADS] {
-    if pads.iter().all(Option::is_none) {
-        return pads;
-    }
     let further = |a: f32, b: f32| if b.abs() > a.abs() { b } else { a };
     let mut one = fallback(keys);
     for pad in pads.into_iter().flatten() {
@@ -1322,8 +1326,11 @@ mod tests {
         let one = as_one_pad([Some(silent), Some(held), None, None], &[]);
         assert_eq!(one[0], Some(held), "the second pad's state is the first's");
         assert!(one[1..].iter().all(Option::is_none), "and the title sees one pad");
-        // No host pad: left alone, the keyboard's stand-in is its own device.
-        assert_eq!(as_one_pad([None; PADS], &[]), [None; PADS]);
+        // No host pad: the first pad is still there (the stand-in, at rest),
+        // so a controller plugged in later is not another device.
+        let none = as_one_pad([None; PADS], &[]);
+        assert_eq!(none[0], Some(PadState::default()));
+        assert!(none[1..].iter().all(Option::is_none));
     }
     use crate::HleResolver;
     use crate::HostPolicy;

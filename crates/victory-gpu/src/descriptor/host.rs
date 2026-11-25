@@ -1697,6 +1697,29 @@ impl HostHeap {
         back
     }
 
+    /// Before a bake draw (`draw.rs`, `early_textures`): every slot the
+    /// eviction made null goes back into the queue, due now, so that the
+    /// bake's pass (which makes every due slot, [`ALL_DUE`]) makes them
+    /// before the bake reads them: a bake draws once into what the title
+    /// keeps, and a source read null then is baked in for good (run
+    /// onread-3: the heroine's skin came out plastic in the diner with the
+    /// eviction on, and textured with make on first read alone, onread-4).
+    /// Returns how many went back.
+    pub(crate) fn texture_slots_unevict(&self, frame: u64) -> usize {
+        let back: Vec<u32> = {
+            let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+            evicted.drain().map(|(index, _)| index).collect()
+        };
+        if !back.is_empty() {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &index in &back {
+                textures.written(index, frame, frame, false);
+            }
+            EVICTION[2].fetch_add(back.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        back.len()
+    }
+
     /// Whether the eviction made title slot `index` null and nothing read
     /// it since.
     fn is_evicted(&self, index: u32) -> bool {
@@ -3257,9 +3280,17 @@ fn buffer_uav(
 /// day came a few seconds after new content (new textures) arrived.
 /// shortcut: "fresh" is counted in time, not against each submission's
 /// send.
+///
+/// `VICTORY_PUBLISH_SAFE=sent` (texture-on-read): the exact condition instead
+/// of the time: put off while a submission sent before the texture's host
+/// copy was made is still in the air (they finish in order, so: while the
+/// last finished is older than the copy, `crate::resource::host_made_started`);
+/// every submission sent after it may read it. Such writes are also tried
+/// again at each texture pass ([`super::publish_ready`]), not only with
+/// nothing in the air.
 fn publish_later(view: &View) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PUBLISH_SAFE").is_none_or(|v| v != "0")) {
+    let mode = publish_mode();
+    if mode == 0 {
         return false;
     }
     let texture = match view {
@@ -3273,10 +3304,25 @@ fn publish_later(view: &View) -> bool {
     if !crate::host::flying() {
         return false;
     }
+    if mode == 2 {
+        return crate::resource::host_made_started(texture as crate::object::This)
+            .is_some_and(|made| crate::host::finished() < made);
+    }
     match crate::resource::host_age_ms(texture as crate::object::This) {
         Some(age) => age < FRESH_MS,
         None => false,
     }
+}
+
+/// [`publish_later`]'s rule: 0 off (`VICTORY_PUBLISH_SAFE=0`), 1 by time (the
+/// default), 2 by the submissions sent before the texture (`=sent`).
+pub(crate) fn publish_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_PUBLISH_SAFE").as_deref() {
+        Ok("0") => 0,
+        Ok("sent") => 2,
+        _ => 1,
+    })
 }
 
 /// How new a texture's host copy is for [`publish_later`] (ms).

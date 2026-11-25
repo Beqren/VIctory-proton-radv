@@ -2176,6 +2176,9 @@ impl State {
         // made before it, read by a shader yet or not (make on first read
         // would give it a frame of nulls, baked in for good).
         crate::descriptor::host::ALL_DUE.set(bake);
+        if bake && crate::descriptor::host::evict_switch().0 {
+            host.texture_slots_unevict(frame);
+        }
         self.heap_textures(list, heap, host);
         crate::descriptor::host::ALL_DUE.set(false);
         PASS_BUDGET.set(None);
@@ -2263,6 +2266,10 @@ impl State {
         // read now (what the eviction goes by, and what make on first read
         // makes); those the eviction made null go back into the queue.
         host.texture_slots_read(frame);
+        // Slot writes of new textures put off while older submissions were
+        // in the air (`VICTORY_PUBLISH_SAFE=sent`): those every submission
+        // in the air may read now.
+        crate::descriptor::publish_ready();
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);

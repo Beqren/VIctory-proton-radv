@@ -638,6 +638,31 @@ pub(crate) fn defer_publish(handle: u64) {
     }
 }
 
+/// `VICTORY_PUBLISH_SAFE=sent`: the slot writes put off whose textures every
+/// submission in the air was sent after are made now (the others are put off
+/// again by the same check, `host::publish_later`). Called by the texture
+/// pass (`draw.rs`, `heap_textures`), once a frame, on a recording thread.
+#[cfg(windows)]
+pub(crate) fn publish_ready() {
+    if host::publish_mode() != 2 {
+        return;
+    }
+    let handles = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    let n = handles.len() as u64;
+    for handle in handles {
+        let Some((heap, index)) = shader_slot(handle) else {
+            continue;
+        };
+        if let Some(Some(host)) = heap.host.get() {
+            host.mirror(index, handle, true);
+        }
+    }
+    // Put off again: counted again by `defer_publish`.
+    let again = DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    host::PUBLISH[0].fetch_sub(again.min(host::PUBLISH[0].load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
+    host::PUBLISH[1].fetch_add(n.saturating_sub(again), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Makes the host slots whose writes were put off: called with nothing in
 /// the air (`crate::host::Host::submit`, where the sweep runs). The write
 /// is made from what the title's slot holds now.

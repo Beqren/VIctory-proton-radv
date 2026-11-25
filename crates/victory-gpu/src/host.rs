@@ -141,6 +141,17 @@ fn oldest_recording(finished: u64) -> u64 {
         .find(|&(_, &sent)| sent != UNUSED && (sent == u64::MAX || sent > finished))
         .map_or(u64::MAX, |(&n, _)| n)
 }
+/// Submissions started so far (numbered from 1 as they are sent).
+pub(crate) fn started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// The last submission finished: submissions finish in the order they
+/// were sent (one queue).
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -1123,6 +1123,9 @@ pub(crate) struct HostTexture {
     va: u64,
     /// When it was made (`crate::host::now_ms`).
     made_ms: u64,
+    /// Submissions started when it was made (`crate::host::started`): a
+    /// submission numbered higher was sent after its memory existed.
+    made_started: u64,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
@@ -1427,6 +1430,17 @@ pub(crate) fn host_age_ms(this: This) -> Option<u64> {
     }
     let (host, _) = hosted(this, true)?;
     Some(crate::host::now_ms().saturating_sub(host.made_ms))
+}
+
+/// Submissions started when title texture `this`'s host copy was made,
+/// making it if it has none (then: started now).
+#[cfg(windows)]
+pub(crate) fn host_made_started(this: This) -> Option<u64> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, true)?;
+    Some(host.made_started)
 }
 
 /// Whether more host copies of textures the title fills may be made for
@@ -1927,6 +1941,7 @@ impl HostTexture {
             texture,
             va,
             made_ms: crate::host::now_ms(),
+            made_started: crate::host::started(),
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,

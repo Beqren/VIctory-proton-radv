@@ -948,6 +948,55 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// The table-by-slot format-kind bits of a buffer view: a typed view (no
+/// structure stride, not raw) of an integer format gets `SLOT_INTEGER`, a
+/// signed one also `SLOT_SIGNED`; anything else none. Translated shaders
+/// pass 16-bit typed data of such views as bits, not as halves
+/// (`victory_shader::emit`, "d16"; after upstream 4243a96).
+fn view_kind(view: &View) -> u32 {
+    use victory_shader::emit::{SLOT_INTEGER, SLOT_SIGNED};
+    const BUFFER: u32 = 1;
+    let (words, unordered): (&[u32; 10], bool) = match view {
+        View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => match d[..10].try_into() {
+            Ok(words) => (words, *unordered),
+            Err(_) => return 0,
+        },
+        _ => return 0,
+    };
+    // SAFETY: buffer views' union members.
+    let (stride, raw, format) = unsafe {
+        if unordered {
+            let d = uav_desc(words);
+            let b = d.Anonymous.Buffer;
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format)
+        } else {
+            let d = srv_desc(words);
+            let b = d.Anonymous.Buffer;
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
+        }
+    };
+    if stride != 0 || raw {
+        return 0;
+    }
+    match integer_format(format.0 as u32) {
+        Some(true) => SLOT_INTEGER | SLOT_SIGNED,
+        Some(false) => SLOT_INTEGER,
+        None => 0,
+    }
+}
+
+/// Whether a DXGI format is an integer one, and if so whether signed:
+/// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
+fn integer_format(format: u32) -> Option<bool> {
+    match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => Some(false),
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => Some(true),
+        _ => None,
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -2046,12 +2095,15 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
+        // The table's dword: the stride, with the format kind of a typed
+        // view of an integer format (`view_kind`).
+        let word = stride.map_or(0, |s| s | view.map_or(0, view_kind));
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {

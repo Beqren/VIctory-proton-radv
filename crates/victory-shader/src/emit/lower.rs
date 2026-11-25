@@ -6561,12 +6561,22 @@ impl<'a> Lower<'a> {
         if !heap {
             return Ok(None);
         }
-        let key = (self.cur, *load, *first);
+        let word = self.slot_word(*load, *first)?;
+        let bits = self.s.m.i32(super::shader::SLOT_STRIDE_BITS);
+        Ok(Some(self.s.m.bin(self.cur, Bin::And, word, bits)))
+    }
+
+    /// Dword `slot` of the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`]) for the descriptor loaded at `load`
+    /// from dword `first` on, read in the current block: the stride and the
+    /// view's format kind.
+    fn slot_word(&mut self, load: Site, first: u8) -> Result<V, Why> {
+        let key = (self.cur, load, first);
         if let Some(&v) = self.strides.get(&key) {
-            return Ok(Some(v));
+            return Ok(v);
         }
         let c = self.cur;
-        let slot = self.heap_index(*load, *first, false)?;
+        let slot = self.heap_index(load, first, false)?;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -6590,7 +6600,26 @@ impl<'a> Lower<'a> {
         let f = self.s.m.extract(c, r, 0);
         let v = self.as_int(f);
         self.strides.insert(key, v);
-        Ok(Some(v))
+        Ok(v)
+    }
+
+    /// Whether the typed buffer view the descriptor `src` names has an
+    /// integer format, and whether a signed one, from the host's table by
+    /// heap slot ([`super::shader::SLOT_INTEGER`]); `None` for a descriptor
+    /// not loaded from the view heap.
+    fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
+        let Source::Loaded { load, first } = *src else {
+            return Ok(None);
+        };
+        let word = self.slot_word(load, first)?;
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let [int, signed] = [super::shader::SLOT_INTEGER, super::shader::SLOT_SIGNED].map(|bit| {
+            let bit = self.s.m.i32(bit);
+            let x = self.s.m.bin(c, Bin::And, word, bit);
+            self.s.m.cmp(c, pred::NE, x, zero)
+        });
+        Ok(Some((int, signed)))
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -10563,8 +10592,12 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // d16 data is f16 for float and normalized formats, widened
+                // for the 32-bit float store; for integer formats (the view's
+                // kind, from the host's table by heap slot) the 16-bit
+                // integer, zero- or sign-extended (stored through the
+                // float-typed handle as loads read: see there).
+                let integer = if typed { self.integer_view(src)? } else { None };
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
@@ -10576,7 +10609,16 @@ impl<'a> Lower<'a> {
                     let f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
+                    let mut w = self.as_int(f);
+                    if let Some((int, signed)) = integer {
+                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
+                        let n = self.s.m.select(c, signed, sign_ext, zero_ext);
+                        w = self.s.m.select(c, int, n, w);
+                    }
+                    wide.push(w);
                 }
                 vals = wide;
             }
@@ -10711,16 +10753,34 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two 16-bit channels per VGPR (an odd last high half 0): f16 for
+            // float and normalized formats; for integer formats (the view's
+            // kind, from the host's table by heap slot) the integer's low 16
+            // bits. The pack's d16 users are its compute graph (the
+            // compute_graph_ops programs, e.g. 0aa7934094794dbf, which adds
+            // and divides the 16-bit channels as integers); through a UINT
+            // view the f16 conversion made their integers denormals, then 0.
+            // After upstream 4243a96.
+            // shortcut: an integer view is read and written through the
+            // float-typed handle, so its channels' bits travel as the driver
+            // passes a mismatched component type.
+            let integer = if typed { self.integer_view(src)? } else { None };
+            let c = self.cur;
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
+                    let mut h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    if let Some((int, _)) = integer {
+                        let bits = self.as_int(f);
+                        let low = self.s.m.i32(0xFFFF);
+                        let low = self.s.m.bin(c, Bin::And, bits, low);
+                        h = self.s.m.select(c, int, low, h);
+                    }
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
@@ -11990,6 +12050,49 @@ mod tests {
             ];
             lower_with(&words, layout.clone(), used.clone()).unwrap();
         }
+    }
+
+    /// A d16 typed buffer load through a table asks the host's table by heap
+    /// slot for its view's format kind: through an integer view the 16-bit
+    /// channels are the integers' bits, not halves (the pack's
+    /// compute_graph_ops programs, e.g. 0aa7934094794dbf, load
+    /// R16G16B16A16_UINT data this way and compute with it as integers).
+    #[test]
+    fn a_d16_typed_buffer_load_reads_its_views_format_kind() {
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = |d16: bool| {
+            // buffer_load_format(_d16)_xyzw v[1:..], v0, s[8:11], 0 idxen
+            let op: u32 = if d16 { 0x83 } else { 0x03 };
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x38 << 26 | op << 18 | 1 << 13,
+                0x8002_0100,
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let table = |d16| {
+            let l = lower_with(&words(d16), layout.clone(), used.clone()).unwrap();
+            l.root_srvs.contains(&super::super::shader::SLOT_STRIDES)
+        };
+        assert!(table(true), "d16");
+        assert!(!table(false), "32-bit");
     }
 
     #[test]

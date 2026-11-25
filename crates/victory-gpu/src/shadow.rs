@@ -2129,8 +2129,25 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Whether each copy's GPU address range is logged when it is made and
+/// when it is freed (`VICTORY_LOG_VA=1`, off): a GPU page fault's address
+/// (the kernel log) can then be matched to a copy, live or freed.
+pub(crate) fn log_va() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOG_VA").is_some_and(|v| v == "1"))
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if log_va() {
+            tracing::info!(
+                gpu = format_args!("{:#x}", self.gpu),
+                end = format_args!("{:#x}", self.gpu + self.len),
+                title = format_args!("{:#x}", self.start),
+                window = self.window,
+                "va: copy freed"
+            );
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2453,6 +2470,14 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        if log_va() {
+            tracing::info!(
+                gpu = format_args!("{gpu:#x}"),
+                end = format_args!("{:#x}", gpu + len),
+                title = format_args!("{start:#x}"),
+                "va: copy made"
+            );
+        }
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);

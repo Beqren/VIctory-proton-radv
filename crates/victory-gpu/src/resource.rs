@@ -1486,11 +1486,49 @@ static SWEPT: std::sync::Mutex<std::collections::VecDeque<(u64, usize, std::sync
 /// Notes a host texture the sweep lets go ([`SWEPT`]: the last 4,096).
 #[cfg(windows)]
 fn note_swept(title: usize, host: &std::sync::Arc<HostTexture>) {
-    let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
-    if swept.len() >= 4096 {
-        swept.pop_front();
+    let now = crate::host::now_ms();
+    {
+        let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if swept.len() >= 4096 {
+            swept.pop_front();
+        }
+        swept.push_back((now, title, std::sync::Arc::downgrade(host)));
     }
-    swept.push_back((crate::host::now_ms(), title, std::sync::Arc::downgrade(host)));
+    let hold = swept_hold_ms();
+    if hold > 0 {
+        let gone: Vec<std::sync::Arc<HostTexture>> = {
+            let mut held = SWEPT_HELD.lock().unwrap_or_else(|e| e.into_inner());
+            held.push_back((now, host.clone()));
+            let mut gone = Vec::new();
+            while held.front().is_some_and(|(at, _)| now.saturating_sub(*at) >= hold) {
+                if let Some((_, h)) = held.pop_front() {
+                    gone.push(h);
+                }
+            }
+            gone
+        };
+        // Through the graveyard all the same.
+        for h in gone {
+            crate::host::retire(h);
+        }
+    }
+}
+
+/// Host textures the sweep let go, kept besides the graveyard for
+/// [`swept_hold_ms`].
+static SWEPT_HELD: std::sync::Mutex<std::collections::VecDeque<(u64, std::sync::Arc<HostTexture>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// A test, not for play: every host texture the sweep lets go is kept this
+/// long at least (`VICTORY_SWEPT_HOLD_MS`, 0: off), whatever the graveyard
+/// says. Runs of 2026-11-25 lost the device on texture-unit reads within
+/// 1-3 s of a sweep whose textures the graveyard had already freed (play
+/// session play-fault2: 453 let go 2,385 ms before the removal, all freed):
+/// with the hold, a device loss that remains is not a read of those
+/// textures' memory.
+fn swept_hold_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_SWEPT_HOLD_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
 /// For the removal report: of the textures the sweep let go lately, by how

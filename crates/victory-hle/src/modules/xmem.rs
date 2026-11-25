@@ -841,6 +841,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         shown.push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::views_alive(physical.views.len());
     true
 }
 

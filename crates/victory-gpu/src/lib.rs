@@ -57,7 +57,7 @@ mod texture;
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use copystat::{page_mapping, phase as frame_phase, remap_call};
+pub use copystat::{page_mapping, phase as frame_phase, remap_call, views_alive};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

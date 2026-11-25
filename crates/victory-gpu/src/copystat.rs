@@ -187,6 +187,24 @@ pub(crate) enum C {
     RemapSysUs,
     RemappedUs,
     RemappedGuardWaitUs,
+    /// Pages of the GPU's page-mapping copies by kind (pool pages in a run,
+    /// one pool page over many, unmapped, left), and of the second kind
+    /// those whose pool page holds zeros only.
+    PagesRun,
+    PagesOne,
+    PagesUnmapped,
+    PagesLeft,
+    PagesOneZero,
+}
+
+/// Views of physical pages the runtime has mapped now (a gauge, not a
+/// count per frame), and the most there were.
+static VIEWS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The runtime holds `n` views of physical pages now.
+pub fn views_alive(n: usize) {
+    VIEWS[0].store(n as u64, Relaxed);
+    VIEWS[1].fetch_max(n as u64, Relaxed);
 }
 
 /// A memory call of the runtime's remapping took `us`.
@@ -210,7 +228,7 @@ pub fn page_mapping(alias: bool, pages: u64, same: u64, us: u64) {
     add(t, us);
 }
 const COUNTERS: usize = 112;
-const _: () = assert!((C::RemappedGuardWaitUs as usize) < COUNTERS);
+const _: () = assert!((C::PagesOneZero as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1284,7 +1302,9 @@ pub(crate) fn log(frames: f64) {
          waited {:.1} ms held {:.1} ms, {:.0} reads in place waited {:.1} ms held {:.1} ms; page \
          mappings: the GPU's {:.0} calls {:.0} pages ({:.0} already so) {:.1} ms, physical {:.0} \
          calls {:.0} pages ({:.0} already so) {:.1} ms; in them {:.0} memory calls {:.1} ms, our notes \
-         {:.1} ms ({:.1} ms waiting for the guards' lock)",
+         {:.1} ms ({:.1} ms waiting for the guards' lock); the GPU's page mappings by kind: {:.0} pages \
+         in runs, {:.0} one pool page over many ({:.0} of them a page of zeros), {:.0} unmapped, {:.0} \
+         left; views of physical pages alive {} (at most {})",
         c[C::KernelCalls as usize],
         ms(c[C::KernelUs as usize]),
         mb(c[C::KernelBytes as usize]),
@@ -1319,6 +1339,13 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::RemapSysUs as usize]),
         ms(c[C::RemappedUs as usize]),
         ms(c[C::RemappedGuardWaitUs as usize]),
+        c[C::PagesRun as usize],
+        c[C::PagesOne as usize],
+        c[C::PagesOneZero as usize],
+        c[C::PagesUnmapped as usize],
+        c[C::PagesLeft as usize],
+        VIEWS[0].load(Relaxed),
+        VIEWS[1].load(Relaxed),
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

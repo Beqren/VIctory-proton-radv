@@ -1816,6 +1816,21 @@ impl Shadow {
         self.id
     }
 
+    /// Diagnostics: the copy's bytes at title address `address` as the CPU
+    /// side holds them, for a copy in the PC's memory that is a copy (not
+    /// in place, not on the card); false otherwise.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek(&self, address: u64, out: &mut [u8]) -> bool {
+        if self.card.is_some() || self.place.is_some() || self.data.is_null() {
+            return false;
+        }
+        let Some(at) = self.offset_in(address) else { return false };
+        if at + out.len() as u64 > self.len {
+            return false;
+        }
+        crate::host::read_into(self.data.wrapping_add(at as usize), out)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)

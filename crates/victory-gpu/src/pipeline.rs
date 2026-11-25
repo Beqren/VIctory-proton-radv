@@ -464,6 +464,25 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
+/// The shader hashes of the title's pipeline `this`, as `[stage hash, ...]`
+/// (diagnostics: which programs a drop counted under one reason is of).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shaders_text(this: This) -> String {
+    if this.is_null() {
+        return "[]".to_owned();
+    }
+    let p = pipeline(this);
+    let list: Vec<String> = p.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    format!("[{}]", list.join(", "))
+}
+
+/// Whether a shader of the title's pipeline `this` holds `name` in its
+/// container (diagnostics: programs found by the title's own names).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn holds_name(this: This, name: &[u8]) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.container.windows(name.len()).any(|w| w == name))
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
@@ -481,7 +500,11 @@ pub(crate) fn note_drop(this: This) {
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
     };
-    if let Some(why) = why {
+    if let Some(mut why) = why {
+        // Which programs: the reasons left out by kind name none.
+        if !this.is_null() && !why.contains('[') {
+            why = format!("{why}: {}", shaders_text(this));
+        }
         note_why(why);
     }
 }

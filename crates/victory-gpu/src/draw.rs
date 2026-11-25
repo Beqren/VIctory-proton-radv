@@ -2124,6 +2124,86 @@ impl State {
         });
     }
 
+    /// Diagnostics: at a dispatch of the title's head blend-shape programs
+    /// (`ped_standard_head_cs`), the floats of each buffer it reads or
+    /// writes through its table, in title memory (where what earlier
+    /// dispatches wrote has been copied back) and in the host copy: how
+    /// many are NaN, infinite, huge or zero, and how many bytes the two
+    /// differ by. The heads drawn with blend shapes are the ones missing.
+    #[cfg(feature = "diagnostics")]
+    fn probe_blendshapes(&self, p: &HostPipeline) {
+        const NAMES: [&[u8]; 3] = [
+            b"CS_BlendshapeTranslationsHSSGraphOutputExtract",
+            b"CS_ComputeStickyLips",
+            b"CS_ReconstructBlendshapeNormals",
+        ];
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let Some(name) = NAMES.iter().find(|n| crate::pipeline::holds_name(self.pipeline as This, n)) else {
+            return;
+        };
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if n >= 48 && n % 400 != 0 {
+            return;
+        }
+        let stats = |bytes: &[u8]| {
+            let (mut nan, mut inf, mut huge, mut zero) = (0, 0, 0, 0);
+            for w in bytes.chunks_exact(4) {
+                let f = f32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+                if f.is_nan() {
+                    nan += 1;
+                } else if f.is_infinite() {
+                    inf += 1;
+                } else if f.abs() > 1.0e5 {
+                    huge += 1;
+                } else if f == 0.0 {
+                    zero += 1;
+                }
+            }
+            format!("{} floats: {nan} NaN {inf} inf {huge} huge {zero} zero", bytes.len() / 4)
+        };
+        let mut text = String::new();
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some((address, len)) = crate::descriptor::view(handle)
+                    .as_ref()
+                    .and_then(crate::descriptor::host::buffer_range)
+                else {
+                    continue;
+                };
+                let mut title = vec![0u8; len.min(64 << 10) as usize & !3];
+                if title.is_empty() || !crate::host::read_into(address as *const u8, &mut title) {
+                    continue;
+                }
+                let mut host = vec![0u8; title.len()];
+                let copy = crate::shadow::find(address, len.max(1));
+                let peeked = copy.as_ref().is_some_and(|s| s.peek(address, &mut host));
+                let differ = if peeked {
+                    let d = title.iter().zip(&host).filter(|(a, b)| a != b).count();
+                    format!("{d} bytes differ, host {}", stats(&host))
+                } else {
+                    "host copy not readable".to_owned()
+                };
+                text.push_str(&format!(
+                    "\n    {:?} s{}+{} {address:#x}+{len:#x} (copy {:?}): title {}; {differ}",
+                    u.kind,
+                    u.slot,
+                    u.table_offset_dwords,
+                    copy.as_ref().map(|s| s.id()),
+                    stats(&title)
+                ));
+            }
+        }
+        tracing::info!(
+            "blend-shape probe {} #{n} frame {}:{text}",
+            String::from_utf8_lossy(name),
+            crate::queue::presented() + 1
+        );
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
@@ -2139,7 +2219,10 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
-                crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
+                crate::pipeline::note_why(format!(
+                    "a stage of the ray-tracing structure builder, which is off: {}",
+                    crate::pipeline::shaders_text(self.pipeline as This)
+                ));
                 self.list_dropped_roots([x, y, z]);
             }
             return;
@@ -2172,6 +2255,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.probe_blendshapes(p);
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -2227,6 +2312,34 @@ impl State {
                     text,
                     " viewport [{} {} {} {} depth {}..{}]",
                     v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth
+                );
+            }
+            // The vertex and index buffers it reads, with the host copy
+            // each lies in (a buffer a dispatch wrote through another copy
+            // of the same memory is not seen here until it is copied back).
+            let host_of = |address: u64, len: u64| {
+                crate::shadow::find_any(address, len.max(1)).map(|s| {
+                    let (start, size) = s.span();
+                    format!("{:#x} (copy {} of {start:#x}+{size:#x})", s.gpu(address), s.id())
+                })
+            };
+            for (slot, v) in self.vertex.iter().enumerate().filter(|(_, v)| v.address != 0) {
+                let _ = write!(
+                    text,
+                    " vb{slot}={:#x}+{:#x}/{} host {:?}",
+                    v.address,
+                    v.size,
+                    v.stride,
+                    host_of(v.address, u64::from(v.size))
+                );
+            }
+            if self.index.address != 0 {
+                let _ = write!(
+                    text,
+                    " ib={:#x}+{:#x} host {:?}",
+                    self.index.address,
+                    self.index.size,
+                    host_of(self.index.address, u64::from(self.index.size))
                 );
             }
         }
@@ -2748,7 +2861,28 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let view = crate::descriptor::view(handle);
+                        let mut what = describe(view.as_ref());
+                        // Which host copy a buffer view lies in.
+                        if let Some((address, len)) = view.as_ref().and_then(crate::descriptor::host::buffer_range)
+                            && let Some(s) = crate::shadow::find(address, len.max(1))
+                        {
+                            let (start, size) = s.span();
+                            what.push_str(&format!(" in copy {} of {start:#x}+{size:#x}", s.id()));
+                        }
+                        // The title's view says nothing of the host's slot,
+                        // which may have been left null (a buffer view not
+                        // on an element of its host copy, one the host
+                        // would refuse).
+                        let host_null = self
+                            .heap_of(handle)
+                            .and_then(|heap| Some((heap.host()?, heap.index(handle)?)))
+                            .and_then(|(host, index)| host.describe_slot(index))
+                            .is_some_and(|slot| slot == "null");
+                        if host_null {
+                            what.push_str(" HOST NULL");
+                        }
+                        what
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -2923,6 +3057,11 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!(
+                "an indirect stage of the ray-tracing structure builder, which is off: {}",
+                crate::pipeline::shaders_text(self.pipeline as This)
+            ));
             return false;
         }
         const DRAW: u32 = 0;

@@ -995,6 +995,16 @@ pub enum View<'a> {
     /// A typed buffer UAV in this format, of this many elements of this many
     /// bytes, zeroed.
     TypedUav(DXGI_FORMAT, u32, u32),
+    /// A typed buffer UAV in this format, of elements of this many bytes,
+    /// holding `data`; `share`: the same buffer as the earlier view at that
+    /// heap index (another view of its memory, which then gets no readback
+    /// of its own).
+    TypedUavData {
+        format: DXGI_FORMAT,
+        element_bytes: u32,
+        data: &'a [u32],
+        share: Option<usize>,
+    },
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1156,6 +1166,10 @@ impl Host {
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
+            // Buffers of `TypedUavData` views by heap index, and their
+            // uploads (copied in before the dispatch).
+            let mut owned: Vec<(usize, ID3D12Resource)> = Vec::new();
+            let mut uploads: Vec<(ID3D12Resource, ID3D12Resource, u64)> = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
@@ -1304,6 +1318,41 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 1, rb));
                     }
+                    View::TypedUavData { format, element_bytes, data, share } => {
+                        let bytes = (data.len() * 4) as u64;
+                        let b = match share.and_then(|k| owned.iter().find(|(i, _)| *i == k)) {
+                            Some((_, b)) => b.clone(),
+                            None => {
+                                let b = make(
+                                    D3D12_HEAP_TYPE_DEFAULT,
+                                    &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                )?;
+                                let up = upload(data)?;
+                                uploads.push((b.clone(), up, bytes));
+                                let rb = make(
+                                    D3D12_HEAP_TYPE_READBACK,
+                                    &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                )?;
+                                uavs.push((b.clone(), None, data.len() as u32, rb));
+                                owned.push((i, b.clone()));
+                                b
+                            }
+                        };
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: (bytes / u64::from(element_bytes)) as u32,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                    }
                     View::Cbv(data) => {
                         let b = upload(data)?;
                         dev.CreateConstantBufferView(
@@ -1397,6 +1446,14 @@ impl Host {
                         keep.push(b);
                     }
                 }
+            }
+            for (b, up, bytes) in &uploads {
+                list.CopyBufferRegion(b, 0, up, 0, *bytes);
+                list.ResourceBarrier(&[transition(
+                    b,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);

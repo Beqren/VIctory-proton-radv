@@ -87,6 +87,8 @@ mod diff_tests;
 #[cfg(all(test, windows))]
 mod d16_view_tests;
 #[cfg(all(test, windows))]
+mod formula_replay_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -808,6 +810,15 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    #[ignore]
+    fn translate_file_from_env() {
+        let Some(p) = std::env::var_os("VICTORY_TRANSLATE_FILE") else { return };
+        let bytes = std::fs::read(p).unwrap();
+        let r = super::translate(&bytes);
+        eprintln!("translated: {}", r.is_ok());
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {

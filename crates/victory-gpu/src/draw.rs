@@ -2870,18 +2870,6 @@ impl State {
                             let (start, size) = s.span();
                             what.push_str(&format!(" in copy {} of {start:#x}+{size:#x}", s.id()));
                         }
-                        // The title's view says nothing of the host's slot,
-                        // which may have been left null (a buffer view not
-                        // on an element of its host copy, one the host
-                        // would refuse).
-                        let host_null = self
-                            .heap_of(handle)
-                            .and_then(|heap| Some((heap.host()?, heap.index(handle)?)))
-                            .and_then(|(host, index)| host.describe_slot(index))
-                            .is_some_and(|slot| slot == "null");
-                        if host_null {
-                            what.push_str(" HOST NULL");
-                        }
                         what
                     }
                     (root, _) => format!("{root:?}"),

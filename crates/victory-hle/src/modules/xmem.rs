@@ -1565,6 +1565,46 @@ mod tests {
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
+    /// With `VICTORY_ALIAS_COPY=1` (run the tests with it set; otherwise
+    /// the same as above): the GPU's page mapping copies the page, writes
+    /// through our own views reach the copy, and unmapping or mapping over
+    /// it leaves a placeholder that takes a view again.
+    #[test]
+    fn copied_aliases_take_writes_and_go() {
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(), reserve());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        unsafe { at(a, 1).cast::<u8>().write(5) };
+        // Pool page 1 at three pages of `b`, one at a time.
+        for k in 0..3 {
+            assert!(map_alias(at(b, k) as u64, at(a, 1) as u64, PAGE as u64));
+        }
+        // SAFETY: mapped or copied, read-write.
+        assert!((0..3).all(|k| unsafe { at(b, k).cast::<u8>().read() } == 5));
+        assert!(write_physical(&pages[1..], 2, &[6]));
+        // SAFETY: as above.
+        assert!((0..3).all(|k| unsafe { at(b, k).cast::<u8>().add(2).read() } == 6));
+        // The middle one unmapped, the last one mapped over with page 0.
+        assert!(map_alias(at(b, 1) as u64, 0, PAGE as u64));
+        assert_eq!(query(at(b, 1)).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPages(at(b, 2), 1, pages.as_ptr()), at(b, 2));
+        // SAFETY: page 0 mapped there; page 0's first byte is 0.
+        assert_eq!(unsafe { at(b, 2).cast::<u8>().read() }, 0);
+        // A run over a copy and a hole.
+        assert!(map_alias(b as u64, a as u64, 2 * PAGE as u64));
+        // SAFETY: as above.
+        assert_eq!(unsafe { at(b, 1).cast::<u8>().read() }, 5);
+        assert!(map_alias(b as u64, 0, 4 * PAGE as u64));
+        assert!((0..4).all(|k| query(at(b, k)).host.State == MEM_RESERVE));
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
     /// A thread that reads a mapped page in place, as the GPU side reads a
     /// texture, never meets the moment in which the runtime has taken the
     /// page's view away to map it again: mapping the same pages at the same

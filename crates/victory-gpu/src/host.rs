@@ -6196,7 +6196,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6276,7 +6276,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -6678,6 +6678,7 @@ impl Meter {
         );
         late_line(frames);
         card_clock_line(frames, ms);
+        crate::plaincopy::line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::marks_line(frames);
         {

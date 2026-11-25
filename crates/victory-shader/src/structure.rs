@@ -874,6 +874,41 @@ impl<'a> Lanes<'a> {
         Some((lo, hi))
     }
 
+    /// The pair `k` copies, following `s_mov_b32` copies of each half (at
+    /// most 8), if it ends at a pair one instruction other than a memory
+    /// read wrote or phis of one block join.
+    fn copied_pair(&self, mut k: Key) -> Option<Key> {
+        let p = self.p;
+        let copied = |v: Value| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &p.blocks[b].insts[i];
+            match (inst.name(), &inst.fields) {
+                ("s_mov_b32", Fields::Sop { src, .. }) => match src.first() {
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => inst.read(Reg::S(code)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let mut moved = false;
+        for _ in 0..8 {
+            if k.0 == k.1 {
+                return None;
+            }
+            // (Not a pair read from memory: that is a number, which lowering
+            // reads by the copy's dwords as before.)
+            let one_def = matches!((self.defs.get(&k.0), self.defs.get(&k.1)),
+                (Some(a), Some(b)) if a == b && !matches!(p.blocks[a.0].insts[a.1].fields, Fields::Smem { .. }));
+            let one_join = matches!((self.phis.get(&k.0), self.phis.get(&k.1)), (Some(a), Some(b)) if a.0 == b.0);
+            if one_def || one_join {
+                return moved.then_some(k);
+            }
+            k = (copied(k.0)?, copied(k.1)?);
+            moved = true;
+        }
+        None
+    }
+
     fn born(&self, v: Value) -> usize {
         match (self.defs.get(&v), self.phis.get(&v)) {
             (Some(&(b, _)), _) | (_, Some(&(b, _))) => self.index[b],
@@ -917,6 +952,25 @@ impl<'a> Lanes<'a> {
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
+                // A pair copied a dword at a time (`s_mov_b32` each half)
+                // from a pair one instruction (or one join) wrote: the mask
+                // of that pair. The title's `PS_VoxelizeVisiblity`
+                // (#405bfb31f54125ae) parks an `s_cselect_b64` mask in two
+                // VGPR lanes and reads it back with two `v_readlane_b32`
+                // (`ir::unspill` makes each a copy).
+                if m.is_none()
+                    && p.wave64
+                    && let Some(from) = self.copied_pair(k)
+                {
+                    let (m, derived) = self.mask(from);
+                    let cache = if derived {
+                        &mut self.masks
+                    } else {
+                        &mut self.other
+                    };
+                    cache.insert(k, m);
+                    return (m, derived);
+                }
                 // shortcut: the atom names the pair by its low dword, and
                 // lowering takes the high dword written beside it. For halves
                 // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
@@ -1711,6 +1765,31 @@ mod tests {
             s.masks.get(&lo).and_then(|&m| s.bools.node(m)),
             Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE))
         );
+    }
+
+    #[test]
+    fn a_mask_copied_a_dword_at_a_time_is_the_mask_copied() {
+        // `PS_VoxelizeVisiblity`: a compare's mask parked and read back half
+        // by half, then made EXEC.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE84_036A, // s_mov_b32 s4, vcc_lo
+                0xBE85_036B, // s_mov_b32 s5, vcc_hi
+                0xBE86_0304, // s_mov_b32 s6, s4
+                0xBE87_0305, // s_mov_b32 s7, s5
+                0xBE88_2406, // s_and_saveexec_b64 s[8:9], s[6:7]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let cmp = insts[0].write(Reg::S(VCC)).unwrap();
+        let copy = insts[3].write(Reg::S(6)).unwrap();
+        let m = s.masks.get(&copy).copied();
+        assert!(m.is_some());
+        assert_eq!(m, s.masks.get(&cmp).copied());
     }
 
     #[test]

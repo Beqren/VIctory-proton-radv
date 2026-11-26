@@ -2588,6 +2588,57 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Diagnostics: what of `runs` waits for flights: the first step that
+/// reads (or, for a copy, writes) title memory flights' shaders may write,
+/// with the declared range it touches; or why else.
+#[cfg(feature = "diagnostics")]
+fn blocking_detail(runs: &[&HostList]) -> String {
+    let written = line().written.clone();
+    let hit = |from: usize, to: usize| -> String {
+        let _ = to;
+        let at = written.partition_point(|r| r.1 <= from);
+        written.get(at).map_or_else(String::new, |r| format!("declared written {:#x}..{:#x} ({} KiB)", r.0, r.1, (r.1 - r.0) >> 10))
+    };
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(dst, src, len) if touches(&written, src, src + len) || touches(&written, dst, dst + len) => {
+                    let what = if touches(&written, src, src + len) { hit(src, src + len) } else { hit(dst, dst + len) };
+                    return format!("copy {src:#x}->{dst:#x} {len} B, {what}");
+                }
+                &Step::Fill(_, src, len) if touches(&written, src, src + len) => {
+                    return format!("fill from {src:#x} {len} B, {}", hit(src, src + len));
+                }
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    if touches(&written, at, at + len) {
+                        return format!("texture {at:#x} {len} B, {}", hit(at, at + len));
+                    }
+                }
+                Step::Run(_) => return "a step of the title's to run".into(),
+                _ => {}
+            }
+        }
+    }
+    "nothing found (settled for another reason)".into()
+}
+
+/// Diagnostics: a submission waited `waited` for flights (`why`): the first
+/// few of each second are said with what they waited for.
+#[cfg(feature = "diagnostics")]
+fn blocked_note(why: usize, detail: String, waited: std::time::Duration) {
+    static SAID: Mutex<(u64, u32)> = Mutex::new((0, 0));
+    let now = now_ms() / 1000;
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.0 != now {
+        *said = (now, 0);
+    }
+    if said.1 < 6 && waited.as_micros() > 500 {
+        said.1 += 1;
+        tracing::info!(why, ms = format_args!("{:.1}", waited.as_secs_f64() * 1e3), "a submission waited for flights: {detail}");
+    }
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -4651,6 +4702,8 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
+            #[cfg(feature = "diagnostics")]
+            let (blocked_at, detail) = (std::time::Instant::now(), blocking_detail(runs));
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -4658,6 +4711,8 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+            #[cfg(feature = "diagnostics")]
+            blocked_note(why, detail, blocked_at.elapsed());
         }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -4693,6 +4748,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // The card's clock around the submission (`VICTORY_CARD_TIME`).
+        let card_stamps = crate::cardtime::stamps(&self.device, this_submission, FINISHED.load(Ordering::Acquire));
+        if let Some((first, _)) = &card_stamps {
+            lists.push(Some(first.clone()));
+        }
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
@@ -4789,6 +4849,9 @@ impl Host {
             crate::shadow::MARK_STATS[if marks.is_some() { 4 } else { 5 }].fetch_add(1, Ordering::Relaxed);
         }
         let marks_list: Option<ID3D12CommandList> = marks.as_ref().and_then(|m| m.list.1.cast().ok());
+        if let Some((_, last)) = card_stamps {
+            lists.push(Some(last));
+        }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6679,6 +6742,9 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::plaincopy::line(frames);
+        if let Some(host) = host() {
+            crate::cardtime::line(&host.queue, frames, FINISHED.load(Ordering::Acquire));
+        }
         crate::shadow::refresh_check_line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::marks_line(frames);

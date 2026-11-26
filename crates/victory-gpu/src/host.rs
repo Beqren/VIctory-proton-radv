@@ -1930,6 +1930,9 @@ struct Deferred {
     /// Some of its fills were made on the card (`card_steps`): their slots
     /// show our buffer, and a submission of it again puts them back.
     card_taken: bool,
+    /// It was sent since its reset: card steps leave it alone (they rewrite
+    /// its dynamic slots, which an earlier submission of it may be reading).
+    sent: bool,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -4866,6 +4869,7 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         for list in runs {
             list.recording_sent(this_submission);
+            list.deferred().sent = true;
         }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);

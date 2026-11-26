@@ -497,6 +497,12 @@ impl Host {
         if runs.iter().any(|l| l.deferred().card_taken) {
             return Err("a list sent again after its constant buffers were made on the card");
         }
+        // A list sent before may still be read by that submission: its
+        // dynamic slots are not rewritten under it (the class of a slot
+        // written under a running submission, whatever the bytes).
+        if runs.iter().any(|l| l.deferred().sent) {
+            return Err("a list sent before since its reset");
+        }
         let mut does = Vec::new();
         let mut steps = Vec::new();
         for list in runs {

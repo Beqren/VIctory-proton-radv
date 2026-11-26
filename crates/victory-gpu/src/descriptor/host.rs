@@ -3360,9 +3360,9 @@ fn buffer_uav(
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
 /// Whether a slot write that shows texture `view` waits for a moment with
-/// no submission in the air (`VICTORY_PUBLISH_SAFE`, on): it does while
-/// submissions are in the air and the texture's host copy was made less
-/// than [`FRESH_MS`] ago (or is made now, for this view).
+/// no submission in the air (`VICTORY_PUBLISH_SAFE`, on): it does when the
+/// texture's host copy was made less than [`FRESH_MS`] ago (or is made now,
+/// for this view), unless made at that moment itself ([`QUIET`]).
 ///
 /// Why: run play-va1 (2026-11-25, `VICTORY_TEXTURE_VA=1`) lost the device
 /// on texture-unit reads inside a LIVE host texture (a 4096x4096 BC1, at
@@ -3396,16 +3396,39 @@ fn publish_later(view: &View) -> bool {
         },
         _ => return false,
     };
-    if !crate::host::flying() {
+    // Not by what is in the air now: this runs on title and recording
+    // threads, and a submission may start between that look and the slot
+    // write (the window the eviction's nulls had, review run
+    // 20261126T012301). By time, a fresh texture's slot write always waits
+    // for the quiet moment on the submitting thread (`super::publish_deferred`,
+    // which publishes, [`QUIET`]). By `sent`, a submission starting
+    // meanwhile is sent after the texture's memory exists: no window.
+    let quiet = QUIET.get();
+    let texture = texture as crate::object::This;
+    match mode {
+        2 => put_off(2, quiet, None, crate::resource::host_made_started(texture), crate::host::finished()),
+        _ => put_off(mode, quiet, crate::resource::host_age_ms(texture), None, 0),
+    }
+}
+
+thread_local! {
+    /// On the submitting thread with nothing in the air
+    /// (`super::publish_deferred`): slot writes made now cannot race a
+    /// submission, so nothing is put off ([`publish_later`]).
+    pub(crate) static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`publish_later`]'s decision: under rule `mode` (1 by time, 2 by the
+/// submissions sent before), at a quiet moment or not, for a texture whose
+/// host copy is `age` ms old (rule 1) or was made with `made` submissions
+/// started (rule 2), with `finished` submissions finished.
+fn put_off(mode: u8, quiet: bool, age: Option<u64>, made: Option<u64>, finished: u64) -> bool {
+    if mode == 0 || quiet {
         return false;
     }
-    if mode == 2 {
-        return crate::resource::host_made_started(texture as crate::object::This)
-            .is_some_and(|made| crate::host::finished() < made);
-    }
-    match crate::resource::host_age_ms(texture as crate::object::This) {
-        Some(age) => age < FRESH_MS,
-        None => false,
+    match mode {
+        2 => made.is_some_and(|made| finished < made),
+        _ => age.is_some_and(|age| age < FRESH_MS),
     }
 }
 
@@ -4826,6 +4849,20 @@ mod tests {
             memory[at] ^= 1;
         }
         assert_ne!(print(&memory[..100]), print(&memory[..200]));
+    }
+
+    /// A fresh texture's slot write is put off whatever is in the air when
+    /// it looks, and never at the quiet moment; by `sent`, only while an
+    /// older submission is unfinished.
+    #[test]
+    fn fresh_textures_wait_for_a_quiet_moment() {
+        assert!(put_off(1, false, Some(10), None, 0));
+        assert!(!put_off(1, true, Some(10), None, 0));
+        assert!(!put_off(1, false, Some(FRESH_MS), None, 0));
+        assert!(!put_off(0, false, Some(10), None, 0));
+        assert!(put_off(2, false, None, Some(5), 4));
+        assert!(!put_off(2, false, None, Some(5), 5));
+        assert!(!put_off(2, true, None, Some(5), 4));
     }
 
     /// The eviction's nulls are put off whenever a publication rule is on,

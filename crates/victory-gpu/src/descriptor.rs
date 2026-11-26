@@ -718,6 +718,8 @@ pub(crate) fn publish_ready() {
 pub(crate) fn publish_deferred() {
     let handles = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
     let n = handles.len() as u64;
+    // Nothing in the air, and on the thread that submits: published now.
+    host::QUIET.set(true);
     for handle in handles {
         let Some((heap, index)) = shader_slot(handle) else {
             continue;
@@ -726,6 +728,7 @@ pub(crate) fn publish_deferred() {
             host.mirror(index, handle, true);
         }
     }
+    host::QUIET.set(false);
     host::PUBLISH[1].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     static LINE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
     let now = crate::host::now_ms();

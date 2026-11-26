@@ -11,12 +11,13 @@ counts appear here.
 
 ## What works and what does not
 
-The title boots, reaches the world and renders part of it. On the stock Proton a
-world frame took 2 to 3 s (0.3 to 0.5 frames a second); on the Proton with the
-patched wineserver (below) it took about 1 s in the first runs and, with the later
-fixes, 350 to 400 ms (2.5 to 3 frames a second: medians of 349, 373 and 401 ms in
-three runs of six to ten minutes, measured on one machine). **It is not playable.**
-No run has been tested past ten minutes.
+The title boots, loads a save and plays. On the stock Proton a world frame took 2 to
+3 s; on the Proton with the patched wineserver (below) and the fixes in this document
+it takes 170 to 330 ms (3 to 6 frames a second) on one machine (CachyOS, RX 9070,
+RADV), rising with the scene: about 123 ms plus 33 ms per 1,000 draws with the speed
+switches on (see the README). The longest session without a crash or a lost device
+is 74 minutes. **It is not playable for pleasure at this frame rate.** The README
+has the current state and what is known to be wrong.
 
 - Ray tracing is off on purpose (see "Ray tracing"). Most of the draws a
   diagnostics build reports as dropped are ray-tracing passes. Ignore those.

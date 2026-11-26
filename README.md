@@ -1,4 +1,110 @@
-# VIctory fork (work in progress)
+# VIctory under Proton on AMD (RADV)
+
+A fork of [VIctory](https://github.com/Marvisak/VIctory), the compatibility layer
+that runs an Xbox Series title on a PC from files the user supplies. This fork is
+about one thing: **running it on Linux through Proton on an AMD card with the Mesa
+RADV driver.** It collects the fixes that needed, each with the evidence for it.
+
+No game data is in this repository and none will be (see
+[docs/asset-policy.md](docs/asset-policy.md)).
+
+## State (2026-11-25)
+
+Tested on **one machine only**: CachyOS (kernel 7.3), Radeon RX 9070 16 GB, Mesa
+RADV 26.3.1, Ryzen 7 9800X3D, 64 GB RAM, Proton Experimental with a patched
+wineserver (below), 3840x2160, the Series X profile.
+
+| | |
+|---|---|
+| Boots, loads a save, reaches the world | yes |
+| Longest session without a crash or a lost device | 74 minutes |
+| Frame time in the world | 170 to 330 ms (3 to 6 frames a second), rising with the scene: about 123 ms + 33 ms per 1,000 draws with the speed switches below |
+| Characters' heads, facial animation, eyes | right |
+| Water (things float, swimming) | right |
+| Prologue | played through; a save was written after it |
+| Ray-traced light | off (see [docs/proton.md](docs/proton.md), "Ray tracing"): rooms without direct light are dark |
+
+**It is not playable for pleasure at this frame rate.** It is a base for people who
+want to work on the Linux side.
+
+Known wrong, not yet explained:
+
+- Coloured glows (green, pink) on some lights and on rain: one particle program's
+  result is wrong although every input to it was checked and is right. The same is
+  seen with other forks under Proton.
+- Skin looks glossy when the card's memory is full (normal and specular maps not yet
+  on the card). An eviction of unread textures is in the tree, off by default
+  (`VICTORY_TEXTURE_EVICT`): it has run clean in tests and was on in the one session
+  that lost the device, cause not found.
+- Frame time roughly doubles over an hour as scenes get heavier and the card fills.
+- One device loss at world entry (a read near address 0) on the real screen that
+  no off-screen run reproduces.
+
+## What this fork adds for Proton
+
+Each has a section in [docs/proton.md](docs/proton.md) with how it was found. The
+switch named turns it off (`=0`) unless noted.
+
+| Problem under Proton | Fix | Switch |
+|---|---|---|
+| Frames of seconds: every commit of memory walks the wineserver's list of views | A wineserver patch (a tree instead of the list); see "The patched Proton" | (a Proton build, not this code) |
+| Pipelines stuck "being made": vkd3d-proton's shader converter recursed to a stack overflow on loops with two back edges | Loops are emitted with a single latch | always on |
+| Characters without heads: a compute dispatch issued once was dropped when its pipeline was not made yet | Compute dispatches wait for their pipeline | `VICTORY_COMPUTE_WAIT` |
+| GPU page fault inside a texture made a moment ago, device lost after minutes | A view of a fresh texture is written into its heap slot only when no submission is in flight | `VICTORY_PUBLISH_SAFE` |
+| GPU page faults at addresses near 0 | Ray-tracing passes that are handed address 0 read zeros there; null buffer views read zeros | `VICTORY_MEMORY_RUN_FIRST`, `VICTORY_NULL_BUFFER_ZEROS` |
+| Faces still, eyes glowing | Table-bound dynamic slots carry their integer-kind word | `VICTORY_TABLE_SLOT_WORDS` |
+| Faces torn: a typed load of 16-bit integers after a group barrier returned a value from before another wave's store | Those loads read the slot's raw view | `VICTORY_RAW_TYPED_LOADS` |
+| Everything sinks in water | Textures that shaders write are copied back into the title's memory | `VICTORY_TEXTURE_BACK` |
+| A read failing with `0x800703e6` mid-run | DirectStorage's writes take a lease on guarded pages (from upstream) | |
+| A controller turned on after the start is "disconnected"; several pads | One pad that is always there | `VICTORY_ONE_PAD` |
+| Seconds-long stalls when a new scene's pipelines are made | Pipelines earlier runs used are made ahead | `VICTORY_PIPELINE_WARM` |
+
+Speed switches, all **off by default**, measured together at 19 to 30% less frame
+time on this machine (same save, same script, back to back): `VICTORY_GUARD_BITS=1
+VICTORY_COPY_PLAIN=1 VICTORY_LAND_WINDOW=1 VICTORY_CARD_STEPS=2
+VICTORY_LOOKUP_CACHE=1`. Several are ports from
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) and
+[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), named
+where they are in the code.
+
+## What has NOT been tested
+
+**Nothing here has been run on Windows, on an NVIDIA or Intel card, or on any other
+AMD card.** Today most of the fixes above apply on every system, not only under
+Wine. Until that is changed (next), treat this tree as Linux-on-RADV only: on
+another system it may be slower or wrong where upstream is right.
+
+## Where this is going
+
+1. Each Proton fix made to apply only where it is needed (under Wine, or behind a
+   switch that is off by default), so that the same code cannot change anything for
+   Windows users, and each hardened with tests.
+2. Each offered upstream on its own, as a small change with its evidence.
+3. Kept current with upstream; this fork should shrink as fixes land there.
+
+Reports from other Linux machines are welcome in the issues: card, driver and Mesa
+version, kernel, Proton and vkd3d-proton versions, the commit, how far it got, and
+the kernel's lines if the device was lost (`journalctl -k | grep amdgpu`).
+
+## Building and running
+
+[docs/proton.md](docs/proton.md): requirements, the build (`cargo xwin`), the
+patched Proton and how to build it, running, the diagnostics and the checking tools.
+
+## Lineage and credit
+
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory) →
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) →
+myokex/victory-amd (the section below is its README) → this. Commits keep their
+authors. Much of the investigation and code in this fork was done with an AI coding
+assistant (Claude Code) directed and tested by the owner on the machine above; the
+measurements are from that machine's logs.
+
+GPL-3.0, as upstream.
+
+---
+
+# The fork this one started from
 
 ## victory-amd
 

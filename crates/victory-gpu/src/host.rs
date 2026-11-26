@@ -6927,6 +6927,7 @@ impl Meter {
             crate::cardtime::line(&host.queue, frames, FINISHED.load(Ordering::Acquire));
         }
         crate::shadow::refresh_check_line(frames);
+        crate::readgrain::line(frames);
         crate::shadow::back_line(frames);
         crate::shadow::marks_line(frames);
         {

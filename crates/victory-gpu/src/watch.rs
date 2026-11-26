@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 mod blocks;
+pub(crate) mod fine;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -287,6 +288,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
     j.asked += 1;
     let now = j.asked;
+    fine::wrote_range(&j.written, at, len, now);
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
@@ -331,6 +333,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
+        fine::kernel_page(&j.written, j.found[k], now);
         j.written.insert(page, now);
     }
     true
@@ -404,6 +407,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
+    // The kernel's 4 KiB pages kept as such (`fine`), before their blocks
+    // are noted; the guards know whole blocks.
+    for &at in &j.found[..count] {
+        fine::kernel_page(&j.written, at, now);
+    }
+    for &block in &guarded {
+        fine::whole_block(block);
+    }
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
@@ -1296,7 +1307,18 @@ thread_local! {
 ///   memory too.
 /// - A placed texture there changes with no descriptor written:
 ///   `descriptor::host::remapped`, as `writing_why` does.
+#[cfg_attr(not(test), allow(dead_code))] // The copy-back takes `land_past_by`.
 pub(crate) fn land_past(at: usize, bytes: &[u8]) -> Option<u64> {
+    land_past_by(at, bytes).map(|(now, _)| now)
+}
+
+/// [`land_past`], with the journal's number of each block of `[at, at +
+/// len)` (at this view) from before its note, `(block, prior)` in order,
+/// 0 for never: taken under the same hold of the journal as the note, for
+/// the copy the bytes came from (`crate::shadow::Shadow::took_back`),
+/// which may count a block as taken at the note only if it had taken
+/// `prior`. Read after the note it would be the note's own number.
+pub(crate) fn land_past_by(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
     if !land_window() || bytes.is_empty() {
         return None;
     }
@@ -1308,7 +1330,7 @@ pub(crate) fn land_past(at: usize, bytes: &[u8]) -> Option<u64> {
     landed
 }
 
-fn land_past_held(at: usize, bytes: &[u8]) -> Option<u64> {
+fn land_past_held(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
     let end = at.saturating_add(bytes.len());
     let _mapped = title_memory_reading_now(at, bytes.len())?;
     let crate::inplace::Cover::Run(section, offset) = crate::inplace::cover(at, bytes.len()) else {
@@ -1332,12 +1354,17 @@ fn land_past_held(at: usize, bytes: &[u8]) -> Option<u64> {
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (base + offset as usize) as *mut u8, bytes.len()) };
     j.asked += 1;
     let now = j.asked;
+    let priors: Vec<(usize, u64)> =
+        (at / BLOCK..end.div_ceil(BLOCK)).map(|b| (b, j.written.get(&(b * BLOCK / PAGE)).copied().unwrap_or(0))).collect();
     for page in pages {
+        // Whole blocks for the journal by 4 KiB page (`fine`): an entry
+        // left as it was would not hold this note's pages.
+        fine::whole_block(page);
         j.written.insert(page, now);
     }
     drop(g);
     drop(j);
-    Some(now)
+    Some((now, priors))
 }
 
 /// How [`write_title_memory`] went.
@@ -2448,6 +2475,11 @@ mod tests {
         let (_, number) = asked(guarded, page);
         assert!(number > before, "noted written at this view: {number} after {before}");
         assert_eq!(number, landed, "under the asking it gave");
+        // Landed again: the number from before the note is the first
+        // landing's, for the copy the bytes came from (`Shadow::took_back`).
+        let (again, priors) = land_past_by(at, &[1, 2, 3]).expect("landed again");
+        assert_eq!(priors, vec![(page, landed)]);
+        assert!(again > landed);
         let (_, number) = asked(other, other_page);
         assert!(number > before_other, "noted written at the other view: {number} after {before_other}");
         // A block the title has written (open, not clean): the old way.

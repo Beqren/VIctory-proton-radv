@@ -141,6 +141,17 @@ fn oldest_recording(finished: u64) -> u64 {
         .find(|&(_, &sent)| sent != UNUSED && (sent == u64::MAX || sent > finished))
         .map_or(u64::MAX, |(&n, _)| n)
 }
+/// Submissions started so far (numbered from 1 as they are sent).
+pub(crate) fn started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// The last submission finished: submissions finish in the order they
+/// were sent (one queue).
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1931,6 +1942,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Page marks' check: the copies the list's shaders write (by address)
@@ -2345,7 +2361,15 @@ struct MarkTake {
     data: usize,
     /// Words copied down.
     words: usize,
+    /// Read marks (`victory_shader::emit::read_marks`): words of the
+    /// read-slots bitmap copied down, at [`READS_AT`] in the read-back
+    /// buffer.
+    reads: usize,
 }
+
+/// Where a [`MarkTake`]'s read-back buffer holds the read-slots bitmap:
+/// after the written pages.
+const READS_AT: usize = (victory_shader::emit::VIEW_WRITE_BITS / 8) as usize;
 
 // SAFETY: D3D12 objects are free-threaded; the mapping is read only after
 // the submission's fence has passed.
@@ -2361,7 +2385,21 @@ impl MarkTake {
         unsafe { std::slice::from_raw_parts(self.data as *const u32, self.words) }
     }
 
+    /// The read marks, from bit 0 (view-heap slot 0). Only once the
+    /// submission has run.
+    fn read_bits(&self) -> &[u32] {
+        // SAFETY: the mapped read-back buffer holds `VIEW_READ_BITS` bits
+        // from `READS_AT`, `reads` words of them written by the finished copy.
+        unsafe { std::slice::from_raw_parts((self.data + READS_AT) as *const u32, self.reads) }
+    }
+
+    /// Once the submission has landed: its read marks go to the texture
+    /// pass (`crate::descriptor::host::reads_landed`), and the take back to
+    /// the pool.
     fn done(self) {
+        if self.reads > 0 {
+            crate::descriptor::host::reads_landed(self.read_bits());
+        }
         MARK_POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self);
     }
 }
@@ -2436,6 +2474,9 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Title memory its texture read-backs write ([`crate::texback`]):
+    /// written by the flight until it has landed, as `back` is.
+    texture_back_ranges: Vec<(usize, usize)>,
     /// Page marks: its marks, the copies with an unmarked write, and (check)
     /// who declared what.
     marks: Option<MarkTake>,
@@ -2456,6 +2497,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    texture_back_ranges: Vec<(usize, usize)>,
     /// As in [`Sent`].
     marks: Option<MarkTake>,
     unmarked: std::collections::HashSet<usize>,
@@ -2473,8 +2515,8 @@ enum Late {
 
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
+    /// The title memory the flights' shaders and texture read-backs may
+    /// write (address, end), in order and joined.
     written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
@@ -2961,7 +3003,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// shaders wrote. Three later runs that lost the device (tail-1, tail-2,
 /// pairoff-1) ended at the removal check in [`Host::relay_land`] instead:
 /// it saw the removal in time there.
-fn fetch_mark() -> bool {
+pub(crate) fn fetch_mark() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_MARK").is_none_or(|v| v != "0"))
 }
@@ -2969,7 +3011,7 @@ fn fetch_mark() -> bool {
 /// The mark fetch number `sent` writes ([`fetch_mark`]): never 0, so a
 /// buffer the card never wrote does not pass, and never the mark of the
 /// fetch before, so that one's leftover does not pass either.
-fn mark_value(sent: u64) -> u32 {
+pub(crate) fn mark_value(sent: u64) -> u32 {
     (sent as u32) | 0x8000_0000
 }
 
@@ -3305,6 +3347,11 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    // Textures shaders wrote that the title reads on the CPU
+    // ([`crate::texback`]): every caller found the device alive first.
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -3646,15 +3693,22 @@ impl Host {
     /// one's, so the buffer holds exactly this submission's marks (and those
     /// of submissions before it that took none). `None` if it cannot be made.
     fn marks_take(&self) -> Option<MarkTake> {
-        let gpu = crate::shadow::mark_bitmap()?;
-        let words = crate::shadow::mark_words();
+        let pages = crate::shadow::mark_bitmap();
+        let reads = crate::shadow::read_bitmap();
+        if pages.is_none() && reads.is_none() {
+            return None;
+        }
+        let words = if pages.is_some() { crate::shadow::mark_words() } else { 0 };
+        let read_words = if reads.is_some() { crate::shadow::read_words() } else { 0 };
         let pooled = MARK_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
         let mut take = match pooled {
             Some(take) => take,
             None => {
                 let list = self.make_prelude()?;
-                let back = self.read_back_buffer(u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8))?;
-                name(&back, || "written pages, read back".into());
+                let back = self.read_back_buffer(
+                    u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8) + u64::from(victory_shader::emit::VIEW_READ_BITS / 8),
+                )?;
+                name(&back, || "written pages and read slots, read back".into());
                 let mut data = std::ptr::null_mut();
                 // SAFETY: a read-back buffer of ours, mapped for good; read
                 // only after the copies into it have run.
@@ -3664,11 +3718,21 @@ impl Host {
                     back,
                     data: data as usize,
                     words: 0,
+                    reads: 0,
                 }
             }
         };
         take.words = words;
+        take.reads = read_words;
         let bytes = (words * 4) as u64;
+        let read_bytes = (read_words * 4) as u64;
+        // A copy down and a clear of each bitmap: (bitmap and zeros, bytes,
+        // where in the read-back buffer).
+        let both: Vec<(&crate::shadow::MarkBitmap, u64, u64)> = [(pages, bytes, 0), (reads, read_bytes, READS_AT as u64)]
+            .into_iter()
+            .filter_map(|(gpu, n, at)| Some((gpu?, n, at)))
+            .filter(|&(_, n, _)| n > 0)
+            .collect();
         let (allocator, list) = &take.list;
         // SAFETY: the list's last run finished (a take goes back to the pool
         // only once its submission has landed); live buffers holding
@@ -3686,21 +3750,23 @@ impl Host {
                         }),
                     },
                 }]);
-                list.ResourceBarrier(&[
-                    transition(&gpu.bitmap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                    transition(&gpu.zeros, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                ]);
-                list.CopyBufferRegion(&take.back, 0, &gpu.bitmap, 0, bytes);
-                list.ResourceBarrier(&[transition(
-                    &gpu.bitmap,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                )]);
-                list.CopyBufferRegion(&gpu.bitmap, 0, &gpu.zeros, 0, bytes);
-                list.ResourceBarrier(&[
-                    transition(&gpu.bitmap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
-                    transition(&gpu.zeros, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-                ]);
+                for &(gpu, bytes, at) in &both {
+                    list.ResourceBarrier(&[
+                        transition(&gpu.bitmap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                        transition(&gpu.zeros, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    ]);
+                    list.CopyBufferRegion(&take.back, at, &gpu.bitmap, 0, bytes);
+                    list.ResourceBarrier(&[transition(
+                        &gpu.bitmap,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    list.CopyBufferRegion(&gpu.bitmap, 0, &gpu.zeros, 0, bytes);
+                    list.ResourceBarrier(&[
+                        transition(&gpu.bitmap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+                        transition(&gpu.zeros, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    ]);
+                }
                 list.Close()
             })()
         };
@@ -4276,6 +4342,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -4451,7 +4518,13 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4461,6 +4534,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
                 marks: sent.marks,
                 unmarked: sent.unmarked,
                 writers: sent.writers,
@@ -4498,7 +4572,13 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -4508,6 +4588,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
                 marks: sent.marks,
                 unmarked: sent.unmarked,
                 writers: sent.writers,
@@ -4723,6 +4804,7 @@ impl Host {
         if !behind {
             sweep();
             crate::descriptor::publish_deferred();
+            crate::descriptor::nulls_deferred();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
@@ -4730,6 +4812,7 @@ impl Host {
             self.settle(&mut submitted, WHY_SYNC);
             sweep();
             crate::descriptor::publish_deferred();
+            crate::descriptor::nulls_deferred();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
@@ -4835,7 +4918,8 @@ impl Host {
         let part = std::time::Instant::now();
         let (mut unmarked, marking, writers) = marked_writes(runs);
         prep_part(4, part);
-        let marks = if marking { self.marks_take() } else { None };
+        // Read marks: every submission takes its own, whatever it wrote.
+        let marks = if marking || victory_shader::emit::read_marks() { self.marks_take() } else { None };
         if marking && marks.is_none() {
             for list in runs {
                 for step in &list.deferred().copies {
@@ -4869,6 +4953,10 @@ impl Host {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             let back = declared_writes(runs);
+            let texture_back_ranges = runs
+                .iter()
+                .flat_map(|l| l.deferred().texture_backs.iter().map(crate::texback::Back::range).collect::<Vec<_>>())
+                .collect();
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -4878,6 +4966,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                texture_back_ranges,
                 writes,
                 marks,
                 unmarked,
@@ -5322,6 +5411,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5407,6 +5497,34 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers of ours ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -5752,7 +5870,9 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.texture_backs.is_empty()
+                && deferred.back_wanted.is_empty())
             {
                 return false;
             }
@@ -6889,6 +7009,29 @@ impl Meter {
                         r[8],
                         r[9],
                     );
+                    if victory_shader::emit::read_marks() {
+                        let k = crate::descriptor::host::READ_MARKS.each_ref().map(|c| c.load(Ordering::Relaxed));
+                        tracing::info!(
+                            "read marks since the start: {} submissions' marks landed; {} slots named by passes, of them \
+                             null {} in the queue, {} made null by the eviction (put back), {} neither; asked slots no \
+                             mark named lately: {} of {}; make on first read (VICTORY_TEXTURE_ON_READ): {}; eviction's nulls \
+                             put off while submissions were in the air {}, made {}, left (slot changed) {}; host copies passed \
+                             over as young (looks) {}; eviction passes left out for a load burst {}",
+                            k[0],
+                            k[1],
+                            k[2],
+                            k[3],
+                            k[4],
+                            k[5],
+                            k[6],
+                            u8::from(crate::descriptor::host::on_read()),
+                            crate::descriptor::NULLED[0].load(Ordering::Relaxed),
+                            crate::descriptor::NULLED[1].load(Ordering::Relaxed),
+                            crate::descriptor::NULLED[2].load(Ordering::Relaxed),
+                            crate::resource::EVICTED[11].load(Ordering::Relaxed),
+                            crate::resource::EVICTED[12].load(Ordering::Relaxed),
+                        );
+                    }
                     let m = crate::descriptor::host::MISSING.each_ref().map(|c| c.load(Ordering::Relaxed));
                     let c = crate::draw::PLACED_COPIES.each_ref().map(|c| c.load(Ordering::Relaxed));
                     tracing::info!(

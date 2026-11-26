@@ -1567,6 +1567,23 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_VIEW_READS {
+                    // Ours: the read-slots bitmap (read marks).
+                    let Some(gpu) = crate::shadow::view_reads() else {
+                        once!("a shader marking its texture reads without the read-slots bitmap: dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the bitmap lives as long as the
+                    // process.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_VIEW_WRITES {
                     // Ours: the written-pages bitmap.
                     let Some(gpu) = crate::shadow::view_writes() else {
@@ -2124,6 +2141,16 @@ impl State {
                 continue;
             }
             let made = host.texture_slot_made(index);
+            // Read marks: what of the record's first words no mark named
+            // lately (a word the program does not sample, or a read marks
+            // miss).
+            if primary && victory_shader::emit::read_marks() {
+                use crate::descriptor::host::{MARK_FRAMES, READ_MARKS};
+                READ_MARKS[6].fetch_add(1, Ordering::Relaxed);
+                if !host.texture_slot_marked_within(index, frame, MARK_FRAMES) {
+                    READ_MARKS[5].fetch_add(1, Ordering::Relaxed);
+                }
+            }
             if primary || asked_wide() {
                 host.texture_slot_asked(index, frame);
                 HEAP_TEXTURES_ASKED[0].fetch_add(1, Ordering::Relaxed);
@@ -2270,7 +2297,27 @@ impl State {
         EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed);
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
+        // A bake draws once into what the title keeps: what it may read is
+        // made before it, read by a shader yet or not (make on first read
+        // would give it a frame of nulls, baked in for good).
+        crate::descriptor::host::ALL_DUE.set(bake);
+        // At most once in `UNEVICT_MS`: the bake draws several times in
+        // most frames, and putting every evicted slot back at each made the
+        // pass remake and the eviction let go tens of thousands again (run
+        // onread-5: 61,213 made again after an eviction, 44,916 within 10 s).
+        const UNEVICT_MS: u64 = 10_000;
+        static UNEVICTED: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let last = UNEVICTED.load(Ordering::Relaxed);
+        if bake
+            && crate::descriptor::host::evict_switch().0
+            && (last == 0 || now >= last + UNEVICT_MS)
+            && UNEVICTED.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            host.texture_slots_unevict(frame);
+        }
         self.heap_textures(list, heap, host);
+        crate::descriptor::host::ALL_DUE.set(false);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -2352,6 +2399,14 @@ impl State {
         // read lately that were refused for room.
         let (evict, evict_age) = crate::descriptor::host::evict_switch();
         let mut refused_read_bytes = 0u64;
+        // Read marks: the slots shaders read since the last pass count as
+        // read now (what the eviction goes by, and what make on first read
+        // makes); those the eviction made null go back into the queue.
+        host.texture_slots_read(frame);
+        // Slot writes of new textures put off while older submissions were
+        // in the air (`VICTORY_PUBLISH_SAFE=sent`): those every submission
+        // in the air may read now.
+        crate::descriptor::publish_ready();
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -2609,7 +2664,14 @@ impl State {
             catching_up(began.elapsed().saturating_sub(SPAN));
         }
         if evict {
-            self.evict_textures(host, refused_read_bytes, evict_age);
+            // Marks landed during the pass count before anything is chosen
+            // (review: a read landing meanwhile left an old stamp). Marks of
+            // submissions still in the air are not known: shortcut: such a
+            // texture, unread for the eviction's frames before, can be made
+            // null under a read; its slot reads null until the next pass
+            // puts it back (counted as made again after an eviction).
+            host.texture_slots_read(frame);
+            self.evict_textures(heap, host, refused_read_bytes, evict_age);
         }
         // What is shown and when it was read, for the 5 s line.
         static CENSUS_MS: AtomicU64 = AtomicU64::new(0);
@@ -2632,7 +2694,18 @@ impl State {
     /// let go yet (the sweep lets go a second or two later); at most every
     /// half second. And, every two seconds, the textures not read for `age`
     /// milliseconds, whether the card is full or not.
-    fn evict_textures(&self, host: &crate::descriptor::host::HostHeap, refused: u64, age: Option<u64>) {
+    ///
+    /// With read marks, also past nine tenths of the card's budget: the
+    /// textures read longest ago until it would be at 85% (upstream
+    /// 69d1e8e's band), instead of refusing what shaders read now.
+    fn evict_textures(
+        &self,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+        refused: u64,
+        age: Option<(u64, u64)>,
+    ) {
+        let handle = |index: u32| heap.handle(index);
         static LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
         let now = crate::host::now_ms();
         let due = |i: usize, every: u64| {
@@ -2640,17 +2713,32 @@ impl State {
             now >= last + every && LAST[i].compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         };
         let pending = crate::resource::EVICTED[10].load(Ordering::Relaxed);
-        let need = refused.saturating_add(32 << 20).saturating_sub(pending);
+        let over = if victory_shader::emit::read_marks() { crate::resource::over_budget_line() } else { 0 };
+        let wanted = if refused > 0 { refused.saturating_add(32 << 20) } else { 0 };
+        let need = wanted.max(over).saturating_sub(pending);
+        // A load burst (with read marks): the passes made more than `BURST`
+        // textures since the last eviction pass: a scene is loading, what
+        // it loads is about to be read and what was read before it may be
+        // again; nothing goes for room until it settles (run onread-7: three
+        // in four of the textures made again within 10 s of their eviction
+        // were let go in the world's first 6 s).
+        const BURST: u64 = 300;
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let made = HEAP_TEXTURES.load(Ordering::Relaxed);
+        let burst = victory_shader::emit::read_marks() && made.saturating_sub(MADE.swap(made, Ordering::Relaxed)) > BURST;
+        if burst && need > 0 {
+            crate::resource::EVICTED[12].fetch_add(1, Ordering::Relaxed);
+        }
         let mut said = None;
-        if refused > 0 && need > 0 && due(0, 500) {
-            said = Some(("refused", need, host.evict(need, None)));
+        if need > 0 && !burst && due(0, 500) {
+            said = Some((if refused > 0 { "refused" } else { "past the budget line" }, need, host.evict(need, None, handle)));
         }
         if let Some(age) = age
             && due(1, 2_000)
         {
-            let chose = host.evict(0, Some(age));
+            let chose = host.evict(0, Some(age), handle);
             if said.is_none() && chose[0] > 0 {
-                said = Some(("unread", age, chose));
+                said = Some(("unread", age.0, chose));
             }
         }
         if let Some((why, of, [textures, bytes, slots])) = said
@@ -4572,6 +4660,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Some textures shaders write the title reads on the CPU
+            // ([`crate::texback`]).
+            list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

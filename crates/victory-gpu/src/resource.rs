@@ -1123,6 +1123,9 @@ pub(crate) struct HostTexture {
     va: u64,
     /// When it was made (`crate::host::now_ms`).
     made_ms: u64,
+    /// Submissions started when it was made (`crate::host::started`): a
+    /// submission numbered higher was sent after its memory existed.
+    made_started: u64,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
@@ -1175,10 +1178,12 @@ struct Hosted {
 /// chosen but used again before they could go; made again after an
 /// eviction, and of those within 10 s and within 60 s of it; host copies
 /// let go as idle (not chosen) made again within 5 s and within 30 s; and
-/// the bytes chosen but not let go yet.
+/// the bytes chosen but not let go yet; host copies passed over as young
+/// (per look, `young_ms`); eviction passes left out for a load burst
+/// (`draw.rs`, `evict_textures`).
 #[cfg(windows)]
-pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 11] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 13] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 13];
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
@@ -1429,6 +1434,17 @@ pub(crate) fn host_age_ms(this: This) -> Option<u64> {
     Some(crate::host::now_ms().saturating_sub(host.made_ms))
 }
 
+/// Submissions started when title texture `this`'s host copy was made,
+/// making it if it has none (then: started now).
+#[cfg(windows)]
+pub(crate) fn host_made_started(this: This) -> Option<u64> {
+    if this.is_null() {
+        return None;
+    }
+    let (host, _) = hosted(this, true)?;
+    Some(host.made_started)
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
@@ -1489,6 +1505,23 @@ pub(crate) fn reserve_room(asked: bool) -> bool {
     match crate::host::host().and_then(|h| h.video_memory()) {
         Some([budget, used, ..]) => used + crate::shadow::card_reserve_left() < budget / 100 * percent,
         None => false,
+    }
+}
+
+/// Read marks' eviction (`draw.rs`, `evict_textures`): past nine tenths of
+/// the card's budget (the line [`room`] stops making textures at), the
+/// bytes to give up to come back to 85% of it (upstream 69d1e8e: past 90%,
+/// the least recently used until 85%); 0 under the line or without a
+/// budget. What the copies of title buffers may still take counts as in
+/// use, as for [`room`].
+#[cfg(windows)]
+pub(crate) fn over_budget_line() -> u64 {
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => {
+            let used = used + crate::shadow::card_reserve_left();
+            if used >= budget / 10 * 9 { used - budget / 100 * 85 } else { 0 }
+        }
+        None => 0,
     }
 }
 
@@ -1724,6 +1757,7 @@ pub(crate) fn evictable() -> std::collections::HashMap<usize, (usize, u64, u64)>
     use std::sync::atomic::Ordering::Relaxed;
     use windows::core::Interface;
     let mut out = std::collections::HashMap::new();
+    let (now, young) = (crate::host::now_ms(), young_ms());
     let all = textures();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
@@ -1736,10 +1770,31 @@ pub(crate) fn evictable() -> std::collections::HashMap<usize, (usize, u64, u64)>
             && std::sync::Arc::strong_count(host) == 1
             && r.host.mark.load(Relaxed) == 0
         {
+            // Young: made (or made again) lately, maybe not read yet (read
+            // marks land a frame or two later, and a write waits for a
+            // quiet point to show it): not the eviction's.
+            if now.saturating_sub(host.made_ms) < young {
+                EVICTED[11].fetch_add(1, Relaxed);
+                continue;
+            }
             out.insert(host.texture.as_raw() as usize, (at, host.bytes, r.host.used.load(Relaxed)));
         }
     }
     out
+}
+
+/// How long a host copy is safe from the eviction after it is made (ms):
+/// `VICTORY_EVICT_YOUNG_MS`, 15,000 with read marks (run onread-7: 12,278
+/// of 16,323 textures made again within 10 s of their eviction were let go
+/// in the world's first 6 s, while it was loading), else 0.
+fn young_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_EVICT_YOUNG_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(if victory_shader::emit::read_marks() { 15_000 } else { 0 })
+    })
 }
 
 /// For the 5 s line: host copies of placed textures the title fills, and
@@ -1910,6 +1965,7 @@ impl HostTexture {
             texture,
             va,
             made_ms: crate::host::now_ms(),
+            made_started: crate::host::started(),
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
@@ -2263,6 +2319,7 @@ fn hand_out_resource(
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
+        crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             TARGETS_AT
                 .lock()
@@ -2287,7 +2344,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -2500,6 +2559,37 @@ pub(crate) extern "system" fn create_at_address(
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Width, height and format of texture `this` (`None` for a buffer and
+/// anything but a single-sampled 2D texture), for `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a texture with planes.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
 
 /// The bytes of title memory a texture with the resource description
 /// `desc` (as words) takes where the title placed it; `None` for a buffer

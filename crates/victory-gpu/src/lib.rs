@@ -63,6 +63,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::{alias_copy_event, copies_alive, page_mapping, phase as frame_phase, remap_call, view_join, views_alive};

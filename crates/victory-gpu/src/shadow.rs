@@ -2131,7 +2131,12 @@ fn sample_read(held: *const u8, from: usize, len: usize) {
 /// [`Shadow::refresh_check`]: blocks looked at and found differing since
 /// the last line, blocks found stale three refreshes in a row since the
 /// start, and of those since the last line.
-static REFRESH_CHECKED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Then blocks that differed with a write reported since the refresh, and
+/// streaks of three such (since the last line).
+static REFRESH_CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// [`Shadow::check_raced`]'s streaks, by copy and address.
+static CHECK_RACED: Mutex<Option<std::collections::HashMap<(u64, usize), u32>>> = Mutex::new(None);
 
 /// Of the checks: blocks (and pages) found differing, by copy and address
 /// (a block one copy holds stale says nothing of another copy's), and how
@@ -2217,11 +2222,15 @@ pub(crate) fn refresh_check_line(frames: f64) {
         return;
     }
     let stale = REFRESH_CHECKED[3].swap(0, Ordering::Relaxed);
+    let [raced, raced3] = [4, 5].map(|i| REFRESH_CHECKED[i].swap(0, Ordering::Relaxed));
     tracing::info!(
-        "refreshes checked per frame (VICTORY_REFRESH_CHECK=1): {:.0} blocks looked at, {:.1} differed once; stale three \
-         refreshes in a row: {:.1} a frame, {} since the start (must be 0)",
+        "refreshes checked per frame (VICTORY_REFRESH_CHECK=1): {:.0} blocks looked at, {:.1} differed, of them {:.1} with a \
+         write reported since the refresh (the race; {:.2} streaks of three a frame); stale three refreshes in a row with no \
+         write reported: {:.1} a frame, {} since the start (must be 0)",
         looked as f64 / frames,
         differed as f64 / frames,
+        raced as f64 / frames,
+        raced3 as f64 / frames,
         stale as f64 / frames,
         REFRESH_CHECKED[2].load(Ordering::Relaxed)
     );
@@ -3772,7 +3781,7 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
-                self.refresh_check(from, to);
+                self.refresh_check(from, to, now);
                 #[cfg(feature = "diagnostics")]
                 {
                     READS[0].fetch_add(1, Ordering::Relaxed);
@@ -3809,7 +3818,13 @@ impl Shadow {
     /// instrument for every change to how writes are found: it must stay at
     /// 0. Taken from VIctory-7900XTX (`Shadow::refresh_check`, from their
     /// 8dd30ab), with the counts added. It costs about 100 ms a frame there.
-    fn refresh_check(&self, from: usize, to: usize) {
+    ///
+    /// Each difference is told apart by whether a write into the block was
+    /// reported after the refresh's asking `now` (`crate::watch::reported_since`):
+    /// three in a row with none reported is a missed write, counted and
+    /// said as before; with one reported each time it is the title writing
+    /// the block while it is refreshed, counted apart.
+    fn refresh_check(&self, from: usize, to: usize, now: u64) {
         if !refresh_check_on() {
             return;
         }
@@ -3828,7 +3843,16 @@ impl Shadow {
                 if differs {
                     REFRESH_CHECKED[1].fetch_add(1, Ordering::Relaxed);
                 }
-                self.check_noted(at, differs, (from, to));
+                // A difference with a write reported since the refresh is
+                // the race, not a miss.
+                let reported = differs && crate::watch::reported_since(at, now) == Some(true);
+                if reported {
+                    REFRESH_CHECKED[4].fetch_add(1, Ordering::Relaxed);
+                }
+                self.check_noted(at, differs && !reported, (from, to));
+                if reported {
+                    self.check_raced(at);
+                }
             }
             // The first bytes of the next 64 KiB block.
             at = (at / PAGE + 1) * PAGE;
@@ -3863,6 +3887,19 @@ impl Shadow {
                 crate::readgrain::count(crate::readgrain::CHECK_DIFFERED, 1);
             }
             self.check_noted(a, differs, (page, page + KERNEL_PAGE));
+        }
+    }
+
+    /// Of the checks: the block at `at` differed with a write reported since
+    /// the refresh; three refreshes in a row so are counted (the title
+    /// writing it while it is refreshed), not said.
+    fn check_raced(&self, at: usize) {
+        let mut map = CHECK_RACED.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(Default::default);
+        let times = map.entry((self.id as u64, at)).or_insert(0);
+        *times += 1;
+        if *times % 3 == 0 {
+            REFRESH_CHECKED[5].fetch_add(1, Ordering::Relaxed);
         }
     }
 

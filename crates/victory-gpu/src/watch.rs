@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 mod blocks;
+pub(crate) mod fine;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -287,6 +288,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
     j.asked += 1;
     let now = j.asked;
+    fine::wrote_range(&j.written, at, len, now);
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
     }
@@ -331,6 +333,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
+        fine::kernel_page(&j.written, j.found[k], now);
         j.written.insert(page, now);
     }
     true
@@ -404,6 +407,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
+    // The kernel's 4 KiB pages kept as such (`fine`), before their blocks
+    // are noted; the guards know whole blocks.
+    for &at in &j.found[..count] {
+        fine::kernel_page(&j.written, at, now);
+    }
+    for &block in &guarded {
+        fine::whole_block(block);
+    }
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);

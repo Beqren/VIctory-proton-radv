@@ -2116,6 +2116,82 @@ fn sample_read(held: *const u8, from: usize, len: usize) {
 /// start, and of those since the last line.
 static REFRESH_CHECKED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Of the checks: blocks (and pages) found differing, by address, and how
+/// many refreshes in a row.
+static CHECK_DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+
+/// Check mode (`VICTORY_REFRESH_CHECK=1`, [`Shadow::refresh_check`]).
+fn refresh_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// Whether a copy the copy-back wrote title memory from leaves those bytes
+/// out of its next refresh ([`Shadow::took_back`], `VICTORY_TOOK_BACK=1`;
+/// off by default). Run d4-off: 1,475 of the 2,618 blocks a frame the
+/// guards reported written had been opened by the copy-back, about 97 MB a
+/// frame read back into copies, the copy it came from among them, which
+/// held those bytes already.
+fn took_back_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TOOK_BACK").is_some_and(|v| v == "1"))
+}
+
+/// [`Shadow::took_back`] for one block: the copy took it at `*copied`
+/// (0: never), the journal had it at `prior` before the copy-back's note,
+/// which is `now`. The copy counts it as taken at `now` only if it had
+/// taken every earlier report (`prior <= *copied`); whether it did.
+fn took_back_block(copied: &mut u64, prior: u64, now: u64) -> bool {
+    if *copied == 0 || prior > *copied {
+        return false;
+    }
+    *copied = (*copied).max(now);
+    true
+}
+
+#[cfg(test)]
+mod took_back_tests {
+    use super::took_back_block;
+    use crate::readgrain::plan;
+    use crate::watch::PAGE;
+
+    const B: usize = 200;
+
+    fn whole(_: usize, _: u64, _: u64) -> (u16, bool) {
+        (u16::MAX, false)
+    }
+
+    /// Two copies of the same block, X and Y, both took it at 3. The
+    /// copy-back writes it from X, noted at 5 (prior 3).
+    #[test]
+    fn the_copy_that_took_back_skips_the_reread_and_the_others_read() {
+        let (mut x, mut y) = (vec![3u64], vec![3u64]);
+        assert!(took_back_block(&mut x[0], 3, 5));
+        let r = (B * PAGE, (B + 1) * PAGE);
+        let written = [(B, 5)];
+        // X reads nothing back, so nothing goes up to the card's side
+        // either: only `Shadow::copy` marks bytes to go up.
+        assert!(plan(r, r, &mut x, B, 6, &written, whole, 0, false).runs.is_empty());
+        // Y reads the block.
+        assert_eq!(plan(r, r, &mut y, B, 6, &written, whole, 0, false).runs, vec![r]);
+        // A title write after the note is reported at 7: X reads it.
+        assert_eq!(plan(r, r, &mut x, B, 8, &[(B, 7)], whole, 0, false).runs, vec![r]);
+    }
+
+    #[test]
+    fn a_report_the_copy_had_not_taken_is_not_swallowed() {
+        // X took the block at 3; a title write was reported at 4 (not yet
+        // read into X); the copy-back's note is 5.
+        let mut x = vec![3u64];
+        assert!(!took_back_block(&mut x[0], 4, 5));
+        let r = (B * PAGE, (B + 1) * PAGE);
+        assert_eq!(plan(r, r, &mut x, B, 6, &[(B, 5)], whole, 0, false).runs, vec![r]);
+        // Never taken: not counted as taken.
+        let mut never = 0;
+        assert!(!took_back_block(&mut never, 0, 5));
+    }
+}
+
 /// With the frame line: what [`Shadow::refresh_check`] found, if it is on.
 pub(crate) fn refresh_check_line(frames: f64) {
     let [looked, differed] = [0, 1].map(|i| REFRESH_CHECKED[i].swap(0, Ordering::Relaxed));
@@ -3711,13 +3787,10 @@ impl Shadow {
     /// 0. Taken from VIctory-7900XTX (`Shadow::refresh_check`, from their
     /// 8dd30ab), with the counts added. It costs about 100 ms a frame there.
     fn refresh_check(&self, from: usize, to: usize) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !refresh_check_on() {
             return;
         }
         const SAMPLE: usize = 256;
-        // Blocks found differing: how many refreshes in a row.
-        static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
         let start = self.start as usize;
         let mut title = [0u8; SAMPLE];
         let mut at = from;
@@ -3728,36 +3801,128 @@ impl Shadow {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
                 let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
-                let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
-                let map = map.get_or_insert_with(Default::default);
-                if copy == &title[..n] {
-                    map.remove(&at);
-                } else {
+                let differs = copy != &title[..n];
+                if differs {
                     REFRESH_CHECKED[1].fetch_add(1, Ordering::Relaxed);
-                    let times = map.entry(at).or_insert(0);
-                    *times += 1;
-                    if *times == 3 {
-                        let said = REFRESH_CHECKED[2].fetch_add(1, Ordering::Relaxed) + 1;
-                        REFRESH_CHECKED[3].fetch_add(1, Ordering::Relaxed);
-                        if said <= 64 || said.is_power_of_two() {
-                            tracing::warn!(
-                                said,
-                                copy = self.id,
-                                copy_start = format_args!("{start:#x}"),
-                                copy_bytes = self.len,
-                                address = format_args!("{at:#x}"),
-                                refreshed = format_args!("{from:#x}..{to:#x}"),
-                                on_the_card = self.card.is_some(),
-                                "a host copy of title memory is stale after its refresh, three times in a row: \
-                                 the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
-                            );
-                        }
-                    }
                 }
+                self.check_noted(at, differs, (from, to));
             }
             // The first bytes of the next 64 KiB block.
             at = (at / PAGE + 1) * PAGE;
         }
+    }
+
+    /// Check mode, with `VICTORY_READ_PAGES=1`: the 4 KiB pages a refresh
+    /// left out of blocks it read in part (`readgrain::plan`), each
+    /// compared whole with title memory. [`Shadow::refresh_check`] compares
+    /// the first 256 bytes of a block, which lie in its first page only, so
+    /// a page left out wrongly elsewhere in it would never be seen there.
+    /// Counted on the "reading by page" line; a page that differs is noted
+    /// as a block of [`Shadow::refresh_check`] is (the same map, by
+    /// address): said and counted when it differs three refreshes in a row.
+    fn refresh_check_pages(&self, pages: &[usize]) {
+        if pages.is_empty() {
+            return;
+        }
+        const KERNEL_PAGE: usize = PAGE / crate::watch::fine::SUB;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut title = vec![0u8; KERNEL_PAGE];
+        for &page in pages {
+            let (a, e) = (page.max(start), (page + KERNEL_PAGE).min(end));
+            if a >= e || !crate::host::read_into(a as *const u8, &mut title[..e - a]) {
+                continue;
+            }
+            crate::readgrain::count(crate::readgrain::CHECKED, 1);
+            // SAFETY: inside the copy (cut to it above).
+            let copy = unsafe { std::slice::from_raw_parts(self.data.add(a - start).cast_const(), e - a) };
+            let differs = copy != &title[..e - a];
+            if differs {
+                crate::readgrain::count(crate::readgrain::CHECK_DIFFERED, 1);
+            }
+            self.check_noted(a, differs, (page, page + KERNEL_PAGE));
+        }
+    }
+
+    /// Of the checks: the block (or page) at `at` was found differing or
+    /// not; three refreshes in a row differing is said and counted.
+    fn check_noted(&self, at: usize, differs: bool, (from, to): (usize, usize)) {
+        let start = self.start as usize;
+        let mut map = CHECK_DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(Default::default);
+        if !differs {
+            map.remove(&at);
+            return;
+        }
+        let times = map.entry(at).or_insert(0);
+        *times += 1;
+        if *times == 3 {
+            let said = REFRESH_CHECKED[2].fetch_add(1, Ordering::Relaxed) + 1;
+            REFRESH_CHECKED[3].fetch_add(1, Ordering::Relaxed);
+            if said <= 64 || said.is_power_of_two() {
+                tracing::warn!(
+                    said,
+                    copy = self.id,
+                    copy_start = format_args!("{start:#x}"),
+                    copy_bytes = self.len,
+                    address = format_args!("{at:#x}"),
+                    refreshed = format_args!("{from:#x}..{to:#x}"),
+                    on_the_card = self.card.is_some(),
+                    "a host copy of title memory is stale after its refresh, three times in a row: \
+                     the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
+                );
+            }
+        }
+    }
+
+    /// The copy-back wrote `[address, address + len)` of title memory from
+    /// this copy's bytes, and this copy holds exactly those bytes there
+    /// now. Notes the range as written in the journal at a new asking
+    /// (`crate::watch::fine::took_back`), so that every other copy of that
+    /// memory reads it again; with `VICTORY_TOOK_BACK=1` this copy counts
+    /// each block of it as taken at that asking where it had taken every
+    /// earlier report of the block, and its next refresh does not read the
+    /// bytes back (nor, for a copy in the card's memory, send them up
+    /// again: only a read marks bytes to go up). Returns the asking.
+    ///
+    /// For the copy-back (the asking side's change "written past the
+    /// guards"): call it after the write has landed, in place of telling
+    /// the write as one of ours that opens the block (`Why::Card`). It
+    /// notes this address only: other views of the same pages are the
+    /// caller's to tell, as now. A title write the copy-back's write does
+    /// not overwrite is never lost: one reported before this note has a
+    /// number the copy had not taken (so the copy does not count the block
+    /// as taken), one reported after it (it landed before the copy-back's
+    /// write, or between that write and the guards put back, or after) is
+    /// numbered after this note and read. Only a title write that is never
+    /// reported is lost, as without this.
+    // Called by the copy-back once it writes past the guards (the asking
+    // side's change); until then only the tests reach it.
+    #[allow(dead_code)]
+    pub(crate) fn took_back(&self, address: usize, len: usize) -> u64 {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return crate::watch::fine::took_back(0, 0, |_, _, _| {});
+        }
+        let base = start / PAGE;
+        let on = took_back_on();
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::readgrain::TOOK_BACK[0].fetch_add(1, Ordering::Relaxed);
+        crate::watch::fine::took_back(from, to - from, |block, prior, now| {
+            if !on {
+                return;
+            }
+            let Some(at) = copied.get_mut(block - base) else {
+                return;
+            };
+            if took_back_block(at, prior, now) {
+                let bytes = ((block + 1) * PAGE).min(to) - (block * PAGE).max(from);
+                crate::readgrain::TOOK_BACK[1].fetch_add(1, Ordering::Relaxed);
+                crate::readgrain::TOOK_BACK[3].fetch_add(bytes as u64, Ordering::Relaxed);
+            } else {
+                crate::readgrain::TOOK_BACK[2].fetch_add(1, Ordering::Relaxed);
+            }
+        })
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -3766,6 +3931,25 @@ impl Shadow {
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::watch::fine::on() {
+            // By 4 KiB page where the write watch said which (`readgrain`).
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let plan = crate::readgrain::plan(
+                (from, to),
+                (start, end),
+                &mut copied,
+                base,
+                now,
+                written,
+                crate::watch::fine::stale_pages,
+                crate::readgrain::gap(),
+                refresh_check_on(),
+            );
+            drop(copied);
+            let bytes = plan.runs.iter().map(|&(a, b)| self.copy(a, b)).sum();
+            self.refresh_check_pages(&plan.left_out);
+            return bytes;
+        }
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;

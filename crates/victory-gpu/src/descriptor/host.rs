@@ -491,6 +491,12 @@ pub(crate) fn on_read() -> bool {
     })
 }
 
+/// Whether the eviction's nulls wait for a moment with nothing in the air
+/// ([`HostHeap::evict`]): with any publication rule on, always.
+fn nulls_put_off(publish_mode: u8) -> bool {
+    publish_mode != 0
+}
+
 /// [`HostHeap::rank`]'s order (`VICTORY_TEXTURE_READ_FIRST=0`: off).
 fn read_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1777,12 +1783,17 @@ impl HostHeap {
     /// read in the last frames; none a dynamic slot (a list's table) shows.
     /// Returns textures chosen, their bytes, and slots made null.
     ///
-    /// With `VICTORY_PUBLISH_SAFE` on (the default) and a submission in the
-    /// air, a slot is not made null now but at the next moment with none
-    /// (`super::nulls_deferred`): a shader running in it reads descriptors
-    /// when it runs, and a slot rewritten under it may read torn (the race
-    /// behind the device losses of 2026-11-25, `publish_later`). `handle`
-    /// gives the title's descriptor of a slot, which names it then.
+    /// With `VICTORY_PUBLISH_SAFE` on (the default), a slot is not made null
+    /// now but at the next moment with nothing in the air
+    /// (`super::nulls_deferred`, on the submitting thread, where no
+    /// submission can start meanwhile): a shader running in it reads
+    /// descriptors when it runs, and a slot rewritten under it may read
+    /// torn (the race behind the device losses of 2026-11-25,
+    /// `publish_later`). Always put off, not only while something is in
+    /// the air: this runs on a recording thread, and a submission may start
+    /// between a look at what is in the air and the write (review, run
+    /// 20261126T012301). `handle` gives the title's descriptor of a slot,
+    /// which names it then.
     pub(crate) fn evict(&self, need: u64, age: Option<(u64, u64)>, handle: impl Fn(u32) -> Option<u64>) -> [u64; 3] {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::core::Interface;
@@ -1827,7 +1838,7 @@ impl HostHeap {
         }
         let mut titles = Vec::with_capacity(chosen.len());
         let mut slots = 0u64;
-        let defer = publish_mode() != 0 && crate::host::flying();
+        let defer = nulls_put_off(publish_mode());
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
@@ -4815,6 +4826,16 @@ mod tests {
             memory[at] ^= 1;
         }
         assert_ne!(print(&memory[..100]), print(&memory[..200]));
+    }
+
+    /// The eviction's nulls are put off whenever a publication rule is on,
+    /// whatever is in the air when it looks (a submission may start between
+    /// the look and the write); with none, made at once as before.
+    #[test]
+    fn eviction_nulls_wait_for_a_quiet_moment_with_publication_on() {
+        assert!(nulls_put_off(1));
+        assert!(nulls_put_off(2));
+        assert!(!nulls_put_off(0));
     }
 
     /// Make on first read: a due slot nothing wants stays in the queue

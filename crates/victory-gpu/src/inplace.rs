@@ -286,9 +286,41 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    // A handle used again names another section now.
+    window_gone(section);
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
+}
+
+/// Views of ours of whole sections, by the section's handle: where
+/// ([`window`]).
+static WINDOWS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Unmaps our view of `section`, if there is one: the handle is about to
+/// name another section.
+fn window_gone(section: usize) {
+    let window = WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
+    if let Some(base) = window.filter(|&base| base != 0) {
+        // SAFETY: a view of ours, which only `crate::watch::land_past`
+        // writes through, holding off remapping (the runtime makes no
+        // section while it maps).
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
+    }
+}
+
+/// Where a view of ours of all of `section` is, made when first asked for;
+/// `None` if the host gives none. The caller holds off remapping and found
+/// the section in a view the runtime told us of, so the section lives.
+/// After VIctory-7900XTX 2aa8134.
+pub(crate) fn window(section: usize) -> Option<usize> {
+    let bytes = views().sections.iter().find(|s| s.0 == section)?.1;
+    let mut windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let base = *windows.entry(section).or_insert_with(|| {
+        // SAFETY: a live section of that many bytes.
+        unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize
+    });
+    (base != 0).then_some(base)
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from

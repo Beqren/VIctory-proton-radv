@@ -3778,6 +3778,21 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // Nothing wrote it since this copy took it, and the blocks say so
+        // without a question (`VICTORY_LIGHT_REFRESH`).
+        if self.watched.load(Ordering::Relaxed) == 1 && crate::watch::light_refresh() {
+            let base = self.start as usize / PAGE;
+            let known = {
+                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                crate::watch::nothing_new(from, to, base, &copied)
+            };
+            if known {
+                if refresh_check_on() {
+                    self.refresh_check(from, to, crate::watch::asking_now());
+                }
+                return 0;
+            }
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);

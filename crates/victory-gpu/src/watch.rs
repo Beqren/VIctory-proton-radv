@@ -291,6 +291,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     fine::wrote_range(&j.written, at, len, now);
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         j.written.insert(page, now);
+        PUBLISHED.clear(page * PAGE / BLOCK);
     }
 }
 
@@ -415,9 +416,22 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for &block in &guarded {
         fine::whole_block(block);
     }
+    let asked_guards = failed;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
+    }
+    // View memory the guards answered for: its blocks that are guarded and
+    // clean are published with their last note (`nothing_new`), under the
+    // guards' lock (a fault clears a block's number under it before the
+    // block is writable), the journal's held since the notes.
+    if asked_guards && light_refresh() {
+        let g = guards();
+        for block in first * PAGE / BLOCK..(last * PAGE).div_ceil(BLOCK) {
+            if g.protected.contains(&block) && g.clean.tree.contains(&block) {
+                PUBLISHED.set(block, j.written.get(&(block * BLOCK / PAGE)).copied().unwrap_or(0));
+            }
+        }
     }
     Some((
         now,
@@ -434,7 +448,7 @@ const BLOCK: usize = PAGE;
 /// Diagnostics: the guards' work taken apart, since the last frame line
 /// ([`prep_take`]). Indices: [`P_GUARD_CALLS`] and on.
 #[cfg(feature = "diagnostics")]
-static PREP: [std::sync::atomic::AtomicU64; 40] = [const { std::sync::atomic::AtomicU64::new(0) }; 40];
+static PREP: [std::sync::atomic::AtomicU64; 44] = [const { std::sync::atomic::AtomicU64::new(0) }; 44];
 /// `guard` calls, of them all clean, microseconds waiting for the guards'
 /// lock in them, microseconds in `protect` in them.
 pub(crate) const P_GUARD_CALLS: usize = 0;
@@ -484,6 +498,10 @@ pub(crate) const P_RESTED: usize = 37;
 /// pieces it tried that went the old way.
 pub(crate) const P_LANDED: usize = 38;
 pub(crate) const P_LAND_REFUSED: usize = 39;
+/// Refreshes answered by the blocks' published numbers ([`nothing_new`]),
+/// and those that went the usual way.
+pub(crate) const P_LIGHT: usize = 40;
+pub(crate) const P_LIGHT_NOT: usize = 41;
 
 /// Why a guarded block was opened (diagnostics).
 #[derive(Clone, Copy)]
@@ -512,7 +530,7 @@ fn prep(_: usize, _: u64) {}
 
 /// [`PREP`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn prep_take() -> [u64; 40] {
+pub(crate) fn prep_take() -> [u64; 44] {
     std::array::from_fn(|i| PREP[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -885,6 +903,8 @@ impl Clean {
     }
 
     fn remove(&mut self, block: &usize) -> bool {
+        // Before anything makes the block writable or forgets it.
+        PUBLISHED.clear(*block);
         self.bits.remove(block);
         self.tree.remove(block)
     }
@@ -1361,6 +1381,8 @@ fn land_past_held(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
         // left as it was would not hold this note's pages.
         fine::whole_block(page);
         j.written.insert(page, now);
+        // Noted written: not answered by its number until asked again.
+        PUBLISHED.clear(page * PAGE / BLOCK);
     }
     drop(g);
     drop(j);
@@ -1394,6 +1416,114 @@ pub(crate) fn reported_since(at: usize, now: u64) -> Option<bool> {
     // SAFETY: the answer buffer holds `count` entries; no reset.
     let ok = unsafe { GetWriteWatch(0, (page * PAGE) as *const _, PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity) } == 0;
     ok.then_some(count > 0)
+}
+
+/// Whether refreshes of view memory that nothing wrote since a copy took it
+/// are answered without asking (`VICTORY_LIGHT_REFRESH=1`; off by default
+/// until measured): lock-free, from a number per block ([`PUBLISHED`]), with
+/// no guards' lock, no journal walk and no page walk ([`nothing_new`]).
+///
+/// After fxceless/victory-fork 94ed363 (their port of VIctory-7900XTX
+/// 2aa8134), rebuilt smaller on this tree: a number per block instead of a
+/// bit, so the copy's own notes say whether it took the block's last write.
+/// Their run 294 cut "copies" 13.7 ms a frame and the frame did not follow:
+/// the settles' waiting rose 25 -> 50 ms and the card's idle time fell
+/// 28 -> 18 ms, their card was the limit. Ours was idle 80-100 ms a frame in
+/// runs d6-d11.
+pub(crate) fn light_refresh() -> bool {
+    #[cfg(test)]
+    {
+        LIGHT_IN_TEST.with(|l| l.get())
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LIGHT_REFRESH").is_some_and(|v| v == "1"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`light_refresh`], for what this thread asks.
+    static LIGHT_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Per 64 KiB block of view memory: 0, or one more than the journal's note
+/// of it when an asking found it guarded and clean ([`writes`]). Set only
+/// under the guards' and the journal's locks; cleared under the guards' lock
+/// before the block is made writable or forgotten (`Clean::remove`), and
+/// where a write of ours is noted in the journal ([`wrote`], [`land_past`]).
+/// So while a block has its number nothing can have written it through any
+/// view since that note, and a copy that took the block at or after the
+/// note holds it as it is. Read without a lock: a write that comes while it
+/// is read is no different from one just after an asking, and the next
+/// refresh finds the block open.
+static PUBLISHED: Published = Published::new();
+
+struct Published([std::sync::atomic::AtomicPtr<PublishedPiece>; Published::PIECES]);
+
+/// The numbers of 4 GiB of blocks.
+type PublishedPiece = [std::sync::atomic::AtomicU64; Published::BLOCKS];
+
+impl Published {
+    const BLOCKS: usize = 1 << 16;
+    /// 128 TiB, what a process has.
+    const PIECES: usize = 1 << 15;
+
+    const fn new() -> Published {
+        Published([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Published::PIECES])
+    }
+
+    fn piece(&self, block: usize) -> Option<&PublishedPiece> {
+        let piece = self.0.get(block / Published::BLOCKS)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: null, or a piece made by `set`, never freed.
+        unsafe { piece.as_ref() }
+    }
+
+    /// Under the guards' lock (one setter at a time).
+    fn set(&self, block: usize, note: u64) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let Some(place) = self.0.get(block / Published::BLOCKS) else {
+            return;
+        };
+        if place.load(Relaxed).is_null() {
+            let piece: Box<PublishedPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Published::BLOCKS]);
+            place.store(Box::into_raw(piece), Release);
+        }
+        if let Some(piece) = self.piece(block) {
+            piece[block % Published::BLOCKS].store(note + 1, Release);
+        }
+    }
+
+    fn clear(&self, block: usize) {
+        if let Some(piece) = self.piece(block) {
+            piece[block % Published::BLOCKS].store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn get(&self, block: usize) -> u64 {
+        self.piece(block).map_or(0, |p| p[block % Published::BLOCKS].load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+/// With [`light_refresh`]: whether a refresh of `[start, end)` by a copy
+/// whose notes are `copied` (the asking after which each page from page
+/// `base` on was taken; 0: never) would copy nothing, known without asking:
+/// every block of it is published ([`PUBLISHED`]) and the copy took it at or
+/// after that note. False if something would have to be asked.
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64]) -> bool {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let known = (first..last).all(|block| {
+        let note = PUBLISHED.get(block);
+        note != 0 && block >= base && copied.get(block - base).is_some_and(|&taken| taken != 0 && taken + 1 >= note)
+    });
+    prep(if known { P_LIGHT } else { P_LIGHT_NOT }, 1);
+    known
+}
+
+/// Check mode: the journal's latest asking.
+pub(crate) fn asking_now() -> u64 {
+    journal().asked
 }
 
 /// How [`write_title_memory`] went.
@@ -2521,6 +2651,48 @@ mod tests {
         drop_views(section, &[guarded, other], SIZE);
         // The notes stay in the journal (they only make a copy copy again);
         // a test that maps fresh memory here later wants none.
+        journal().written.retain(|&p, _| !(guarded / PAGE..(guarded + SIZE) / PAGE).contains(&p) && !(other / PAGE..(other + SIZE) / PAGE).contains(&p));
+    }
+
+    /// A block an asking found guarded and clean is published with its last
+    /// note: a copy that took it after that note is answered "nothing new"
+    /// without a question, one that did not is not; a write through either
+    /// view (it faults), a remap, or a note of ours takes the answer away.
+    #[test]
+    fn a_published_block_answers_until_it_is_written() {
+        const SIZE: usize = 2 * BLOCK;
+        LIGHT_IN_TEST.with(|l| l.set(true));
+        let (section, guarded, other) = two_views(SIZE);
+        let base = guarded / PAGE;
+        // Taken: guarded by the first asking, published by the second.
+        let (first, _) = writes(guarded, guarded + SIZE, true).expect("a view");
+        let (now, _) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert!(now > first);
+        let taken = vec![now; 2];
+        assert!(nothing_new(guarded, guarded + SIZE, base, &taken));
+        assert!(!nothing_new(guarded, guarded + SIZE, base, &[0, now]), "never taken");
+        // Written through the other view: it faults, the number goes.
+        // SAFETY: the other view, opened by the handler.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
+        assert!(!nothing_new(guarded, guarded + SIZE, base, &taken));
+        assert!(nothing_new(guarded, guarded + BLOCK, base, &taken), "the other block");
+        let (again, written) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert!(written.iter().any(|&(p, w)| p == base + 1 && w > now), "the write is reported");
+        // Published again, with the new note: the old take is not enough.
+        let (later, _) = writes(guarded, guarded + SIZE, true).expect("a view");
+        assert!(!nothing_new(guarded, guarded + SIZE, base, &taken));
+        assert!(nothing_new(guarded, guarded + SIZE, base, &[now, again.max(later)]));
+        // A note of ours (`wrote`, under an asking kept for a submission).
+        journal().kept = true;
+        wrote(guarded + 4, 4);
+        journal().kept = false;
+        assert!(!nothing_new(guarded, guarded + BLOCK, base, &[u64::MAX, u64::MAX]));
+        // A remap.
+        let _ = writes(guarded, guarded + SIZE, true);
+        title_memory_remapped(guarded + BLOCK, BLOCK);
+        assert!(!nothing_new(guarded + BLOCK, guarded + SIZE, base, &[u64::MAX, u64::MAX]));
+        LIGHT_IN_TEST.with(|l| l.set(false));
+        drop_views(section, &[guarded, other], SIZE);
         journal().written.retain(|&p, _| !(guarded / PAGE..(guarded + SIZE) / PAGE).contains(&p) && !(other / PAGE..(other + SIZE) / PAGE).contains(&p));
     }
 

@@ -251,11 +251,45 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
     runs.iter().any(|list| {
         list.deferred().copies.iter().any(|step| match step {
             Step::Refresh(shadow, at, len) => {
-                copies.iter().any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow)))
+                let hit = copies
+                    .iter()
+                    .find(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow)));
+                #[cfg(feature = "diagnostics")]
+                if let Some(w) = hit {
+                    collided(w, shadow, *at, *len);
+                }
+                hit.is_some()
             }
             _ => false,
         })
     })
+}
+
+/// Diagnostics: a refresh of `shadow` (`[at, at + len)`) met the destination
+/// of a copy made on the card through another host copy ([`copied_read`]):
+/// the first few of each second said with both copies' spans, to judge
+/// bringing the other copy up to date on the card.
+#[cfg(feature = "diagnostics")]
+fn collided(w: &Writer, shadow: &Arc<Shadow>, at: usize, len: usize) {
+    static SAID: Mutex<(u64, u32)> = Mutex::new((0, 0));
+    let now = now_ms() / 1000;
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.0 != now {
+        *said = (now, 0);
+    }
+    if said.1 >= 4 {
+        return;
+    }
+    said.1 += 1;
+    let (other_start, other_len) = shadow.span();
+    let (card_start, card_len) = w.shadow.as_ref().map_or((0, 0), |s| s.span());
+    tracing::info!(
+        copied = format_args!("{:#x}..{:#x}", w.from, w.to),
+        through = format_args!("{card_start:#x}+{card_len:#x} (copy {})", w.shadow.as_ref().map_or(0, |s| s.id())),
+        refreshed = format_args!("{at:#x}+{len:#x}"),
+        other = format_args!("{other_start:#x}+{other_len:#x} (copy {}, on the card {})", shadow.id(), shadow.carded()),
+        "a copy made on the card is read through another host copy: the submission waits"
+    );
 }
 
 /// The host copy that holds `[from, to)` on the card once what `writers`

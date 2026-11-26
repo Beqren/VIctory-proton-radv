@@ -1367,6 +1367,35 @@ fn land_past_held(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
     Some((now, priors))
 }
 
+/// Check mode (`VICTORY_REFRESH_CHECK`): whether a write into the 64 KiB
+/// block of `at` is known since asking `now` (a refresh's): the journal noted
+/// its page later, the guards hold it open or not clean, or the kernel's
+/// write watch has a page of it written (asked without a reset, which
+/// changes nothing). `None` if none of them can say. A copy found differing
+/// from title memory with a write known since is the race of a write landing
+/// between the refresh and the look; with none known, a write was missed.
+pub(crate) fn reported_since(at: usize, now: u64) -> Option<bool> {
+    let (block, page) = (at / BLOCK, at / PAGE);
+    if journal().written.get(&page).is_some_and(|&w| w > now) {
+        return Some(true);
+    }
+    {
+        let g = guards();
+        if g.protected.contains(&block) || g.clean.tree.contains(&block) {
+            return Some(!g.clean.tree.contains(&block) || !g.protected.contains(&block));
+        }
+        if g.opened.contains_key(&block) {
+            return Some(true);
+        }
+    }
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = vec![0usize; PAGE / KERNEL_PAGE];
+    let (mut count, mut granularity) = (found.len(), 0u32);
+    // SAFETY: the answer buffer holds `count` entries; no reset.
+    let ok = unsafe { GetWriteWatch(0, (page * PAGE) as *const _, PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity) } == 0;
+    ok.then_some(count > 0)
+}
+
 /// How [`write_title_memory`] went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleWrite {

@@ -719,16 +719,26 @@ pub(crate) fn publish_deferred() {
     let handles = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
     let n = handles.len() as u64;
     // Nothing in the air, and on the thread that submits: published now.
-    host::QUIET.set(true);
-    for handle in handles {
-        let Some((heap, index)) = shader_slot(handle) else {
-            continue;
-        };
-        if let Some(Some(host)) = heap.host.get() {
-            host.mirror(index, handle, true);
+    // Put back when this scope is left, by an unwinding panic too: a flag
+    // left set would let later writes of this thread past the rule.
+    struct Quiet;
+    impl Drop for Quiet {
+        fn drop(&mut self) {
+            host::QUIET.set(false);
         }
     }
-    host::QUIET.set(false);
+    host::QUIET.set(true);
+    {
+        let _quiet = Quiet;
+        for handle in handles {
+            let Some((heap, index)) = shader_slot(handle) else {
+                continue;
+            };
+            if let Some(Some(host)) = heap.host.get() {
+                host.mirror(index, handle, true);
+            }
+        }
+    }
     host::PUBLISH[1].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     static LINE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
     let now = crate::host::now_ms();

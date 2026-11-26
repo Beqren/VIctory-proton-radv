@@ -3991,7 +3991,7 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_constants(to, address as *const u8, size as usize, (std::ptr::from_ref(heap) as usize, index));
+                        list.defer_constants(to, address as *const u8, size as usize, (std::ptr::from_ref(heap) as usize, index, gpu));
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {

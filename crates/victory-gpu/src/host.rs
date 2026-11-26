@@ -1899,9 +1899,10 @@ enum Step {
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory; the
-    /// descriptor slot that alone shows it (title heap, slot), if one does
-    /// (a constant buffer of a table made for the draw: `card_steps`).
-    Fill(usize, usize, usize, Option<(usize, u32)>),
+    /// descriptor slot that alone shows it (title heap, slot) and the upload
+    /// memory's GPU address, if one does (a constant buffer of a table made
+    /// for the draw: `card_steps`).
+    Fill(usize, usize, usize, Option<(usize, u32, u64)>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -1926,6 +1927,9 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Some of its fills were made on the card (`card_steps`): their slots
+    /// show our buffer, and a submission of it again puts them back.
+    card_taken: bool,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -4811,6 +4815,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             blocked_note(why, detail, blocked_at.elapsed());
         }
+        // A list some of whose constant buffers were made on the card is sent
+        // again: their slots go back to its upload memory, which is not safe
+        // while a flight may read them (the earlier submission's).
+        if taken.is_none() && runs.iter().any(|l| l.deferred().card_taken) && flying() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
         // The list that makes them goes first, prepared like the others.
         let with_own: Vec<&HostList>;
         let runs: &[&HostList] = match taken.as_ref().and_then(|t| t.list()) {
@@ -5952,7 +5962,7 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows: a constant buffer of a
     /// table made for the draw (`card_steps`).
-    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32, u64)) {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len, Some(slot)));
@@ -6160,7 +6170,10 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch, taken: Option<&card_steps::Taken>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for (i, step) in self.deferred().copies.iter().enumerate() {
+        let deferred = self.deferred();
+        // (Set by this submission's own card steps, the slots are as wanted.)
+        let card_taken = deferred.card_taken && taken.is_none();
+        for (i, step) in deferred.copies.iter().enumerate() {
             // Made on the card in front of the submission (`card_steps`).
             if taken.is_some_and(|t| t.takes(self, i)) {
                 continue;
@@ -6179,7 +6192,15 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len, _) => {
+                &Step::Fill(dst, src, len, slot) => {
+                    // Sent again after a submission made it on the card
+                    // (nothing is in the air then: `submit`): the slot shows
+                    // the upload memory again.
+                    if let Some((heap, index, gpu)) = slot
+                        && card_taken
+                    {
+                        crate::descriptor::constant_slot(heap, index, gpu, len as u32);
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);

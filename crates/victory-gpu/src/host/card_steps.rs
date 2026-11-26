@@ -62,7 +62,7 @@ const BETWEEN: u64 = 1 << 20;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Does {
     Copy { dst: usize, src: usize, len: usize, asked: bool },
-    Fill { src: usize, len: usize, asked: bool, slot: Option<(usize, u32)> },
+    Fill { src: usize, len: usize, asked: bool, slot: Option<(usize, u32, u64)> },
     /// Another read on the CPU (a texture).
     Read { asked: bool },
     /// Anything, anywhere.
@@ -260,6 +260,11 @@ impl Host {
             }
             (line.written.clone(), writers(&line.line))
         };
+        // Sent again after a submission made some of it on the card: its
+        // slots go back to its upload memory, on the CPU (`submit`).
+        if runs.iter().any(|l| l.deferred().card_taken) {
+            return Err("a list sent again after its constant buffers were made on the card");
+        }
         let mut does = Vec::new();
         let mut steps = Vec::new();
         for list in runs {
@@ -290,7 +295,7 @@ impl Host {
         let mut ops = Vec::with_capacity(chosen.len());
         let mut at = 0u64;
         for &i in &chosen {
-            let Does::Fill { src, len, slot: Some(slot), .. } = does[i] else {
+            let Does::Fill { src, len, slot: Some((heap, index, _)), .. } = does[i] else {
                 continue;
             };
             if len == 0 {
@@ -303,7 +308,7 @@ impl Host {
             if !mapped(src, src + len) {
                 return Err("not all of what it reads is mapped");
             }
-            ops.push((from, src, len, at, slot));
+            ops.push((from, src, len, at, (heap, index)));
             at = (at + len as u64).next_multiple_of(256);
         }
         let own = self.own_list().ok_or("no host list or buffer for it")?;
@@ -323,6 +328,13 @@ impl Host {
             DONE[1].fetch_add(*len as u64, Ordering::Relaxed);
             // (A heap that is gone: nothing can read the slot.)
             crate::descriptor::constant_slot(*heap, *index, gpu + at, *len as u32);
+        }
+        // Their slots show our buffer from now on, also if they are sent
+        // again (review finding): such a submission puts them back first.
+        for list in runs {
+            if chosen.iter().any(|&i| steps[i].0 == std::ptr::from_ref::<HostList>(list) as usize) {
+                list.deferred().card_taken = true;
+            }
         }
         Ok(Some(Taken { own: Some(own), steps: chosen.iter().map(|&i| steps[i]).collect() }))
     }
@@ -360,7 +372,18 @@ fn record(list: &ID3D12GraphicsCommandList, between: &ID3D12Resource, reads: &[(
         for &(buffer, offset, at, len) in reads {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
-        list.ResourceBarrier(&[transition(between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)]);
+        // The sources back to the common state: the submission's lists run
+        // in the same call and may write them (no decay in between; review
+        // finding).
+        let mut barriers = vec![transition(between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)];
+        let mut sources: Vec<&ID3D12Resource> = Vec::new();
+        for &(buffer, ..) in reads {
+            if !sources.iter().any(|b| b.as_raw() == buffer.as_raw()) {
+                sources.push(buffer);
+            }
+        }
+        barriers.extend(sources.iter().map(|b| transition(b, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)));
+        list.ResourceBarrier(&barriers);
     }
 }
 
@@ -396,7 +419,7 @@ mod tests {
     }
 
     fn fill(src: usize, len: usize, asked: bool) -> Does {
-        Does::Fill { src, len, asked, slot: Some((1, 2)) }
+        Does::Fill { src, len, asked, slot: Some((1, 2, 3)) }
     }
 
     /// Only what is asked for is taken, all of it; steps in none of their

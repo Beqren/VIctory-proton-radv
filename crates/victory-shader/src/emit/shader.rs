@@ -104,6 +104,18 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits of the [`SLOT_VIEW_WRITES`] bitmap; marks past it set its last bit,
 /// which no copy owns.
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+/// Read marks (`super::read_marks`; module notes, "Read marks"): the root
+/// UAV `u<SLOT_VIEW_READS>` in [`ROOT_CBV_SPACE`], the read-slots bitmap of
+/// [`VIEW_READ_BITS`] bits: bit `i` is set by every image instruction that
+/// reads the texture view at view-heap index `i` picked by an index the host
+/// cannot follow. Its own UAV, not bits after the written pages (upstream
+/// 52d14b1's layout): this tree's written-pages bitmap exists only with page
+/// marks, is copied down only as far as its pages are handed out, and only
+/// behind submissions that wrote through marked views.
+pub const SLOT_VIEW_READS: u8 = 250;
+/// Bits of the [`SLOT_VIEW_READS`] bitmap: heap indices are clamped to its
+/// last bit (a root UAV has no bounds check).
+pub const VIEW_READ_BITS: u32 = 1 << 21;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -215,6 +227,11 @@ pub(crate) struct Shader {
     /// an unordered buffer view made from the heap, whose writes are marked
     /// by that index's view-mark entry. Empty without the switch.
     pub view_index: std::collections::HashMap<V, V>,
+    /// Read marks (`super::read_marks`): the heap index of each handle of a
+    /// texture shader view made from the heap (kinds 1-9, no UAV bit), whose
+    /// reads are marked when the program picks it by index. Empty without
+    /// the switch.
+    pub texture_index: std::collections::HashMap<V, V>,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -272,6 +289,7 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             view_index: std::collections::HashMap::new(),
+            texture_index: std::collections::HashMap::new(),
             lds: None,
             main,
             entry,
@@ -515,6 +533,11 @@ impl Shader {
         if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) && super::page_marks() {
             self.view_index.insert(h, index);
         }
+        // Texture shader views (kinds 1-9): their reads are marked by their
+        // slot when picked by index (read marks).
+        if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&(props.0 & 0xFF)) && super::read_marks() {
+            self.texture_index.insert(h, index);
+        }
         h
     }
 
@@ -545,13 +568,13 @@ impl Shader {
         }
         // UAVs outside pixel and compute programs (upstream a1a2077): the
         // flag the validator wants when a vertex, geometry or mesh program
-        // declares a UAV range. With page marks only, which bring the
-        // bitmap's root UAV to such programs; without them the output stays
-        // as it was.
-        // shortcut: root UAVs of such programs without page marks still
-        // leave the flag out.
+        // declares a UAV range. With page or read marks only, which bring
+        // their bitmap's root UAV to such programs; without them the output
+        // stays as it was.
+        // shortcut: root UAVs of such programs without marks still leave
+        // the flag out.
         let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
-        if super::page_marks() && !self.root_uavs.is_empty() && !self.pixel && !compute {
+        if (super::page_marks() || super::read_marks()) && !self.root_uavs.is_empty() && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
         let mut resources = None;

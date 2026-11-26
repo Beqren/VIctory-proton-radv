@@ -638,6 +638,39 @@ pub(crate) fn defer_publish(handle: u64) {
     }
 }
 
+/// Nulls the eviction put off while submissions were in the air (the title's
+/// descriptor handle of the slot, and the record the slot showed then);
+/// made at the next moment with none ([`nulls_deferred`]).
+static NULLS: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Nulls the eviction put off, made, and left (the slot changed meanwhile),
+/// since the start.
+pub(crate) static NULLED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The eviction puts off making the slot at `handle` null (`host::HostHeap::evict`).
+#[cfg(windows)]
+pub(crate) fn defer_null(handle: u64, key: u64) {
+    NULLS.lock().unwrap_or_else(|e| e.into_inner()).push((handle, key));
+    NULLED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Makes the nulls the eviction put off: called with nothing in the air,
+/// where [`publish_deferred`] is. The host copies go once no slot holds
+/// them (the sweep, through the graveyard).
+#[cfg(windows)]
+pub(crate) fn nulls_deferred() {
+    let nulls = std::mem::take(&mut *NULLS.lock().unwrap_or_else(|e| e.into_inner()));
+    for (handle, key) in nulls {
+        let Some((heap, index)) = shader_slot(handle) else {
+            continue;
+        };
+        if let Some(Some(host)) = heap.host.get() {
+            let made = host.null_deferred(index, key);
+            NULLED[if made { 1 } else { 2 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// `VICTORY_PUBLISH_SAFE=sent`: the slot writes put off whose textures every
 /// submission in the air was sent after are made now (the others are put off
 /// again by the same check, `host::publish_later`). Called by the texture

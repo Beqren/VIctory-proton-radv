@@ -6714,12 +6714,14 @@ impl<'a> Lower<'a> {
     /// `tables`).
     fn read_by_index(&self, src: &Source) -> bool {
         // `VICTORY_READ_MARKS=all`: every texture read through the heaps,
-        // tables at fixed offsets too (upstream 52d14b1 before 2d6c0df). Run
-        // onread-8's slot listing of the skin programs (94d281151ca58b4f,
-        // a402e650d0acbc92): the material record's colour map was made and
-        // never marked in 366 of 366 listings, and 45% of the asked record
-        // words never marked, so those programs reach their slots in a way
-        // this test takes for a fixed table entry.
+        // tables at fixed offsets too (upstream 52d14b1 before 2d6c0df).
+        // Not needed for the skin programs (94d281151ca58b4f,
+        // a402e650d0acbc92): traced offline, every read they make through
+        // the heap root (a record word as index) is marked, and the rest
+        // are fixed entries of their tables (root 21 at 0xd40-0x1520, root
+        // 218 at 0xa0), which the draw's table walk sees. The record words
+        // run onread-8 found never marked (the colour map's among them) are
+        // words those programs do not sample by index.
         if super::read_marks_all() {
             return true;
         }

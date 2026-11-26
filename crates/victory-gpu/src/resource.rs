@@ -1178,10 +1178,12 @@ struct Hosted {
 /// chosen but used again before they could go; made again after an
 /// eviction, and of those within 10 s and within 60 s of it; host copies
 /// let go as idle (not chosen) made again within 5 s and within 30 s; and
-/// the bytes chosen but not let go yet.
+/// the bytes chosen but not let go yet; host copies passed over as young
+/// (per look, `young_ms`); eviction passes left out for a load burst
+/// (`draw.rs`, `evict_textures`).
 #[cfg(windows)]
-pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 11] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 13] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 13];
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
@@ -1755,6 +1757,7 @@ pub(crate) fn evictable() -> std::collections::HashMap<usize, (usize, u64, u64)>
     use std::sync::atomic::Ordering::Relaxed;
     use windows::core::Interface;
     let mut out = std::collections::HashMap::new();
+    let (now, young) = (crate::host::now_ms(), young_ms());
     let all = textures();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
@@ -1767,10 +1770,31 @@ pub(crate) fn evictable() -> std::collections::HashMap<usize, (usize, u64, u64)>
             && std::sync::Arc::strong_count(host) == 1
             && r.host.mark.load(Relaxed) == 0
         {
+            // Young: made (or made again) lately, maybe not read yet (read
+            // marks land a frame or two later, and a write waits for a
+            // quiet point to show it): not the eviction's.
+            if now.saturating_sub(host.made_ms) < young {
+                EVICTED[11].fetch_add(1, Relaxed);
+                continue;
+            }
             out.insert(host.texture.as_raw() as usize, (at, host.bytes, r.host.used.load(Relaxed)));
         }
     }
     out
+}
+
+/// How long a host copy is safe from the eviction after it is made (ms):
+/// `VICTORY_EVICT_YOUNG_MS`, 15,000 with read marks (run onread-7: 12,278
+/// of 16,323 textures made again within 10 s of their eviction were let go
+/// in the world's first 6 s, while it was loading), else 0.
+fn young_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_EVICT_YOUNG_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(if victory_shader::emit::read_marks() { 15_000 } else { 0 })
+    })
 }
 
 /// For the 5 s line: host copies of placed textures the title fills, and

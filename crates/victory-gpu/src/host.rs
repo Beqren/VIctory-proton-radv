@@ -4725,6 +4725,7 @@ impl Host {
         if !behind {
             sweep();
             crate::descriptor::publish_deferred();
+            crate::descriptor::nulls_deferred();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
@@ -4732,6 +4733,7 @@ impl Host {
             self.settle(&mut submitted, WHY_SYNC);
             sweep();
             crate::descriptor::publish_deferred();
+            crate::descriptor::nulls_deferred();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
@@ -6904,7 +6906,9 @@ impl Meter {
                         tracing::info!(
                             "read marks since the start: {} submissions' marks landed; {} slots named by passes, of them \
                              null {} in the queue, {} made null by the eviction (put back), {} neither; asked slots no \
-                             mark named lately: {} of {}; make on first read (VICTORY_TEXTURE_ON_READ): {}",
+                             mark named lately: {} of {}; make on first read (VICTORY_TEXTURE_ON_READ): {}; eviction's nulls \
+                             put off while submissions were in the air {}, made {}, left (slot changed) {}; host copies passed \
+                             over as young (looks) {}; eviction passes left out for a load burst {}",
                             k[0],
                             k[1],
                             k[2],
@@ -6913,6 +6917,11 @@ impl Meter {
                             k[5],
                             k[6],
                             u8::from(crate::descriptor::host::on_read()),
+                            crate::descriptor::NULLED[0].load(Ordering::Relaxed),
+                            crate::descriptor::NULLED[1].load(Ordering::Relaxed),
+                            crate::descriptor::NULLED[2].load(Ordering::Relaxed),
+                            crate::resource::EVICTED[11].load(Ordering::Relaxed),
+                            crate::resource::EVICTED[12].load(Ordering::Relaxed),
                         );
                     }
                     let m = crate::descriptor::host::MISSING.each_ref().map(|c| c.load(Ordering::Relaxed));

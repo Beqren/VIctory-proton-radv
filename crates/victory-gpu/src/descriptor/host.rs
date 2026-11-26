@@ -491,6 +491,12 @@ pub(crate) fn on_read() -> bool {
     })
 }
 
+/// [`HostHeap::rank`]'s order (`VICTORY_TEXTURE_READ_FIRST=0`: off).
+fn read_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_READ_FIRST").is_none_or(|v| v != "0"))
+}
+
 thread_local! {
     /// While a texture pass runs for a bake draw (`draw.rs`,
     /// `early_textures`): every due slot may be made, read or not
@@ -853,12 +859,16 @@ impl TextureQueue {
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
-    /// Only slots `wanted` says the pass may make (make on first read,
-    /// [`on_read`]; all of them without it).
-    fn due(&self, frame: u64, max: usize, wanted: impl Fn(u32) -> bool) -> Vec<(u32, u64)> {
+    /// Only slots `rank` says the pass may make (make on first read,
+    /// [`on_read`]; all of them without it), the lower ranks first, each in
+    /// the order above ([`HostHeap::rank`]: what shaders read now first).
+    fn due(&self, frame: u64, max: usize, rank: impl Fn(u32) -> Option<u8>) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|&(&index, w)| w.due <= frame && wanted(index)) {
+        let mut ranks = std::collections::HashMap::new();
+        for (&index, w) in self.slots.iter().filter(|&(_, w)| w.due <= frame) {
+            let Some(r) = rank(index) else { continue };
+            ranks.insert(index, r);
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
             class.push((w.written, index, w.write));
         }
@@ -868,6 +878,8 @@ impl TextureQueue {
         fresh.sort_unstable_by(newest_first);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
+        // All of them, then ranked and cut to `max`.
+        let (max_before, max) = (max, usize::MAX);
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
             new += 1;
@@ -876,7 +888,9 @@ impl TextureQueue {
                 order.push((fresh[old].1, fresh[old].2));
             }
         }
-        order.truncate(max);
+        // Stable: within a rank, the order above.
+        order.sort_by_key(|&(index, _)| ranks.get(&index).copied().unwrap_or(0));
+        order.truncate(max_before);
         order
     }
 
@@ -889,17 +903,17 @@ impl TextureQueue {
         frame: u64,
         max: usize,
         asked: impl Fn(u32) -> bool,
-        wanted: impl Fn(u32) -> bool,
+        rank: impl Fn(u32) -> Option<u8>,
     ) -> Vec<(u32, u64, u64)> {
-        let mut due: Vec<(bool, u64, u64, u32)> = self
+        let mut due: Vec<(bool, u8, u64, u64, u32)> = self
             .slots
             .iter()
-            .filter(|&(&index, w)| w.due <= frame && wanted(index))
-            .map(|(&index, w)| (!asked(index), w.written, w.write, index))
+            .filter(|&(_, w)| w.due <= frame)
+            .filter_map(|(&index, w)| Some((!asked(index), rank(index)?, w.written, w.write, index)))
             .collect();
         due.sort_unstable();
         due.truncate(max);
-        due.into_iter().map(|(_, written, write, index)| (index, write, written)).collect()
+        due.into_iter().map(|(_, _, written, write, index)| (index, write, written)).collect()
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1509,8 +1523,8 @@ impl HostHeap {
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        let wanted = |index: u32| self.wanted(index, frame);
-        (if max == 0 { Vec::new() } else { textures.due(frame, max, wanted) }, textures.census(frame))
+        let rank = |index: u32| self.rank(index, frame);
+        (if max == 0 { Vec::new() } else { textures.due(frame, max, rank) }, textures.census(frame))
     }
 
     /// Why title slot `index`, which a draw asks for and whose host slot
@@ -1619,6 +1633,28 @@ impl HostHeap {
     /// slot `index` in `frame`: shaders read it lately (a read mark, a
     /// draw's asking by index, or a draw's read through a table, all within
     /// [`MARK_FRAMES`] frames). Always, without the switch.
+    /// The pass's order with read marks (`VICTORY_TEXTURE_READ_FIRST`, on
+    /// with them; run onread-8: the normal and specular maps of the skin
+    /// draws of a close-up waited in the queue, written 4 frames before,
+    /// while the colour maps were made): 0, a draw asked for it by index
+    /// lately (a character's material); 1, a read mark named it within 2
+    /// frames; 2, the others. `None`: not to be made now ([`Self::wanted`]).
+    fn rank(&self, index: u32, frame: u64) -> Option<u8> {
+        if !self.wanted(index, frame) {
+            return None;
+        }
+        if self.marked.is_empty() || !read_first() {
+            return Some(0);
+        }
+        Some(if self.texture_slot_asked_lately(index, frame, ASKED_FRAMES) {
+            0
+        } else if self.texture_slot_marked_within(index, frame, 2) {
+            1
+        } else {
+            2
+        })
+    }
+
     fn wanted(&self, index: u32, frame: u64) -> bool {
         if !on_read() || ALL_DUE.get() {
             return true;
@@ -1740,7 +1776,14 @@ impl HostHeap {
     /// draw's material record names), so that it is made again then; none
     /// read in the last frames; none a dynamic slot (a list's table) shows.
     /// Returns textures chosen, their bytes, and slots made null.
-    pub(crate) fn evict(&self, need: u64, age: Option<(u64, u64)>) -> [u64; 3] {
+    ///
+    /// With `VICTORY_PUBLISH_SAFE` on (the default) and a submission in the
+    /// air, a slot is not made null now but at the next moment with none
+    /// (`super::nulls_deferred`): a shader running in it reads descriptors
+    /// when it runs, and a slot rewritten under it may read torn (the race
+    /// behind the device losses of 2026-11-25, `publish_later`). `handle`
+    /// gives the title's descriptor of a slot, which names it then.
+    pub(crate) fn evict(&self, need: u64, age: Option<(u64, u64)>, handle: impl Fn(u32) -> Option<u64>) -> [u64; 3] {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::core::Interface;
         if self.sampler {
@@ -1784,6 +1827,7 @@ impl HostHeap {
         }
         let mut titles = Vec::with_capacity(chosen.len());
         let mut slots = 0u64;
+        let defer = publish_mode() != 0 && crate::host::flying();
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1799,7 +1843,11 @@ impl HostHeap {
                     if !same || key == 0 {
                         continue;
                     }
-                    self.release_evicted_slot(&mut made, index);
+                    if defer && let Some(handle) = handle(index) {
+                        super::defer_null(handle, key);
+                    } else {
+                        self.release_evicted_slot(&mut made, index);
+                    }
                     evicted.insert(index, key);
                     slots += 1;
                 }
@@ -1817,6 +1865,23 @@ impl HostHeap {
         EVICTION[0].fetch_add(1, Relaxed);
         EVICTION[1].fetch_add(slots, Relaxed);
         [titles.len() as u64, bytes, slots]
+    }
+
+    /// A null the eviction put off ([`HostHeap::evict`]), with nothing in
+    /// the air: made if title slot `index` still shows what it showed then
+    /// (`key`); a slot written or made again since is left as it is (and no
+    /// longer counts as evicted).
+    pub(crate) fn null_deferred(&self, index: u32, key: u64) -> bool {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.get(index as usize).copied() != Some(key) {
+            let mut evicted = self.evicted.lock().unwrap_or_else(|e| e.into_inner());
+            if evicted.get(&index) == Some(&key) {
+                evicted.remove(&index);
+            }
+            return false;
+        }
+        self.release_evicted_slot(&mut made, index);
+        true
     }
 
     /// The one place the eviction makes a slot null and lets go of what it
@@ -1883,8 +1948,8 @@ impl HostHeap {
     pub(crate) fn texture_slots_due_oldest(&self, frame: u64, max: usize) -> (Vec<(u32, u64, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         let asked = |index: u32| self.texture_slot_asked_lately(index, frame, ASKED_FRAMES);
-        let wanted = |index: u32| self.wanted(index, frame);
-        (textures.due_oldest(frame, max, asked, wanted), textures.census(frame))
+        let rank = |index: u32| self.rank(index, frame);
+        (textures.due_oldest(frame, max, asked, rank), textures.census(frame))
     }
 
     /// The texture view of title slot `index` (as handed out with `write`)
@@ -4705,7 +4770,7 @@ mod tests {
         let mut q = TextureQueue::default();
         let at = (0x1000, 64);
         q.written(7, 1, 1, false);
-        let write = q.due(1, 1, |_| true)[0].1;
+        let write = q.due(1, 1, |_| Some(0))[0].1;
         q.recheck(7, 1, at, 5);
         assert!(q.rechecks_due(1000, 9).is_empty(), "it waits in the queue");
         q.done(7, write);
@@ -4723,14 +4788,14 @@ mod tests {
         q.recheck(7, frame, at, 5);
         let due = q.rechecks_due(u64::MAX, 9);
         q.rechecked(7, &due[0].1, true, frame + 4);
-        assert_eq!(q.due(frame + 4, 9, |_| true)[0].0, 7);
+        assert_eq!(q.due(frame + 4, 9, |_| Some(0))[0].0, 7);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
         // A draw makes the host slot anew: the slot is due although a look
         // at it was still to come.
         q.recheck(8, 1, at, 5);
         let seen = q.rechecks_due(u64::MAX, 9);
         q.written(8, 2, 2, true);
-        assert!(q.due(2, 9, |_| true).iter().any(|d| d.0 == 8));
+        assert!(q.due(2, 9, |_| Some(0)).iter().any(|d| d.0 == 8));
         q.rechecked(8, &seen[0].1, false, 5);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
     }
@@ -4761,12 +4826,12 @@ mod tests {
             q.written(index, 1, 1, false);
         }
         let read = |index: u32| index == 5;
-        let due: Vec<u32> = q.due(2, 100, read).into_iter().map(|d| d.0).collect();
+        let due: Vec<u32> = q.due(2, 100, |i| read(i).then_some(0)).into_iter().map(|d| d.0).collect();
         assert_eq!(due, [5]);
-        let oldest: Vec<u32> = q.due_oldest(2, 100, |_| false, read).into_iter().map(|d| d.0).collect();
+        let oldest: Vec<u32> = q.due_oldest(2, 100, |_| false, |i| read(i).then_some(0)).into_iter().map(|d| d.0).collect();
         assert_eq!(oldest, [5]);
         assert_eq!(q.slots.len(), 3, "the others still wait");
-        assert_eq!(q.due(2, 100, |_| true).len(), 3);
+        assert_eq!(q.due(2, 100, |_| Some(0)).len(), 3);
     }
 
     #[test]
@@ -4777,37 +4842,37 @@ mod tests {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100, |_| true).into_iter().map(|d| d.0).collect();
+        let order: Vec<u32> = q.due(9, 100, |_| Some(0)).into_iter().map(|d| d.0).collect();
         // newest, oldest, newest, oldest, and so on
         assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2, |_| true).len(), 2);
+        assert_eq!(q.due(9, 2, |_| Some(0)).len(), 2);
         assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
-        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100, |_| true).iter().find(|d| d.0 == index).unwrap().1;
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100, |_| Some(0)).iter().find(|d| d.0 == index).unwrap().1;
         let w17 = write(&q, 17);
         let mut frame = 9;
         for wait in [1, 2, 4, 4] {
             q.later(17, w17, frame, 4);
-            assert!(!q.due(frame + wait - 1, 100, |_| true).iter().any(|d| d.0 == 17));
+            assert!(!q.due(frame + wait - 1, 100, |_| Some(0)).iter().any(|d| d.0 == 17));
             frame += wait;
             // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100, |_| true)[0].0, 17);
+            assert_eq!(q.due(frame, 100, |_| Some(0))[0].0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
-        assert!(!q.due(u64::MAX, 100, |_| true).iter().any(|d| d.0 == 17));
+        assert!(!q.due(u64::MAX, 100, |_| Some(0)).iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100, |_| true)[0].0, 16);
+        assert_eq!(q.due(12, 100, |_| Some(0))[0].0, 16);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
         q.done(16, w16);
         q.later(16, w16, 13, 4);
         assert_eq!(q.mapped(16), 0);
-        assert_eq!(q.due(13, 100, |_| true)[0].0, 16);
+        assert_eq!(q.due(13, 100, |_| Some(0))[0].0, 16);
         // A draw that makes the host slot (`seen`) keeps what the queue knows,
         let w15 = write(&q, 15);
         q.partly(15, w15, 20, 8192);
@@ -4815,11 +4880,11 @@ mod tests {
         assert_eq!(q.mapped(15), 8192);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
-        assert!(q.due(14, 100, |_| true).iter().any(|d| d.0 == 99));
+        assert!(q.due(14, 100, |_| Some(0)).iter().any(|d| d.0 == 99));
         // A write due later (a table's slot) is not handed out before.
         q.written(98, 14, 16, false);
-        assert!(!q.due(15, 100, |_| true).iter().any(|d| d.0 == 98));
-        assert!(q.due(16, 100, |_| true).iter().any(|d| d.0 == 98));
+        assert!(!q.due(15, 100, |_| Some(0)).iter().any(|d| d.0 == 98));
+        assert!(q.due(16, 100, |_| Some(0)).iter().any(|d| d.0 == 98));
     }
 
     /// A view written over memory that older views describe otherwise

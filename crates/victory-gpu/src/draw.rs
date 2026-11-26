@@ -2671,7 +2671,7 @@ impl State {
             // null under a read; its slot reads null until the next pass
             // puts it back (counted as made again after an eviction).
             host.texture_slots_read(frame);
-            self.evict_textures(host, refused_read_bytes, evict_age);
+            self.evict_textures(heap, host, refused_read_bytes, evict_age);
         }
         // What is shown and when it was read, for the 5 s line.
         static CENSUS_MS: AtomicU64 = AtomicU64::new(0);
@@ -2698,7 +2698,14 @@ impl State {
     /// With read marks, also past nine tenths of the card's budget: the
     /// textures read longest ago until it would be at 85% (upstream
     /// 69d1e8e's band), instead of refusing what shaders read now.
-    fn evict_textures(&self, host: &crate::descriptor::host::HostHeap, refused: u64, age: Option<(u64, u64)>) {
+    fn evict_textures(
+        &self,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+        refused: u64,
+        age: Option<(u64, u64)>,
+    ) {
+        let handle = |index: u32| heap.handle(index);
         static LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
         let now = crate::host::now_ms();
         let due = |i: usize, every: u64| {
@@ -2709,14 +2716,27 @@ impl State {
         let over = if victory_shader::emit::read_marks() { crate::resource::over_budget_line() } else { 0 };
         let wanted = if refused > 0 { refused.saturating_add(32 << 20) } else { 0 };
         let need = wanted.max(over).saturating_sub(pending);
+        // A load burst (with read marks): the passes made more than `BURST`
+        // textures since the last eviction pass: a scene is loading, what
+        // it loads is about to be read and what was read before it may be
+        // again; nothing goes for room until it settles (run onread-7: three
+        // in four of the textures made again within 10 s of their eviction
+        // were let go in the world's first 6 s).
+        const BURST: u64 = 300;
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let made = HEAP_TEXTURES.load(Ordering::Relaxed);
+        let burst = victory_shader::emit::read_marks() && made.saturating_sub(MADE.swap(made, Ordering::Relaxed)) > BURST;
+        if burst && need > 0 {
+            crate::resource::EVICTED[12].fetch_add(1, Ordering::Relaxed);
+        }
         let mut said = None;
-        if need > 0 && due(0, 500) {
-            said = Some((if refused > 0 { "refused" } else { "past the budget line" }, need, host.evict(need, None)));
+        if need > 0 && !burst && due(0, 500) {
+            said = Some((if refused > 0 { "refused" } else { "past the budget line" }, need, host.evict(need, None, handle)));
         }
         if let Some(age) = age
             && due(1, 2_000)
         {
-            let chose = host.evict(0, Some(age));
+            let chose = host.evict(0, Some(age), handle);
             if said.is_none() && chose[0] > 0 {
                 said = Some(("unread", age.0, chose));
             }

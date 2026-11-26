@@ -292,6 +292,45 @@ fn collided(w: &Writer, shadow: &Arc<Shadow>, at: usize, len: usize) {
     );
 }
 
+/// For the refreshes of `runs` that bring another host copy than the one a
+/// copy made on the card writes through (`copies`) up to date over what it
+/// writes: (the copy written through, the other copy, from, to) of each
+/// overlap, or why it cannot be done on the card. Run d11-all named the case:
+/// a 20 KiB title buffer whose copy was made on the card lies inside a 4 MiB
+/// window of title memory a draw reads by address, and the next submission
+/// refreshes the window: it waited for the copy to land.
+fn mirrors(copies: &[Writer], runs: &[&HostList]) -> Result<Vec<(Arc<Shadow>, Arc<Shadow>, usize, usize)>, &'static str> {
+    let mut out = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            let Step::Refresh(other, at, len) = step else {
+                continue;
+            };
+            for w in copies {
+                let (from, to) = (w.from.max(*at), w.to.min(*at + *len));
+                if from >= to {
+                    continue;
+                }
+                let Some(through) = &w.shadow else {
+                    return Err("a copy made on the card without a host copy");
+                };
+                if Arc::ptr_eq(through, other) {
+                    continue;
+                }
+                if other.carded() || other.in_place() {
+                    return Err("a copy made on the card is read through another host copy in the card's memory");
+                }
+                let (start, n) = other.span();
+                if (from as u64) < start || to as u64 > start + n {
+                    return Err("a copy made on the card is read through another host copy that holds part of it");
+                }
+                out.push((through.clone(), other.clone(), from, to));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through.
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
@@ -332,6 +371,12 @@ struct Op {
 enum To {
     /// A host copy, and the title address.
     Copy(Arc<Shadow>, usize),
+    /// Another host copy of the same title memory as a copy made on the card
+    /// writes, brought up to date with it on the card ([`mirrors`]): nothing
+    /// declared written (the copy's own host copy lands the bytes), nothing
+    /// refreshed by our list (the submission's own refresh of it ran on the
+    /// CPU before the card runs this).
+    Mirror(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
 }
@@ -352,7 +397,7 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: fills made on the card, their bytes, and
 /// submissions that waited instead, refused by a check.
-static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -361,6 +406,10 @@ static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::Ato
 /// pool.
 pub(super) struct Taken {
     own: Option<Own>,
+    /// The host copies our list reads or writes, held until it has run
+    /// (review finding: a mirror's source is held by nothing else of ours,
+    /// and the flight that wrote it may land and let it go first).
+    _held: Vec<Arc<Shadow>>,
     steps: std::collections::HashSet<(usize, usize)>,
     /// The destinations of copies made on the card: host copy, from, to.
     copied: Vec<(Arc<Shadow>, usize, usize)>,
@@ -428,7 +477,7 @@ impl Host {
     }
 
     fn take_steps(&self, runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
-        let (written, writers) = {
+        let (written, writers, flying_mirrors) = {
             let line = line();
             if line.written.is_empty() {
                 return Ok(None);
@@ -437,15 +486,22 @@ impl Host {
             // of the line, still in `written` until they have landed).
             let mut all = writers(&line.line);
             all.extend(line.landing.iter().map(Writer::again));
-            if copied_read(&copies(&line), runs) {
-                return Err("a copy made on the card is read through another host copy");
-            }
-            (line.written.clone(), all)
+            // Copies made on the card in the air whose destination this
+            // submission refreshes through another host copy: that copy is
+            // brought up to date on the card too, instead of waiting.
+            let flying = copies(&line);
+            (line.written.clone(), all, if copied_read(&flying, runs) { mirrors(&flying, runs)? } else { Vec::new() })
         };
         // Sent again after a submission made some of it on the card: its
         // slots go back to its upload memory, on the CPU (`submit`).
         if runs.iter().any(|l| l.deferred().card_taken) {
             return Err("a list sent again after its constant buffers were made on the card");
+        }
+        // A list sent before may still be read by that submission: its
+        // dynamic slots are not rewritten under it (the class of a slot
+        // written under a running submission, whatever the bytes).
+        if runs.iter().any(|l| l.deferred().sent) {
+            return Err("a list sent before since its reset");
         }
         let mut does = Vec::new();
         let mut steps = Vec::new();
@@ -471,11 +527,21 @@ impl Host {
             }
         }
         let chosen = plan(&does, stage())?;
-        if chosen.is_empty() {
+        if chosen.is_empty() && flying_mirrors.is_empty() {
             return Ok(None);
         }
-        let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
+        let mut ops: Vec<Op> = Vec::with_capacity(chosen.len() + flying_mirrors.len());
         let mut at = 0u64;
+        // First what copies in the air wrote, into the other host copies this
+        // submission reads it through.
+        for (through, other, from, to) in flying_mirrors {
+            let len = to - from;
+            if at + len as u64 > BETWEEN {
+                return Err("too much at once");
+            }
+            ops.push(Op { from: (through, from), len, at, to: To::Mirror(other, from) });
+            at = (at + len as u64).next_multiple_of(256);
+        }
         for &i in &chosen {
             let (src, len) = match does[i] {
                 Does::Copy { src, len, .. } | Does::Fill { src, len, .. } => (src, len),
@@ -492,20 +558,24 @@ impl Host {
             let mut writers_now: Vec<Writer> = writers.iter().map(Writer::again).collect();
             writers_now.extend(ops.iter().filter_map(|op: &Op| match &op.to {
                 To::Copy(to, dst) => Some(Writer { shadow: Some(to.clone()), from: *dst, to: *dst + op.len, copy: true }),
-                To::Slot(..) => None,
+                To::Slot(..) | To::Mirror(..) => None,
             }));
             let from = holder(&writers_now, src, src + len)?;
             if !mapped(src, src + len) {
                 return Err("not all of what it reads is mapped");
             }
+            let mut also = Vec::new();
             let to = match does[i] {
                 Does::Copy { dst, .. } => {
                     let to = holder(&writers_now, dst, dst + len)?;
-                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
-                        return Err("another host copy of what it writes is refreshed");
-                    }
                     if !mapped(dst, dst + len) {
                         return Err("not all of what it writes is mapped");
+                    }
+                    // Another host copy of the destination this submission
+                    // refreshes: brought up to date on the card after it.
+                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
+                        let written = [Writer { shadow: Some(to.clone()), from: dst, to: dst + len, copy: true }];
+                        also = mirrors(&written, runs)?;
                     }
                     To::Copy(to, dst)
                 }
@@ -514,6 +584,14 @@ impl Host {
             };
             ops.push(Op { from: (from, src), len, at, to });
             at = (at + len as u64).next_multiple_of(256);
+            for (through, other, from, to) in also {
+                let n = to - from;
+                if at + n as u64 > BETWEEN {
+                    return Err("too much at once");
+                }
+                ops.push(Op { from: (through, from), len: n, at, to: To::Mirror(other, from) });
+                at = (at + n as u64).next_multiple_of(256);
+            }
         }
         let own = self.own_list().ok_or("no host list or buffer for it")?;
         let mut seq = Vec::new();
@@ -521,22 +599,46 @@ impl Host {
         // Every refresh first, then the writes declared: the bytes compared
         // with afterwards are the title's.
         for op in &ops {
-            op.from.0.refresh(&own.list, op.from.1 as u64, op.len as u64);
+            // (A mirror reads what a copy made on the card wrote: no
+            // refresh of it, which would leave that range alone anyway.)
+            if !matches!(op.to, To::Mirror(..)) {
+                op.from.0.refresh(&own.list, op.from.1 as u64, op.len as u64);
+            }
             let out = match &op.to {
                 To::Copy(to, dst) => {
                     to.refresh(&own.list, *dst as u64, op.len as u64);
                     Some((&to.buffer, to.offset(*dst as u64)))
                 }
+                To::Mirror(to, at) => Some((&to.buffer, to.offset(*at as u64))),
                 To::Slot(..) => None,
             };
             seq.push((&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, op.len as u64, out));
         }
         for op in &ops {
-            if let To::Copy(to, dst) = &op.to {
-                to.gpu_writes(&own.list, *dst as u64, op.len as u64, false);
-                copied.push((to.clone(), *dst, *dst + op.len));
+            match &op.to {
+                To::Copy(to, dst) => {
+                    to.gpu_writes(&own.list, *dst as u64, op.len as u64, false);
+                    copied.push((to.clone(), *dst, *dst + op.len));
+                }
+                // Declared written too (review finding): a later refresh of
+                // the other copy leaves the range alone until this has run
+                // and landed, so the card does not put older bytes over a
+                // newer refresh; what it compares there afterwards is the
+                // same bytes the copy itself lands.
+                To::Mirror(to, at) => to.gpu_writes(&own.list, *at as u64, op.len as u64, false),
+                To::Slot(..) => {}
             }
         }
+        let held: Vec<Arc<Shadow>> = ops
+            .iter()
+            .flat_map(|op| {
+                let to = match &op.to {
+                    To::Copy(to, _) | To::Mirror(to, _) => Some(to.clone()),
+                    To::Slot(..) => None,
+                };
+                std::iter::once(op.from.0.clone()).chain(to)
+            })
+            .collect();
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} steps of title memory made on the card, {at} bytes (VICTORY_CARD_STEPS)", ops.len()));
         record(&own.list.list, &own.between, &seq);
@@ -554,9 +656,12 @@ impl Host {
                 To::Copy(..) => {
                     DONE[1].fetch_add(1, Ordering::Relaxed);
                 }
+                To::Mirror(..) => {
+                    DONE[4].fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        Ok(Some(Taken { own: Some(own), steps: chosen.iter().map(|&i| steps[i]).collect(), copied }))
+        Ok(Some(Taken { own: Some(own), _held: held, steps: chosen.iter().map(|&i| steps[i]).collect(), copied }))
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -639,10 +744,12 @@ pub(super) fn log(frames: f64) {
     let why = String::new();
     tracing::info!(
         "steps made on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} table constant \
-         buffers, {:.2} title buffer copies, {:.1} KB; {:.2} submissions refused and waited ({why})",
+         buffers, {:.2} title buffer copies, {:.2} other host copies of their destinations brought up to date, {:.1} KB; \
+         {:.2} submissions refused and waited ({why})",
         stage(),
         d[0],
         d[1],
+        d[4],
         d[2] / 1024.0,
         d[3],
     );

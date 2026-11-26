@@ -2718,19 +2718,27 @@ pub(crate) fn let_go_idle() {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let idle = |s: &Arc<Shadow>| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                && crate::host::references(&s.buffer) == 1
+        };
+        let keys: Vec<(u64, u64)> = map.iter().filter(|(_, s)| idle(s)).map(|(key, _)| *key).collect();
+        // Counted before they leave, and each looked at again after the
+        // count (fxceless bc6ee68): one a thread took from its memory of
+        // asks before the count moved is held by now, and stays.
+        if !keys.is_empty() {
+            tables_changed();
+        }
+        let mut gone = Vec::new();
+        for key in keys {
+            if map.get(&key).is_some_and(&idle) {
+                gone.extend(map.remove(&key));
+            }
+        }
+        gone
     };
     if !gone.is_empty() {
-        tables_changed();
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
@@ -3778,6 +3786,21 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // Nothing wrote it since this copy took it, and the blocks say so
+        // without a question (`VICTORY_LIGHT_REFRESH`).
+        if self.watched.load(Ordering::Relaxed) == 1 && crate::watch::light_refresh() {
+            let base = self.start as usize / PAGE;
+            let known = {
+                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                crate::watch::nothing_new(from, to, base, &copied)
+            };
+            if known {
+                if refresh_check_on() {
+                    self.refresh_check(from, to, crate::watch::asking_now());
+                }
+                return 0;
+            }
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
@@ -4671,8 +4694,15 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive,
 /// and the graveyard keeps it for those being recorded.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let old = buffers().remove(&(start, resource));
-    tables_changed();
+    // Counted before it leaves, with the table's lock held (fxceless
+    // bc6ee68: an entry that comes is counted after it is in, one that
+    // leaves before it leaves; a remembered answer is used only if the count
+    // is still the one it was found under).
+    let old = {
+        let mut map = buffers();
+        tables_changed();
+        map.remove(&(start, resource))
+    };
     if let Some(shadow) = old.and_then(|e| e.shadow) {
         crate::host::retire(shadow);
     }
@@ -4704,19 +4734,23 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        if !keys.is_empty() {
+            tables_changed();
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
+        let placed = |entry: &Entry| entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some());
+        if map.range(..(end, 0)).rev().take(256).any(|(_, entry)| placed(entry)) {
+            tables_changed();
+            for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+                if placed(entry) {
+                    gone.extend(entry.shadow.take());
+                }
             }
         }
-    }
-    if !gone.is_empty() {
-        tables_changed();
     }
     let n = gone.len() as u64;
     for shadow in gone {
@@ -4774,7 +4808,7 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
 
 fn tables_changed() {
-    TABLES_CHANGED.fetch_add(1, Ordering::Release);
+    TABLES_CHANGED.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Since the last frame line: asks answered from a thread's own memory of
@@ -4822,6 +4856,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
     });
+    // The count again: a copy taken out of a table at this moment can still
+    // be alive for the weak handle (fxceless bc6ee68).
+    let found = found.filter(|_| TABLES_CHANGED.load(Ordering::SeqCst) == changes);
     if let Some(shadow) = found {
         if !shadow.window {
             LOOKUPS[0].fetch_add(1, Ordering::Relaxed);

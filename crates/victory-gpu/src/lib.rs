@@ -56,6 +56,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod cardtime;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod heap_pass;
 #[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]

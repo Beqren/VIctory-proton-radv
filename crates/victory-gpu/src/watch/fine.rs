@@ -18,8 +18,9 @@
 //! read late holds every page it held early (it may hold more, which costs
 //! a read and nothing else).
 //!
-//! Also here: [`took_back`], the journal's side of a copy-back that tells
-//! the copy it came from that title memory holds that copy's bytes.
+//! The copy-back's landing past the guards notes whole blocks
+//! (`super::land_past_by`), and gives the copy it wrote from the numbers
+//! from before its note (`crate::shadow::Shadow::took_back`).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -127,39 +128,6 @@ pub(crate) fn stale_pages(block: usize, since: u64, written: u64) -> (u16, bool)
     fine().mask(block, since, written)
 }
 
-/// The copy-back wrote `[at, at + len)` of title memory from one copy's
-/// bytes: noted in the journal as written at a new asking, which every
-/// other copy of that memory then reads again, and `take(block, prior,
-/// now)` is called for each block with the block's number before this note
-/// (`prior`, 0 for never) and the new one (`now`), all under the journal's
-/// lock. Returns `now`.
-///
-/// The copy the bytes came from may count the block as taken at `now`
-/// only if it had taken it at `prior` or later: then every write of the
-/// title's reported before this note is in that copy, and every write the
-/// title made before or after the copy-back's that is reported after it
-/// gets a number above `now` and is read. A title write that lands between
-/// the copy-back's write and its guarding again is such a write, as long as
-/// it is reported at all (it faults, or it finds the block open and the
-/// guards report the block): numbers are given under the journal's lock, so
-/// a report made after this note is numbered after it. That is why the
-/// number is taken here, together with `prior`, and not handed in.
-#[allow(dead_code)]
-pub(crate) fn took_back(at: usize, len: usize, mut take: impl FnMut(usize, u64, u64)) -> u64 {
-    let mut j = super::journal();
-    j.asked += 1;
-    let now = j.asked;
-    if len == 0 {
-        return now;
-    }
-    wrote_range(&j.written, at, len, now);
-    for block in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        let prior = j.written.insert(block, now).unwrap_or(0);
-        take(block, prior, now);
-    }
-    now
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Fine, SUB};
@@ -251,29 +219,5 @@ mod tests {
         }
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
-    }
-
-    /// Far from anything the other tests or the runtime note: only the
-    /// journal is touched, no memory.
-    const FAR: usize = 0x7f00_0000_0000;
-
-    #[test]
-    fn a_took_back_note_numbers_after_every_earlier_report() {
-        let block = FAR / PAGE;
-        // A report the copy has not taken: `prior` says so.
-        let reported = {
-            let mut j = crate::watch::journal();
-            j.asked += 1;
-            let n = j.asked;
-            j.written.insert(block, n);
-            n
-        };
-        let mut seen = Vec::new();
-        let now = super::took_back(FAR + 100, 200, |b, prior, now| seen.push((b, prior, now)));
-        assert_eq!(seen, vec![(block, reported, now)]);
-        assert!(now > reported);
-        // The next report of the block is numbered after the note.
-        let later = super::took_back(FAR, 1, |_, prior, _| assert_eq!(prior, now));
-        assert!(later > now);
     }
 }

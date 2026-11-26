@@ -1490,7 +1490,15 @@ fn told_after(at: usize, len: usize) {
 /// before the merge (only [`back_exact`] and [`back_probe`] look at it:
 /// empty otherwise), `runs` ([`merged_runs`]) are the pages that differ
 /// from it. Returns the bytes written.
+#[cfg_attr(not(test), allow(dead_code))] // The tests' way in.
 pub(crate) fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)]) -> usize {
+    put_back_by(None, address, merged, read, runs)
+}
+
+/// [`put_back`] by the copy `writer` (the one whose card side the bytes
+/// came from), which is told of what went in past the guards
+/// ([`Shadow::took_back`]).
+pub(crate) fn put_back_by(writer: Option<&Shadow>, address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)]) -> usize {
     if runs.is_empty() {
         return 0;
     }
@@ -1519,6 +1527,15 @@ pub(crate) fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usiz
         let opening = std::time::Instant::now();
         if probe {
             probe_write(at, bytes, &read[lo..hi]);
+        }
+        // Past the guards where it can be (`VICTORY_LAND_WINDOW`): the
+        // write is noted for every copy, and nothing is opened.
+        if let Some((asking, priors)) = crate::watch::land_past_by(at, bytes) {
+            if let Some(writer) = writer {
+                writer.took_back(at..at + bytes.len(), asking, &priors);
+            }
+            written += bytes.len();
+            continue;
         }
         crate::watch::writing_from_card(at, bytes.len());
         #[cfg(any(test, feature = "test-hooks"))]
@@ -2116,9 +2133,10 @@ fn sample_read(held: *const u8, from: usize, len: usize) {
 /// start, and of those since the last line.
 static REFRESH_CHECKED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// Of the checks: blocks (and pages) found differing, by address, and how
-/// many refreshes in a row.
-static CHECK_DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+/// Of the checks: blocks (and pages) found differing, by copy and address
+/// (a block one copy holds stale says nothing of another copy's), and how
+/// many refreshes of that copy in a row.
+static CHECK_DIFFERING: Mutex<Option<std::collections::HashMap<(u64, usize), u32>>> = Mutex::new(None);
 
 /// Check mode (`VICTORY_REFRESH_CHECK=1`, [`Shadow::refresh_check`]).
 fn refresh_check_on() -> bool {
@@ -2780,6 +2798,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether it is no copy but title memory in place (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -3159,7 +3182,7 @@ impl Shadow {
                     }
                     differs != 0
                 });
-                written += put_back(start + at, title, &read, &runs);
+                written += put_back_by(Some(self), start + at, title, &read, &runs);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -3249,7 +3272,7 @@ impl Shadow {
         }
         let read = kept_read(title);
         let runs = merged_runs(start + at, n, |lo, hi| merge_piece(&now[lo..hi], &mut held[lo..hi], &mut title[lo..hi]));
-        put_back(start + at, title, &read, &runs)
+        put_back_by(Some(self), start + at, title, &read, &runs)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3819,7 +3842,7 @@ impl Shadow {
     /// a page left out wrongly elsewhere in it would never be seen there.
     /// Counted on the "reading by page" line; a page that differs is noted
     /// as a block of [`Shadow::refresh_check`] is (the same map, by
-    /// address): said and counted when it differs three refreshes in a row.
+    /// copy and address): said and counted when it differs three refreshes in a row.
     fn refresh_check_pages(&self, pages: &[usize]) {
         if pages.is_empty() {
             return;
@@ -3849,11 +3872,12 @@ impl Shadow {
         let start = self.start as usize;
         let mut map = CHECK_DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(Default::default);
+        let key = (self.id as u64, at);
         if !differs {
-            map.remove(&at);
+            map.remove(&key);
             return;
         }
-        let times = map.entry(at).or_insert(0);
+        let times = map.entry(key).or_insert(0);
         *times += 1;
         if *times == 3 {
             let said = REFRESH_CHECKED[2].fetch_add(1, Ordering::Relaxed) + 1;
@@ -3874,55 +3898,54 @@ impl Shadow {
         }
     }
 
-    /// The copy-back wrote `[address, address + len)` of title memory from
-    /// this copy's bytes, and this copy holds exactly those bytes there
-    /// now. Notes the range as written in the journal at a new asking
-    /// (`crate::watch::fine::took_back`), so that every other copy of that
-    /// memory reads it again; with `VICTORY_TOOK_BACK=1` this copy counts
-    /// each block of it as taken at that asking where it had taken every
-    /// earlier report of the block, and its next refresh does not read the
-    /// bytes back (nor, for a copy in the card's memory, send them up
-    /// again: only a read marks bytes to go up). Returns the asking.
+    /// The copy-back put `range` of title memory, which this copy holds
+    /// there as it now is, past the guards (`crate::watch::land_past_by`),
+    /// and the journal noted it written at `asking` for every copy, at
+    /// every view. With `VICTORY_TOOK_BACK=1` this copy counts each block
+    /// of it as taken at `asking` where it had taken the block's number
+    /// from before the note (`priors`, `(block, prior)`, taken under the
+    /// same hold of the journal as the note), and its next refresh does not
+    /// read those bytes back (nor, for a copy in the card's memory, send
+    /// them up again: only a read marks bytes to go up). Other copies read
+    /// them, as the note says.
     ///
-    /// For the copy-back (the asking side's change "written past the
-    /// guards"): call it after the write has landed, in place of telling
-    /// the write as one of ours that opens the block (`Why::Card`). It
-    /// notes this address only: other views of the same pages are the
-    /// caller's to tell, as now. A title write the copy-back's write does
-    /// not overwrite is never lost: one reported before this note has a
-    /// number the copy had not taken (so the copy does not count the block
-    /// as taken), one reported after it (it landed before the copy-back's
-    /// write, or between that write and the guards put back, or after) is
-    /// numbered after this note and read. Only a title write that is never
-    /// reported is lost, as without this.
-    // Called by the copy-back once it writes past the guards (the asking
-    // side's change); until then only the tests reach it.
-    #[allow(dead_code)]
-    pub(crate) fn took_back(&self, address: usize, len: usize) -> u64 {
+    /// Why no title write is lost: one reported before the note has a
+    /// number above what this copy took (`prior`), and the block is not
+    /// counted as taken; one made after the note is reported at a later
+    /// asking and read. None lands between the write and the note: the
+    /// landing holds the journal and the guards' lock over both, on blocks
+    /// guarded and clean, so a title write there waits in the fault
+    /// handler. `prior` must come from that hold: read after it, it is the
+    /// note's own number. The copy's numbers only rise, so applying this
+    /// after the landing let go is as safe as applying it inside: a refresh
+    /// meanwhile read the block after the landing.
+    pub(crate) fn took_back(&self, range: std::ops::Range<usize>, asking: u64, priors: &[(usize, u64)]) {
+        crate::readgrain::TOOK_BACK[0].fetch_add(1, Ordering::Relaxed);
+        if !took_back_on() {
+            return;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
+        let (from, to) = (range.start.max(start), range.end.min(end));
         if from >= to {
-            return crate::watch::fine::took_back(0, 0, |_, _, _| {});
+            return;
         }
         let base = start / PAGE;
-        let on = took_back_on();
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        crate::readgrain::TOOK_BACK[0].fetch_add(1, Ordering::Relaxed);
-        crate::watch::fine::took_back(from, to - from, |block, prior, now| {
-            if !on {
-                return;
+        for &(block, prior) in priors {
+            let (lo, hi) = ((block * PAGE).max(from), ((block + 1) * PAGE).min(to));
+            if lo >= hi || block < base {
+                continue;
             }
             let Some(at) = copied.get_mut(block - base) else {
-                return;
+                continue;
             };
-            if took_back_block(at, prior, now) {
-                let bytes = ((block + 1) * PAGE).min(to) - (block * PAGE).max(from);
+            if took_back_block(at, prior, asking) {
                 crate::readgrain::TOOK_BACK[1].fetch_add(1, Ordering::Relaxed);
-                crate::readgrain::TOOK_BACK[3].fetch_add(bytes as u64, Ordering::Relaxed);
+                crate::readgrain::TOOK_BACK[3].fetch_add((hi - lo) as u64, Ordering::Relaxed);
             } else {
                 crate::readgrain::TOOK_BACK[2].fetch_add(1, Ordering::Relaxed);
             }
-        })
+        }
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -4113,7 +4136,7 @@ impl Shadow {
                 }
                 differs != 0
             });
-            written = put_back(start + at, title, &read, &runs);
+            written = put_back_by(Some(self), start + at, title, &read, &runs);
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
@@ -4189,7 +4212,7 @@ impl Shadow {
         if !mapped {
             return 0;
         }
-        put_back(start + at, title, &read, &runs)
+        put_back_by(Some(self), start + at, title, &read, &runs)
     }
 }
 
@@ -4333,6 +4356,49 @@ pub(crate) fn mark_bitmap() -> Option<&'static MarkBitmap> {
 /// mark their writes.
 pub(crate) fn view_writes() -> Option<u64> {
     mark_bitmap().map(|b| b.gpu)
+}
+
+/// Read marks (`victory_shader::emit::read_marks`): the read-slots bitmap
+/// on the card (a bit per view-heap slot, `VIEW_READ_BITS`) and a buffer of
+/// zeros as long, which clears it. Copied down and cleared behind each
+/// submission with the page marks (`Host::marks_take`).
+pub(crate) fn read_bitmap() -> Option<&'static MarkBitmap> {
+    static BITMAP: std::sync::OnceLock<Option<MarkBitmap>> = std::sync::OnceLock::new();
+    BITMAP
+        .get_or_init(|| {
+            if !victory_shader::emit::read_marks() {
+                return None;
+            }
+            let bytes = u64::from(victory_shader::emit::VIEW_READ_BITS / 8);
+            // Device-local, made zeroed (committed resources are).
+            let bitmap = host()?.uav_buffer(bytes)?;
+            let zeros = host()?.uav_buffer(bytes)?;
+            crate::host::name(&bitmap, || "view slots shaders read by index".into());
+            crate::host::name(&zeros, || "zeros for the read slots".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
+            Some(MarkBitmap { bitmap, zeros, gpu })
+        })
+        .as_ref()
+}
+
+/// Read marks: the bitmap's GPU address, for the root UAV of shaders that
+/// mark their texture reads.
+pub(crate) fn view_reads() -> Option<u64> {
+    read_bitmap().map(|b| b.gpu)
+}
+
+/// Read marks: the words of the read-slots bitmap a copy-down takes: as many
+/// as the largest view heap has slots (0 before one is made: all of them).
+pub(crate) static READ_WORDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Read marks: [`READ_WORDS`], at most the bitmap's.
+pub(crate) fn read_words() -> usize {
+    let most = (victory_shader::emit::VIEW_READ_BITS / 32) as usize;
+    match READ_WORDS.load(Ordering::Relaxed) {
+        0 => most,
+        n => n.min(most),
+    }
 }
 
 /// Page marks, since the last frame-rate line: bytes of declared ranges

@@ -342,6 +342,26 @@ Fixes, helped by the faster frames of the patched wineserver:
 - Eviction of host textures by their last read (`VICTORY_TEXTURE_EVICT=1`) is off:
   the host sees no reads of 6.2 of the 6.4 GB of textures slots show (programs
   pick them by index), and what it can see is read again within seconds.
+- Read marks (branch texture-on-read, all off; after upstream 52d14b1, 2d6c0df,
+  69d1e8e): `VICTORY_READ_MARKS=1` makes translated shaders set a bit per heap slot
+  they read by index (a root UAV `u250`, copied down and cleared behind every
+  submission), so the host sees every read: 0 MB of shown textures with unseen
+  reads (6.3-7.3 GB without), and of 7.3 GB shown only 1.15 GB was read in the
+  last frames. `VICTORY_TEXTURE_ON_READ=1` makes slots only once read;
+  `VICTORY_TEXTURE_EVICT=1` with marks evicts after 120 s/300 frames unread and
+  past 90% of the budget down to 85%. Runs onread-3, -5, -6, -7 (155-159 s of
+  world each, no fault; onread-2, before the merge of world-start-crash, lost the
+  device 13 s into the world right after 12,000 evictions): the card settles at
+  72-86% instead of 96-98%; slot makings refused for room by 70 s of world about
+  23,000 in onread-7 against 108,000 (marks only) and 163,000 (base15). But
+  16-53 thousand textures are made again within 10 s of their eviction, most in the
+  world's first seconds, and street signs pop in later than without eviction. With
+  the eviction alone the heroine's skin was plastic in one run (onread-3); with
+  evicted slots put back before bake draws it was textured in three (consistent with
+  a bake reading evicted sources, not proven: the put-off publication of new
+  textures can still leave the bake a null slot). Null writes of the eviction go
+  straight into the heap, not through the put-off rule. Off until the thrash is near
+  zero.
 - `tools/face_time.py` measures the result: from the per-frame log line of character
   textures asked for and missing on the card, it prints the frames and seconds after
   the world's first frame until none is missing.
@@ -402,6 +422,37 @@ Fixes (branch `warm-pipelines`):
   its threads waited for pipelines, and every second the longest frame and
   the pipeline waits; each host pipeline's translation and host compile
   times (`host pipeline made`).
+
+### Everything sinks in water (the texture read-back)
+
+Symptom (the owner's play, 2026-11-25): past the prologue "everything is falling
+to the bottom of the water, no swimming or floating physics", and the first
+mission failed at once.
+
+Cause: the title's ocean passes write wave textures on the GPU, and its CPU
+physics reads those textures' memory. The copy-back put shader-written buffers
+into title memory, not textures, so the physics read memory nothing wrote.
+
+Fix (branch water-back; port of fxceless/victory-fork f5c03f3, commits 895c0b8
+and 04df435, `crates/victory-gpu/src/texback.rs`): a list whose shaders write a
+title texture of the kinds 256x256 R32_FLOAT, 256x256 and 64x64 R32G32_FLOAT,
+128x128 R16G16_UINT copies it into a read-back buffer when it closes; once the
+list has run and the device was found alive, the texels are tiled into the
+texture's title memory through the copy-back's guarded write. Texels that did not
+change are not written. On by default here (`VICTORY_TEXTURE_BACK=0` turns it off,
+or a list of `<w>x<h>f<format>` picks others). The fork got past its sinking-boat
+mission with it (their runs 275 against 276: the same set but this switch).
+The texture's own host copy is never uploaded again from that memory: a texture
+shaders write keeps unordered access on the host and is not filled from title
+memory (`texture::title_written`), so the write does not loop back.
+
+The log says once per texture which ones it takes (size, format, layout,
+whether the formats crate can tile it), and every 10 s how many copies were
+recorded and landed, KiB written and CPU time. A test under Proton
+(`texback::tests::shader_written_textures_land_tiled_in_title_memory`) writes each
+kind with a compute shader and checks what lands in each console layout; the
+formats crate cannot address the 64 KiB S_X and R_X layouts of these formats, so
+such a texture would be logged as not tileable and not copied.
 
 ### "a descriptor read only as data"
 
@@ -581,7 +632,24 @@ Replay (5f74661: `formula_replay`, an ignored Windows test run under Proton with
   depends on how lanes form waves.
 - `VICTORY_FORMULA_WARP=1` gave the same numbers as the hardware. Unverified that
   WARP really ran: vkd3d-proton may not have a WARP adapter.
-- Open: a stale read that no fence or coherence flag changes. Either the CPU model
+- Solved (4a10989, next item). Running one dispatch a stage (each thread's list
+  cut to stage k, `VICTORY_FORMULA_SPLIT`) matches the model in every register
+  and output after every stage, so the model is right. Reading the 16-bit
+  elements through the slot's raw view (`rawBufferLoad` on the same heap index)
+  instead of the typed view makes the single dispatch match too, at every stage.
+  On RADV through vkd3d-proton, a typed (texel-buffer) load after a group barrier
+  can return a value from before another wave's store that came before the
+  barrier. Raw (storage-buffer) loads see the store. Fix: in compute programs
+  that store to UAVs and use `s_barrier`, 16-bit integer typed loads (`_d16` of
+  1, 2 or 4 channels) also load the raw view. The table-by-slot word chooses at
+  run time: only views marked integer with 2, 4 or 8 bytes an element take the
+  raw value. `VICTORY_RAW_TYPED_LOADS=0` turns it off. With it and the table slot
+  words (now on by default, 514441e), run confirm3 shows whole faces that speak:
+  lips and jaw intact, teeth inside, the heroine's eyes normal
+  (/tmp/victory-faceref/cap3, frames 1098, 1116, 1170). For upstream: they have
+  the same bug in the same place; what to report is the Formula program, its
+  replay, and the raw-view loads.
+- Was open: a stale read that no fence or coherence flag changes. Either the CPU model
   misreads which stage an instruction belongs to, or a wave passes the barrier
   before another has finished its stores. Next: an exact console emulator of these
   ~150 instructions on the dump, as the referee, or the per-stage split (one

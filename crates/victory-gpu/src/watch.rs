@@ -480,6 +480,10 @@ pub(crate) const P_GUARD_BLOCKS: usize = 35;
 pub(crate) const P_GUARD_BITS: usize = 36;
 /// Written blocks left open for their rest ([`rest`]).
 pub(crate) const P_RESTED: usize = 37;
+/// Pieces the copy-back put past the guards ([`land_past`]), and the
+/// pieces it tried that went the old way.
+pub(crate) const P_LANDED: usize = 38;
+pub(crate) const P_LAND_REFUSED: usize = 39;
 
 /// Why a guarded block was opened (diagnostics).
 #[derive(Clone, Copy)]
@@ -1251,6 +1255,118 @@ fn writing_why(at: usize, len: usize, why: Why) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// Whether the copy-back puts what shaders wrote into guarded title memory
+/// past the guards (`VICTORY_LAND_WINDOW=1`; off by default until
+/// measured): through a view of ours of the same section, the title's view
+/// left read-only and clean, instead of opening its blocks (a change of
+/// protection each, under the guards' lock) for the next refresh to guard
+/// again. After VIctory-7900XTX 2aa8134 ("landing past the guards").
+///
+/// In run d4-off the copy-back was the largest source of both: 730-920 of
+/// the 1,060-2,200 blocks a frame that refreshes found written and guarded
+/// again were opened by it, and the title's faulting threads waited 23-47
+/// ms a frame for the guards' lock.
+fn land_window() -> bool {
+    #[cfg(test)]
+    {
+        LAND_IN_TEST.with(|l| l.get())
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_WINDOW").is_some_and(|v| v == "1"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`land_window`], for what this thread writes.
+    static LAND_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With [`land_window`]: writes `bytes` into title memory at `at` past the
+/// guards, if every block there is guarded by us and clean and the range is
+/// one run of one section: the asking under which the pages are noted
+/// written if it did. If not (`None`) nothing is written, and the caller
+/// goes the old way (`writing_from_card`, then its write).
+///
+/// Why nothing is missed:
+/// - The journal and then the guards' lock are held (the order `writes`
+///   takes them) from the look at the blocks to the note: no fault can
+///   open a block meanwhile (a title write waits in the handler, and is
+///   seen after, as any), and no asking comes between the write and its
+///   note.
+/// - The remapping lock is held for reading: the views, and so the
+///   section and offset under `at`, stay as found.
+/// - Every page written is noted in the journal under a new asking, at
+///   this view and at every other view of its pages (`pages_of`): every
+///   host copy of any of them copies the page again at its next refresh,
+///   as after the kernel's write watch or a guard reports it, though no
+///   block was opened. The guards' clean blocks stay clean: the journal
+///   alone says "written", and `writes` gives its entries for guarded
+///   memory too.
+/// - A placed texture there changes with no descriptor written:
+///   `descriptor::host::remapped`, as `writing_why` does.
+#[cfg_attr(not(test), allow(dead_code))] // The copy-back takes `land_past_by`.
+pub(crate) fn land_past(at: usize, bytes: &[u8]) -> Option<u64> {
+    land_past_by(at, bytes).map(|(now, _)| now)
+}
+
+/// [`land_past`], with the journal's number of each block of `[at, at +
+/// len)` (at this view) from before its note, `(block, prior)` in order,
+/// 0 for never: taken under the same hold of the journal as the note, for
+/// the copy the bytes came from (`crate::shadow::Shadow::took_back`),
+/// which may count a block as taken at the note only if it had taken
+/// `prior`. Read after the note it would be the note's own number.
+pub(crate) fn land_past_by(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
+    if !land_window() || bytes.is_empty() {
+        return None;
+    }
+    let landed = land_past_held(at, bytes);
+    prep(if landed.is_some() { P_LANDED } else { P_LAND_REFUSED }, 1);
+    if landed.is_some() {
+        crate::descriptor::host::remapped(at, bytes.len());
+    }
+    landed
+}
+
+fn land_past_held(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
+    let end = at.saturating_add(bytes.len());
+    let _mapped = title_memory_reading_now(at, bytes.len())?;
+    let crate::inplace::Cover::Run(section, offset) = crate::inplace::cover(at, bytes.len()) else {
+        return None;
+    };
+    // Every view of the pages, before the locks (it takes the views' own).
+    let mut pages: Vec<usize> = Vec::new();
+    for block in at / BLOCK..end.div_ceil(BLOCK) {
+        pages.push(block * BLOCK / PAGE);
+        pages.extend(crate::inplace::pages_of(block * BLOCK).into_iter().map(|alias| alias / PAGE));
+    }
+    let base = crate::inplace::window(section)?;
+    let mut j = journal();
+    let g = guards();
+    if !(at / BLOCK..end.div_ceil(BLOCK)).all(|b| g.protected.contains(&b) && g.clean.tree.contains(&b)) {
+        return None;
+    }
+    // SAFETY: our view of the section, which holds `offset..offset + len`
+    // (the runtime's view of that run is inside the section); host memory
+    // the title does not see at this address.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (base + offset as usize) as *mut u8, bytes.len()) };
+    j.asked += 1;
+    let now = j.asked;
+    let priors: Vec<(usize, u64)> =
+        (at / BLOCK..end.div_ceil(BLOCK)).map(|b| (b, j.written.get(&(b * BLOCK / PAGE)).copied().unwrap_or(0))).collect();
+    for page in pages {
+        // Whole blocks for the journal by 4 KiB page (`fine`): an entry
+        // left as it was would not hold this note's pages.
+        fine::whole_block(page);
+        j.written.insert(page, now);
+    }
+    drop(g);
+    drop(j);
+    Some((now, priors))
+}
+
 /// How [`write_title_memory`] went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitleWrite {
@@ -1681,6 +1797,9 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(crate::copystat::C::RemappedUs, std::time::Instant::now());
+    // A texture read-back going there is stale (before the guards are
+    // taken: a landing holds its lock across a guarded write).
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1706,6 +1825,13 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+    // Other memory there now: no rest carries over to it ([`rest`]).
+    if !g.opened.is_empty() {
+        let opened: Vec<usize> = g.opened.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+        for block in opened {
+            g.opened.remove(&block);
+        }
     }
 }
 
@@ -2309,6 +2435,64 @@ mod tests {
             drop_views(section, &[guarded, other], SIZE);
         }
         BITS_IN_TEST.with(|b| b.set(false));
+    }
+
+    /// The copy-back past the guards ([`super::land_past`]): into a clean
+    /// guarded block it writes through a view of ours, the block stays
+    /// guarded and clean, and the pages are noted written under a new asking
+    /// at this view and at the page's other view, so every copy of them
+    /// copies them again. Into a block that is not clean, or with the switch
+    /// off, it writes nothing and says so.
+    #[test]
+    fn the_copy_back_lands_past_the_guards_and_every_view_is_told() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, guarded, other) = two_views(SIZE);
+        crate::inplace::title_memory_section(section, SIZE as u64, true);
+        let page = (guarded + BLOCK) / PAGE;
+        let other_page = (other + BLOCK) / PAGE;
+        assert!(guard(guarded, guarded + SIZE).is_some());
+        assert!(guard(other, other + SIZE).is_some());
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        let at = guarded + BLOCK + 8;
+        // Off: nothing.
+        LAND_IN_TEST.with(|l| l.set(false));
+        assert!(land_past(at, &[1, 2, 3]).is_none());
+        LAND_IN_TEST.with(|l| l.set(true));
+        let asked = |base: usize, page: usize| {
+            let (now, written) = writes(base, base + SIZE, true).expect("a view");
+            (now, written.iter().find(|w| w.0 == page).map_or(0, |w| w.1))
+        };
+        let (before, _) = asked(guarded, page);
+        let (before_other, _) = asked(other, other_page);
+        let landed = land_past(at, &[1, 2, 3]).expect("landed");
+        // SAFETY: both views of the section, readable.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(at as *const u8, 3), &[1, 2, 3]);
+            assert_eq!(std::slice::from_raw_parts((other + BLOCK + 8) as *const u8, 3), &[1, 2, 3]);
+        }
+        assert!(guarded_by_us(guarded, guarded + SIZE), "still guarded");
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "still clean");
+        let (_, number) = asked(guarded, page);
+        assert!(number > before, "noted written at this view: {number} after {before}");
+        assert_eq!(number, landed, "under the asking it gave");
+        // Landed again: the number from before the note is the first
+        // landing's, for the copy the bytes came from (`Shadow::took_back`).
+        let (again, priors) = land_past_by(at, &[1, 2, 3]).expect("landed again");
+        assert_eq!(priors, vec![(page, landed)]);
+        assert!(again > landed);
+        let (_, number) = asked(other, other_page);
+        assert!(number > before_other, "noted written at the other view: {number} after {before_other}");
+        // A block the title has written (open, not clean): the old way.
+        // SAFETY: the guarded view; the handler opens the block.
+        unsafe { ((guarded + 16) as *mut u8).write(9) };
+        assert!(land_past(guarded + 32, &[4]).is_none());
+        // SAFETY: readable.
+        assert_eq!(unsafe { ((guarded + 32) as *const u8).read() }, 0, "nothing written");
+        LAND_IN_TEST.with(|l| l.set(false));
+        drop_views(section, &[guarded, other], SIZE);
+        // The notes stay in the journal (they only make a copy copy again);
+        // a test that maps fresh memory here later wants none.
+        journal().written.retain(|&p, _| !(guarded / PAGE..(guarded + SIZE) / PAGE).contains(&p) && !(other / PAGE..(other + SIZE) / PAGE).contains(&p));
     }
 
     /// A view of guarded pages is mapped anew: it is writable, so the

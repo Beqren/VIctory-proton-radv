@@ -47,13 +47,14 @@ pub(crate) const KEEP_MS: u64 = 2_000;
 /// The textures of `shown` to let go at `now`, in order: those read longest
 /// ago first (the larger first among those read at the same moment), only
 /// ones whose every slot's next read is seen (`known`) and that were not
-/// read within [`KEEP_FRAMES`] frames and [`KEEP_MS`]. With `age` (in
-/// milliseconds), every such texture not read for that long; without, as
-/// many as hold `need` bytes.
-pub(crate) fn pick(shown: &[Shown], need: u64, now: u64, age: Option<u64>) -> Vec<usize> {
+/// read within [`KEEP_FRAMES`] frames and [`KEEP_MS`]. With `age`
+/// (milliseconds and frames), every such texture not read for that long;
+/// without, as many as hold `need` bytes.
+pub(crate) fn pick(shown: &[Shown], need: u64, now: u64, age: Option<(u64, u64)>) -> Vec<usize> {
+    let (ms, frames) = age.unwrap_or((0, 0));
     let mut order: Vec<&Shown> = shown
         .iter()
-        .filter(|s| s.known && before(s.read, now, age.unwrap_or(0).max(KEEP_MS), KEEP_FRAMES))
+        .filter(|s| s.known && before(s.read, now, ms.max(KEEP_MS), frames.max(KEEP_FRAMES)))
         .collect();
     order.sort_unstable_by(|a, b| a.read.cmp(&b.read).then(b.bytes.cmp(&a.bytes)).then(a.id.cmp(&b.id)));
     if age.is_some() {
@@ -136,7 +137,9 @@ mod tests {
             // 60 s unread.
             shown(4, 10, at(800, 2400), true),
         ];
-        assert_eq!(pick(&s, 0, now, Some(20_000)), [4, 1]);
-        assert!(pick(&s, 0, now, Some(120_000)).is_empty());
+        assert_eq!(pick(&s, 0, now, Some((20_000, 0))), [4, 1]);
+        assert!(pick(&s, 0, now, Some((120_000, 0))).is_empty());
+        // Upstream's frames too: 30 s but 100 frames unread stays.
+        assert_eq!(pick(&s, 0, now, Some((20_000, 150))), [4]);
     }
 }

@@ -253,7 +253,8 @@ const LAND_US: usize = 6;
 /// mapped), or the read-back not mapped, or the texels not tiled.
 const FAILED: usize = 7;
 /// Textures not recorded: the host copy's format is not the title's (a
-/// stand-in of another texel size, `crate::resource::target_format`).
+/// stand-in of another texel size, `crate::resource::target_format`), or
+/// it has more than one subresource.
 const OTHER_FORMAT: usize = 8;
 /// Copies whose mark was not behind them: not written.
 const UNMARKED: usize = 9;
@@ -287,6 +288,15 @@ fn record_texture(
     }
     let mips = u32::from(desc.MipLevels.max(1));
     let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
+    // One subresource only: an unordered view writes one mip (and maybe one
+    // slice), and the others' card contents (never uploaded from title
+    // memory: a texture shaders write is the host's own) would go over the
+    // title's texels (review finding). Every texture taken in the owner's
+    // session of 2026-11-25 had one mip and one slice.
+    if subresources != 1 {
+        STATS[OTHER_FORMAT].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let n = subresources as usize;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
     let mut rows = vec![0u32; n];
@@ -317,7 +327,7 @@ fn record_texture(
     // (`crate::host::fetch_mark`): the card may finish a list's fence on a
     // lost device before the loss is reported, and then the buffer holds
     // nothing it copied (zeros), which would be tiled into title memory.
-    let mark = crate::host::fetch_mark().then(|| {
+    let mut mark = crate::host::fetch_mark().then(|| {
         static SENT: AtomicU64 = AtomicU64::new(0);
         (total.next_multiple_of(4), crate::host::mark_value(SENT.fetch_add(1, Ordering::Relaxed) + 1))
     });
@@ -344,9 +354,16 @@ fn record_texture(
         // past every footprint.
         unsafe {
             let write = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: buffer.GetGPUVirtualAddress() + at, Value: value }];
-            list.cast::<ID3D12GraphicsCommandList2>()
-                .ok()?
-                .WriteBufferImmediate(1, write.as_ptr(), Some([D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT].as_ptr()));
+            // Without the interface the copies are recorded all the same,
+            // and the buffer must outlive the list: kept, without a mark
+            // (review finding: returning here dropped a buffer the list
+            // names).
+            match list.cast::<ID3D12GraphicsCommandList2>() {
+                Ok(list) => {
+                    list.WriteBufferImmediate(1, write.as_ptr(), Some([D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT].as_ptr()))
+                }
+                Err(_) => mark = None,
+            }
         }
     }
     STATS[RECORDED].fetch_add(1, Ordering::Relaxed);
@@ -514,7 +531,7 @@ fn report() {
     };
     tracing::info!(
         "texture read-back (VICTORY_TEXTURE_BACK), last 10 s: {} textures taken so far; {} copies recorded ({} not: \
-         host format differs), {} landed ({} unchanged), {} stale, {} unmarked, {} failed (memory unreadable, not mapped or not \
+         host format differs or more than one subresource), {} landed ({} unchanged), {} stale, {} unmarked, {} failed (memory unreadable, not mapped or not \
          tiled); {} KiB written ({:.1} KiB a frame begun over {frames} frames begun); CPU {:.2} ms recording, \
          {:.2} ms landing ({:.3} ms a frame begun)",
         TEXTURES.load(Ordering::Relaxed),
@@ -574,12 +591,13 @@ mod tests {
     }
 
     /// On the host's own GPU (skipped without one): for each kind copied
-    /// back, in three console layouts and with a mip chain, a texture with
-    /// unordered access written by a compute shader with a pattern (each
-    /// texel's mip, x and y) is copied back by `record_texture` and `land`
-    /// into "title memory": what lands there detiles, mip by mip, to the
-    /// pattern, the bytes after the texture's layout are untouched, and a
-    /// second landing of the same texels writes nothing.
+    /// back, in three console layouts, a texture with unordered access
+    /// written by a compute shader with a pattern (each texel's x and y) is
+    /// copied back by `record_texture` and `land` into "title memory": what
+    /// lands there detiles to the pattern, the bytes after the texture's
+    /// layout are untouched, a second landing of the same texels writes
+    /// nothing, nor does one whose mark is missing or whose allocation was
+    /// released; a texture with a mip chain is not taken at all.
     #[test]
     fn shader_written_textures_land_tiled_in_title_memory() {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -710,6 +728,7 @@ mod tests {
             let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let mut checked = 0;
             let mut skipped = 0;
+            let mut refused = 0;
             for (width, height, format) in parse(DEFAULT) {
                 let pso = pipeline(format);
                 // The layouts the console's library picks for a texture
@@ -807,6 +826,15 @@ mod tests {
                             }]);
                             *back.borrow_mut() = record_texture(&device, list, &texture, plane.layout.clone(), format, ticket.clone());
                         });
+                        if mips > 1 {
+                            // More than one subresource: not taken, nothing
+                            // written (the others may hold what no shader
+                            // wrote).
+                            assert!(back.into_inner().is_none(), "{what}: a texture of {mips} mips recorded");
+                            assert!(title.iter().all(|&b| b == 0xcd));
+                            refused += 1;
+                            continue;
+                        }
                         let back = back.into_inner().unwrap_or_else(|| panic!("{what}: nothing recorded"));
                         assert_eq!(back.range(), (at, at + size));
                         let bytes_before = STATS[BYTES].load(Ordering::Relaxed);
@@ -854,8 +882,8 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(checked + skipped, 4 * 5 * 2);
-            assert!(checked >= 4 * 2 * 2, "{checked} checked");
+            assert_eq!(checked + skipped + refused, 4 * 5 * 2);
+            assert!(checked >= 4 * 3, "{checked} checked");
         }
     }
 }

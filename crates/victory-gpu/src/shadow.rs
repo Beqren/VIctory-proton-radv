@@ -1490,7 +1490,15 @@ fn told_after(at: usize, len: usize) {
 /// before the merge (only [`back_exact`] and [`back_probe`] look at it:
 /// empty otherwise), `runs` ([`merged_runs`]) are the pages that differ
 /// from it. Returns the bytes written.
+#[cfg_attr(not(test), allow(dead_code))] // The tests' way in.
 pub(crate) fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)]) -> usize {
+    put_back_by(None, address, merged, read, runs)
+}
+
+/// [`put_back`] by the copy `writer` (the one whose card side the bytes
+/// came from), which is told of what went in past the guards
+/// ([`Shadow::took_back`]).
+pub(crate) fn put_back_by(writer: Option<&Shadow>, address: usize, merged: &[u8], read: &[u8], runs: &[(usize, usize)]) -> usize {
     if runs.is_empty() {
         return 0;
     }
@@ -1522,7 +1530,10 @@ pub(crate) fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usiz
         }
         // Past the guards where it can be (`VICTORY_LAND_WINDOW`): the
         // write is noted for every copy, and nothing is opened.
-        if crate::watch::land_past(at, bytes) {
+        if let Some(asking) = crate::watch::land_past(at, bytes) {
+            if let Some(writer) = writer {
+                writer.took_back(at..at + bytes.len(), asking);
+            }
             written += bytes.len();
             continue;
         }
@@ -3089,7 +3100,7 @@ impl Shadow {
                     }
                     differs != 0
                 });
-                written += put_back(start + at, title, &read, &runs);
+                written += put_back_by(Some(self), start + at, title, &read, &runs);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -3179,7 +3190,7 @@ impl Shadow {
         }
         let read = kept_read(title);
         let runs = merged_runs(start + at, n, |lo, hi| merge_piece(&now[lo..hi], &mut held[lo..hi], &mut title[lo..hi]));
-        put_back(start + at, title, &read, &runs)
+        put_back_by(Some(self), start + at, title, &read, &runs)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3768,6 +3779,15 @@ impl Shadow {
         }
     }
 
+    /// The copy-back put `range` of title memory, which this copy holds as
+    /// the card left it, past the guards (`crate::watch::land_past`); the
+    /// journal notes its pages written under `asking`, for every copy. A
+    /// hook for the read side (branch read-grain: this copy need not read
+    /// them again); nothing here.
+    pub(crate) fn took_back(&self, range: std::ops::Range<usize>, asking: u64) {
+        let _ = (range, asking);
+    }
+
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
@@ -3937,7 +3957,7 @@ impl Shadow {
                 }
                 differs != 0
             });
-            written = put_back(start + at, title, &read, &runs);
+            written = put_back_by(Some(self), start + at, title, &read, &runs);
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.
@@ -4013,7 +4033,7 @@ impl Shadow {
         if !mapped {
             return 0;
         }
-        put_back(start + at, title, &read, &runs)
+        put_back_by(Some(self), start + at, title, &read, &runs)
     }
 }
 

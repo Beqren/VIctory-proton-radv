@@ -4650,7 +4650,6 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    tables_changed();
     let old = buffers().insert(
         (start, resource),
         Entry {
@@ -4658,6 +4657,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // After the insert (review finding): an ask between a count moved first
+    // and the insert would keep the old answer under the new count.
+    tables_changed();
     // Registered again at the same address: its old copy through the
     // graveyard, not dropped at once (as fork Belobug 40b8b9b): a list being
     // recorded may name it by a root view's address, which holds nothing.
@@ -4821,8 +4823,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
     });
     if let Some(shadow) = found {
-        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
-        if shadow.window {
+        if !shadow.window {
+            LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(shadow);
+        }
+        // A window is handed out under the windows' lock, still in their
+        // table, as `loose` hands it out: `let_go_idle` lets go only windows
+        // nothing holds, looked at under the same lock (review finding: a
+        // window it was letting go could otherwise be taken back here).
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let (start, len_w) = shadow.span();
+        if map.get(&(start, len_w)).is_some_and(|s| Arc::ptr_eq(s, &shadow)) {
             // As `loose` notes an ask of a window it hands out.
             shadow.used.store(crate::host::moment(), Ordering::Relaxed);
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
@@ -4830,8 +4841,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             if len <= 1 {
                 shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
             }
+            drop(map);
+            LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(shadow);
         }
-        return Some(shadow);
     }
     LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
     let shadow = lookup_tables(address, len, any)?;

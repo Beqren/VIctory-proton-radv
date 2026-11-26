@@ -153,7 +153,10 @@ impl<C: Clone> Picked<C> {
     /// told, though one of them asks.
     pub(crate) fn note_forgotten(&mut self, entries: Option<&[u32]>) {
         match (entries, &mut self.forgotten) {
-            (Some(new), Some(kept)) => kept.extend_from_slice(new),
+            // A heap whose passes stopped would keep every entry freed
+            // since (review finding): past this many it looks at every
+            // slot when it runs again.
+            (Some(new), Some(kept)) if kept.len() + new.len() <= 1 << 20 => kept.extend_from_slice(new),
             _ => self.forgotten = None,
         }
     }

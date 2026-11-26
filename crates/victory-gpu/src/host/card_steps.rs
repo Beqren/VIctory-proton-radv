@@ -406,6 +406,10 @@ static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::Ato
 /// pool.
 pub(super) struct Taken {
     own: Option<Own>,
+    /// The host copies our list reads or writes, held until it has run
+    /// (review finding: a mirror's source is held by nothing else of ours,
+    /// and the flight that wrote it may land and let it go first).
+    _held: Vec<Arc<Shadow>>,
     steps: std::collections::HashSet<(usize, usize)>,
     /// The destinations of copies made on the card: host copy, from, to.
     copied: Vec<(Arc<Shadow>, usize, usize)>,
@@ -605,11 +609,30 @@ impl Host {
             seq.push((&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, op.len as u64, out));
         }
         for op in &ops {
-            if let To::Copy(to, dst) = &op.to {
-                to.gpu_writes(&own.list, *dst as u64, op.len as u64, false);
-                copied.push((to.clone(), *dst, *dst + op.len));
+            match &op.to {
+                To::Copy(to, dst) => {
+                    to.gpu_writes(&own.list, *dst as u64, op.len as u64, false);
+                    copied.push((to.clone(), *dst, *dst + op.len));
+                }
+                // Declared written too (review finding): a later refresh of
+                // the other copy leaves the range alone until this has run
+                // and landed, so the card does not put older bytes over a
+                // newer refresh; what it compares there afterwards is the
+                // same bytes the copy itself lands.
+                To::Mirror(to, at) => to.gpu_writes(&own.list, *at as u64, op.len as u64, false),
+                To::Slot(..) => {}
             }
         }
+        let held: Vec<Arc<Shadow>> = ops
+            .iter()
+            .flat_map(|op| {
+                let to = match &op.to {
+                    To::Copy(to, _) | To::Mirror(to, _) => Some(to.clone()),
+                    To::Slot(..) => None,
+                };
+                std::iter::once(op.from.0.clone()).chain(to)
+            })
+            .collect();
         #[cfg(feature = "diagnostics")]
         own.list.note_op(|| format!("{} steps of title memory made on the card, {at} bytes (VICTORY_CARD_STEPS)", ops.len()));
         record(&own.list.list, &own.between, &seq);
@@ -632,7 +655,7 @@ impl Host {
                 }
             }
         }
-        Ok(Some(Taken { own: Some(own), steps: chosen.iter().map(|&i| steps[i]).collect(), copied }))
+        Ok(Some(Taken { own: Some(own), _held: held, steps: chosen.iter().map(|&i| steps[i]).collect(), copied }))
     }
 
     /// A list of ours open for recording, and its buffer.

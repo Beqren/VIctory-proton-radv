@@ -1368,6 +1368,13 @@ fn land_past_held(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
     if !(at / BLOCK..end.div_ceil(BLOCK)).all(|b| g.protected.contains(&b) && g.clean.tree.contains(&b)) {
         return None;
     }
+    // Their numbers go before the bytes change (review finding): a refresh
+    // that reads a number without a lock must not find one for bytes
+    // already written; once it is gone the refresh asks, and waits for the
+    // note below.
+    for &page in &pages {
+        PUBLISHED.clear(page * PAGE / BLOCK);
+    }
     // SAFETY: our view of the section, which holds `offset..offset + len`
     // (the runtime's view of that run is inside the section); host memory
     // the title does not see at this address.
@@ -1381,8 +1388,6 @@ fn land_past_held(at: usize, bytes: &[u8]) -> Option<(u64, Vec<(usize, u64)>)> {
         // left as it was would not hold this note's pages.
         fine::whole_block(page);
         j.written.insert(page, now);
-        // Noted written: not answered by its number until asked again.
-        PUBLISHED.clear(page * PAGE / BLOCK);
     }
     drop(g);
     drop(j);

@@ -155,6 +155,21 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Makes dynamic slot `index` of the host heap behind the title heap at
+/// `heap`, if that heap still exists, the constant buffer view of `size`
+/// bytes at `gpu` (`crate::host` card steps, after VIctory-7900XTX
+/// cc03ecb).
+#[cfg(windows)]
+pub(crate) fn constant_slot(heap: usize, index: u32, gpu: u64, size: u32) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if heaps.iter().any(|&(_, _, h)| h == heap)
+        // SAFETY: registered heaps are live (removed when dropped).
+        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+    {
+        host.constant_at(index, gpu, size);
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

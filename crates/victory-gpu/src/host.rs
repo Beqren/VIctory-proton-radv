@@ -491,6 +491,8 @@ pub(crate) fn log_removal_context() {
 /// with `VICTORY_TEXTURE_VA=1`, which places each in a heap of its own),
 /// printed at a device removal so that the kernel's fault address can be
 /// matched to an object afterwards (the layer cannot read the kernel log).
+mod card_steps;
+
 pub(crate) mod vamap {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
@@ -1896,8 +1898,10 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory; the
+    /// descriptor slot that alone shows it (title heap, slot), if one does
+    /// (a constant buffer of a table made for the draw: `card_steps`).
+    Fill(usize, usize, usize, Option<(usize, u32)>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -2484,6 +2488,8 @@ struct Sent {
     writers: Vec<(usize, String)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Constant buffers made on the card in front of it (`card_steps`).
+    own: Option<card_steps::Taken>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2502,6 +2508,8 @@ struct Flight {
     marks: Option<MarkTake>,
     unmarked: std::collections::HashSet<usize>,
     writers: Vec<(usize, String)>,
+    /// As in [`Sent`]: held until the flight has landed.
+    _own: Option<card_steps::Taken>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2648,7 +2656,7 @@ fn blocking_detail(runs: &[&HostList]) -> String {
                     let what = if touches(&written, src, src + len) { hit(src, src + len) } else { hit(dst, dst + len) };
                     return format!("copy {src:#x}->{dst:#x} {len} B, {what}");
                 }
-                &Step::Fill(_, src, len) if touches(&written, src, src + len) => {
+                &Step::Fill(_, src, len, _) if touches(&written, src, src + len) => {
                     return format!("fill from {src:#x} {len} B, {}", hit(src, src + len));
                 }
                 Step::Texture(staging) => {
@@ -2699,7 +2707,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
+                &Step::Fill(_, src, len, _) => {
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
@@ -4538,6 +4546,7 @@ impl Host {
                 marks: sent.marks,
                 unmarked: sent.unmarked,
                 writers: sent.writers,
+                _own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4592,6 +4601,7 @@ impl Host {
                 marks: sent.marks,
                 unmarked: sent.unmarked,
                 writers: sent.writers,
+                _own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -4777,6 +4787,7 @@ impl Host {
         crate::copystat::add(crate::copystat::C::SubmitLockUs, called.elapsed().as_micros() as u64);
         let was_working = working(true);
         submitting(1, runs.len());
+        let mut taken: Option<card_steps::Taken> = None;
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -4785,7 +4796,12 @@ impl Host {
         } else if let Some(why) = late_blocked(runs) {
             #[cfg(feature = "diagnostics")]
             let (blocked_at, detail) = (std::time::Instant::now(), blocking_detail(runs));
-            if relay_exact() && why == WHY_READ {
+            if why == WHY_READ
+                && let Some(t) = self.card_steps(runs)
+            {
+                // Made on the card behind the flights instead (`card_steps`).
+                taken = Some(t);
+            } else if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
@@ -4795,6 +4811,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             blocked_note(why, detail, blocked_at.elapsed());
         }
+        // The list that makes them goes first, prepared like the others.
+        let with_own: Vec<&HostList>;
+        let runs: &[&HostList] = match taken.as_ref().and_then(|t| t.list()) {
+            Some(own) => {
+                with_own = std::iter::once(own).chain(runs.iter().copied()).collect();
+                &with_own
+            }
+            None => runs,
+        };
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -4878,7 +4903,7 @@ impl Host {
         }
         let part = std::time::Instant::now();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, taken.as_ref());
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4971,6 +4996,7 @@ impl Host {
                 marks,
                 unmarked,
                 writers,
+                own: taken,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -5920,7 +5946,16 @@ impl HostList {
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+            .push(Step::Fill(dst as usize, src as usize, len, None));
+    }
+
+    /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
+    /// title heap's address, and the slot) shows: a constant buffer of a
+    /// table made for the draw (`card_steps`).
+    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        self.deferred()
+            .copies
+            .push(Step::Fill(dst as usize, src as usize, len, Some(slot)));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -6122,10 +6157,14 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    fn run_deferred(&self, batch: &mut Batch, taken: Option<&card_steps::Taken>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        for (i, step) in self.deferred().copies.iter().enumerate() {
+            // Made on the card in front of the submission (`card_steps`).
+            if taken.is_some_and(|t| t.takes(self, i)) {
+                continue;
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -6140,7 +6179,7 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill(dst, src, len, _) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -6862,6 +6901,7 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::plaincopy::line(frames);
+        card_steps::log(frames);
         if let Some(host) = host() {
             crate::cardtime::line(&host.queue, frames, FINISHED.load(Ordering::Acquire));
         }

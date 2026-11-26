@@ -1520,6 +1520,12 @@ pub(crate) fn put_back(address: usize, merged: &[u8], read: &[u8], runs: &[(usiz
         if probe {
             probe_write(at, bytes, &read[lo..hi]);
         }
+        // Past the guards where it can be (`VICTORY_LAND_WINDOW`): the
+        // write is noted for every copy, and nothing is opened.
+        if crate::watch::land_past(at, bytes) {
+            written += bytes.len();
+            continue;
+        }
         crate::watch::writing_from_card(at, bytes.len());
         #[cfg(any(test, feature = "test-hooks"))]
         crate::watch::card_between(at, bytes.len());

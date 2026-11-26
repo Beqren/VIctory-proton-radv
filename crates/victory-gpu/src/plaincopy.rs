@@ -161,9 +161,16 @@ fn install() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: a handler that reads the record it is given and nothing else.
     ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_fault));
+        // Without the handler a source page that is not there would be a
+        // fault nobody takes: no copy in place then (review finding).
+        if AddVectoredExceptionHandler(1, Some(on_fault)).is_null() {
+            NO_HANDLER.store(true, Relaxed);
+        }
     });
 }
+
+/// The handler could not be put in: [`copy`] makes no copy in place.
+static NO_HANDLER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(target_arch = "x86_64"))]
 fn install() {}
@@ -199,6 +206,10 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     }
     if faulted_lately(from as usize, len) {
         COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    install();
+    if NO_HANDLER.load(Relaxed) {
         return false;
     }
     let whole = guarded(to, from, len);

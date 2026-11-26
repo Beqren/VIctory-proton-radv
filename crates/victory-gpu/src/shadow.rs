@@ -3722,8 +3722,9 @@ impl Shadow {
             return;
         }
         const SAMPLE: usize = 256;
-        // Blocks found differing: how many refreshes in a row.
-        static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+        // Blocks found differing, by copy and address: how many refreshes
+        // of that copy in a row.
+        static DIFFERING: Mutex<Option<std::collections::HashMap<(u64, usize), u32>>> = Mutex::new(None);
         let start = self.start as usize;
         let mut title = [0u8; SAMPLE];
         let mut at = from;
@@ -3736,11 +3737,12 @@ impl Shadow {
                 let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
+                let key = (self.id as u64, at);
                 if copy == &title[..n] {
-                    map.remove(&at);
+                    map.remove(&key);
                 } else {
                     REFRESH_CHECKED[1].fetch_add(1, Ordering::Relaxed);
-                    let times = map.entry(at).or_insert(0);
+                    let times = map.entry(key).or_insert(0);
                     *times += 1;
                     if *times == 3 {
                         let said = REFRESH_CHECKED[2].fetch_add(1, Ordering::Relaxed) + 1;

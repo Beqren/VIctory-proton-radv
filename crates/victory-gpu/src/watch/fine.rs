@@ -218,6 +218,41 @@ mod tests {
         assert_eq!(f.mask(block, 8, 8), (0, true));
     }
 
+    /// The kernel's answer kept by page through `writes`: a write to one
+    /// page, one across a page boundary. Run with `VICTORY_READ_PAGES=1`
+    /// (without it the journal keeps blocks, and this says that).
+    #[test]
+    fn the_write_watch_pages_reach_the_journal_by_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (taken, _) = crate::watch::writes(p, p + 2 * PAGE, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + 5 * KERNEL_PAGE + 8) as *mut u8).write(1);
+            ((p + PAGE + 4 * KERNEL_PAGE - 2) as *mut u32).write_unaligned(7);
+        }
+        let (now, written) = crate::watch::writes(p, p + 2 * PAGE, false).expect("watched");
+        assert_eq!(written, [(p / PAGE, now), (p / PAGE + 1, now)]);
+        let first = super::stale_pages(p / PAGE, taken, now);
+        let second = super::stale_pages(p / PAGE + 1, taken, now);
+        if super::on() {
+            assert_eq!(first, (1 << 5, true));
+            assert_eq!(second, ((1 << 3) | (1 << 4), true));
+        } else {
+            assert_eq!(first, (u16::MAX, false));
+            assert_eq!(second, (u16::MAX, false));
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Far from anything the other tests or the runtime note: only the
     /// journal is touched, no memory.
     const FAR: usize = 0x7f00_0000_0000;
